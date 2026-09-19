@@ -233,9 +233,11 @@ class FunctionBuilder:
         if self.policy_ctx_slot is not None:
             # Inside a policy, free names are read from the decision context.
             dst = self.temp(T.ANY)
-            self.emit(Op.INDEX, [self.slot_op(self.policy_ctx_slot),
-                                 self.const(e.id, T.TEXT)], dst=dst,
-                      type_=T.ANY, meta={"source": "policy-context"},
+            self.emit(Op.BUILTIN,
+                      [self.slot_op(self.policy_ctx_slot),
+                       self.const(e.id, T.TEXT)], dst=dst,
+                      type_=T.ANY, meta={"name": "__ctx_get",
+                                        "source": "policy-context"},
                       pos=e.pos)
             return self.slot_op(dst)
         return Operand(kind="global", name=e.id, type=(e.inferred or T.ANY))
@@ -280,9 +282,26 @@ class FunctionBuilder:
 
     def e_Call(self, e: A.Call) -> Operand:
         args = [self.expr(a) for a in e.args]
-        dst = self.temp(e.inferred or T.ANY)
         callee = e.callee
 
+        if self.policy_ctx_slot is not None and isinstance(callee, A.Name) \
+                and callee.id == "role" and len(args) == 1:
+            # Spec section 17: `allow role("payroll_admin")` is decided
+            # against the context the policy was given, never against
+            # ambient process state -- otherwise a policy would not be a
+            # pure function of its input and could not be tested.
+            dst = self.temp(T.BOOL)
+            self.emit(Op.BUILTIN,
+                      [self.slot_op(self.policy_ctx_slot),
+                       self.const("role", T.TEXT)],
+                      dst=dst, type_=T.ANY, meta={"name": "__ctx_get"},
+                      pos=e.pos)
+            cmp_slot = self.temp(T.BOOL)
+            self.emit(Op.BINOP, [self.slot_op(dst), args[0]], dst=cmp_slot,
+                      type_=T.BOOL, meta={"operator": "=="}, pos=e.pos)
+            return self.slot_op(cmp_slot)
+
+        dst = self.temp(e.inferred or T.ANY)
         if isinstance(callee, A.Name):
             sym = self.checker.resolved.get(id(callee))
             name = sym.name if isinstance(sym, Symbol) else callee.id
@@ -1308,9 +1327,20 @@ class Builder:
         dispatch.bind("event", ev)
         dispatch.bind("payload", pl)
         b_end = dispatch.new_block("agent.end")
-        for event, hname in handler_names.items():
-            b_test = dispatch.new_block(f"agent.test.{event}")
-            b_call = dispatch.new_block(f"agent.call.{event}")
+        b_nomatch = dispatch.new_block("agent.nomatch")
+        # Blocks are created before any of them is filled, so the entry block
+        # can be given a terminator and each test can chain to the next one.
+        blocks = {event: (dispatch.new_block(f"agent.test.{event}"),
+                          dispatch.new_block(f"agent.call.{event}"))
+                  for event in handler_names}
+        order = list(handler_names)
+        first = blocks[order[0]][0] if order else b_end
+        dispatch.emit(Op.JUMP, meta={"target": first.id})
+
+        for position, (event, hname) in enumerate(handler_names.items()):
+            b_test, b_call = blocks[event]
+            following = blocks[order[position + 1]][0] \
+                if position + 1 < len(order) else b_nomatch
             dispatch.set_block(b_test)
             cmp_slot = dispatch.temp(T.BOOL)
             dispatch.emit(Op.BINOP,
@@ -1319,12 +1349,23 @@ class Builder:
                           pos=decl.pos)
             dispatch.emit(Op.JUMP_IF, [dispatch.slot_op(cmp_slot)],
                           meta={"target": b_call.id,
-                                "target_false": b_end.id})
+                                "target_false": following.id},
+                          pos=decl.pos)
             dispatch.set_block(b_call)
             dst = dispatch.temp(T.ANY)
             dispatch.emit(Op.CALL, [dispatch.slot_op(pl)], dst=dst,
                           meta={"callee": hname}, pos=decl.pos)
             dispatch.emit(Op.JUMP, meta={"target": b_end.id})
+
+        # Agents communicate by typed messages (spec section 9B), so a
+        # message no handler covers is a defect rather than something to
+        # drop silently.
+        dispatch.set_block(b_nomatch)
+        dispatch.emit(Op.FAULT, [],
+                      meta={"kind": "UnhandledMessage",
+                            "message": f"agent `{decl.name}` received an event "
+                                       f"it has no handler for"},
+                      pos=decl.pos)
         dispatch.set_block(b_end)
         dispatch.emit(Op.RETURN, [dispatch.const(Const.unit(), T.UNIT)])
         self.prog.add(dispatch.finish())
@@ -1372,7 +1413,8 @@ class Builder:
                          else fb.const(True, T.BOOL))
                 pairs = [fb.const("kind", T.TEXT), fb.const(kind, T.TEXT),
                          fb.const("value", T.ANY), value,
-                         fb.const("text", T.TEXT), fb.const(kind, T.TEXT)]
+                         fb.const("text", T.TEXT),
+                         fb.const(rule.phrase or kind, T.TEXT)]
             slot = fb.temp(T.MapType(T.TEXT, T.ANY))
             fb.emit(Op.MAKE_MAP, pairs, dst=slot,
                     type_=T.MapType(T.TEXT, T.ANY), pos=rule.pos)

@@ -253,6 +253,7 @@ class Checker:
                                            decl=decl, pos=decl.pos))
                 for method in decl.methods:
                     method.name = f"{decl.name}.{method.name or 'predict'}"
+                    self._apply_model_io(decl, method)
                     self.register_function(method, owner=decl.name)
             elif isinstance(decl, A.ServiceDecl):
                 if decl.name != "<module>":
@@ -341,13 +342,18 @@ class Checker:
             return T.PRIMITIVES[base_name]
         if base_name in T.GENERIC_ARITY and args:
             expected = T.GENERIC_ARITY[base_name]
-            if expected is not None and len(args) != expected:
-                self.error(
-                    f"`{base_name}` expects {expected} type argument(s) but "
-                    f"got {len(args)}", ref.pos, code="E-type-arity",
-                    help_text=f"e.g. `{base_name}<"
-                              + ", ".join(["..."] * expected) + ">")
-                return T.ERROR
+            if expected is not None:
+                low, high = expected if isinstance(expected, tuple) \
+                    else (expected, expected)
+                if not low <= len(args) <= high:
+                    wanted = (f"{high} type argument(s)" if low == high
+                              else f"between {low} and {high} type arguments")
+                    self.error(
+                        f"`{base_name}` expects {wanted} but got {len(args)}",
+                        ref.pos, code="E-type-arity",
+                        help_text=f"e.g. `{base_name}<"
+                                  + ", ".join(["..."] * high) + ">")
+                    return T.ERROR
             try:
                 return T.build_generic(base_name, args, shape)
             except KeyError:
@@ -510,6 +516,30 @@ class Checker:
             self.check_stmt(st, scope)
         self.check_effects(decl, info)
         self.current_fn = previous
+
+    def _apply_model_io(self, decl: A.ModelDecl, method: A.FnDecl) -> None:
+        """Give a model method the signature its declared I/O implies.
+
+        Spec section 14 writes::
+
+            model RiskModel
+                input features: Tensor<F32,[N]>
+                output risk: F32
+
+                predict features
+                    return network(features)
+
+        `predict features` carries no annotations at all: the parameter type
+        comes from the matching `input` declaration and the result type from
+        the `output` declaration.
+        """
+        inputs = {i.name: i.type for i in decl.inputs if i.type is not None}
+        for param in method.params or ():
+            if param.type is None and param.name in inputs:
+                param.type = inputs[param.name]
+        if method.ret is None and len(decl.outputs) == 1 \
+                and decl.outputs[0].type is not None:
+            method.ret = decl.outputs[0].type
 
     def check_model(self, decl: A.ModelDecl) -> None:
         for io_decl in decl.inputs + decl.outputs:

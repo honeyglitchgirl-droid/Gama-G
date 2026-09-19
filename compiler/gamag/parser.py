@@ -778,8 +778,16 @@ class Parser:
             self.adv()
             if self.at(TokenKind.IDENT) and self.peek().text in ("all", "required"):
                 return A.AuditDirective(pos=tok.pos, phrase=text + " " + self.adv().text)
+            start_offset = self.peek().pos.offset
             expr = self.parse_expr()
-            return A.PolicyRule(pos=tok.pos, kind=text, expr=expr)
+            # Spec section 17 asks for explainable decisions, so keep the
+            # rule exactly as written to use as the explanation.
+            phrase = ""
+            if self.source:
+                end_offset = self.peek().pos.offset
+                phrase = self.source[start_offset:end_offset].strip()
+            return A.PolicyRule(pos=tok.pos, kind=text, expr=expr,
+                                phrase=phrase)
 
         if text in ("input", "output") and not called and not assigned and not member:
             self.adv()

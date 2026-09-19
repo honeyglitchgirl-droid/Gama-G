@@ -797,6 +797,23 @@ class VM:
                 return obj.tag
             if name in ("args",):
                 return list(obj.args)
+        if isinstance(obj, GCapability):
+            # A capability handle *is* access to its resource (spec section
+            # 12), so field reads go through to the wrapped value -- but only
+            # when the handle actually carries Read.
+            if name in ("base", "caps", "resource", "token"):
+                return getattr(obj, name)
+            if not obj.grants("Read"):
+                raise CapabilityViolation(
+                    f"capability {obj.base} does not grant Read, so its "
+                    f"fields cannot be read", pos,
+                    context={"caps": list(obj.caps)})
+            if obj.resource is None:
+                raise GamaRuntimeFault(
+                    "NoResource",
+                    f"capability {obj.base} carries no resource to read "
+                    f"`{name}` from", pos)
+            return self.get_field(obj.resource, name, pos)
         if isinstance(obj, GRecord):
             if name in obj.fields:
                 return obj.fields[name]
@@ -891,6 +908,16 @@ class VM:
                   pos: Optional[SourcePos] = None) -> Any:
         if isinstance(obj, GSecret):
             raise SecretLeak("cannot index into a secret value", pos)
+        if isinstance(obj, GCapability):
+            if not obj.grants("Read"):
+                raise CapabilityViolation(
+                    f"capability {obj.base} does not grant Read, so it cannot "
+                    f"be indexed", pos, context={"caps": list(obj.caps)})
+            if obj.resource is None:
+                raise GamaRuntimeFault(
+                    "NoResource",
+                    f"capability {obj.base} carries no resource to index", pos)
+            return self.get_index(obj.resource, index, pos)
         if isinstance(obj, GVariant):
             # `NegativeInput(reason)` binds its payload positionally.
             i = int(index)

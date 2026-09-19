@@ -1917,6 +1917,14 @@ def _role_prelude(ctx, name):
     return to_text(name) in list(getattr(ctx, "roles", []))
 
 
+@reg("__ctx_get", ("context", "key"), ret=T.ANY, hidden=True,
+     doc="internal: read a policy decision context, None when absent")
+def _ctx_get(ctx, context, key):
+    if isinstance(context, dict):
+        return context.get(key)
+    return None
+
+
 @reg("__default", ("type_name",), ret=T.ANY, hidden=True, variadic=True,
      min_args=1, doc="internal: default value for a type")
 def _default(ctx, name=None):

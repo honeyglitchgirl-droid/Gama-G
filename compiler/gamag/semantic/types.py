@@ -440,9 +440,13 @@ PRIMITIVES: Dict[str, Type] = {
     "Int": I64, "Float": F64, "String": TEXT, "None": UNIT,
 }
 
+# An int means "exactly this many"; a pair means "between these inclusive".
+# `Tensor<F64>` is legal with the shape left to inference, while
+# `Tensor<F32,[1,224,224,3]>` pins it -- spec section 6 asks for shape
+# checking "where possible", not always.
 GENERIC_ARITY = {
-    "List": 1, "Set": 1, "Option": 1, "Map": 2, "Result": 2, "Tensor": 2,
-    "Matrix": 3, "Tuple": None,
+    "List": 1, "Set": 1, "Option": 1, "Map": 2, "Result": 2,
+    "Tensor": (1, 2), "Matrix": (1, 3), "Tuple": None,
 }
 
 
