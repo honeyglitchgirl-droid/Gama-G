@@ -428,7 +428,13 @@ class Parser:
         body = self.parse_block(f"body of policy `{name}`")
         decl = A.PolicyDecl(pos=kw.pos, name=name, body=body)
         for st in body.stmts:
-            if isinstance(st, (A.PolicyRule, A.AuditDirective, A.Require)):
+            if isinstance(st, A.Require):
+                # A policy's rules all share one representation, so `require`
+                # becomes a rule rather than staying a statement.
+                decl.rules.append(A.PolicyRule(
+                    pos=st.pos, kind="require", expr=st.expr,
+                    phrase=st.phrase or (st.message or "require")))
+            elif isinstance(st, (A.PolicyRule, A.AuditDirective)):
                 decl.rules.append(st)
         return decl
 
@@ -714,22 +720,26 @@ class Parser:
                 words.append(self.adv().text)
             return A.AuditDirective(pos=tok.pos, phrase=" ".join(words))
 
-        if text == "require" and not called and not assigned and not member:
+        if text in ("require", "assert") and not called and not assigned \
+                and not member:
             self.adv()
+            start_offset = self.peek().pos.offset
             expr = self.parse_expr()
+            phrase = ""
+            if self.source:
+                phrase = self.source[start_offset:self.peek().pos.offset].strip()
+            # Both accept a message, in either spelling, so the two gates read
+            # the same way.
             msg = None
             if self.at_kw("else"):
                 self.adv()
                 msg = self.expect(TokenKind.STRING, "a message").value
-            return A.Require(pos=tok.pos, expr=expr, message=msg)
-
-        if text == "assert" and not called and not assigned and not member:
-            self.adv()
-            expr = self.parse_expr()
-            msg = None
-            if self.accept(TokenKind.COMMA):
+            elif self.accept(TokenKind.COMMA):
                 msg = self.expect(TokenKind.STRING, "a message").value
-            return A.Assert(pos=tok.pos, expr=expr, message=msg)
+            return (A.Require(pos=tok.pos, expr=expr, message=msg,
+                              phrase=phrase)
+                    if text == "require"
+                    else A.Assert(pos=tok.pos, expr=expr, message=msg))
 
         if text in ("requires", "ensures", "ensure") and not called \
                 and not assigned and not member:
@@ -750,9 +760,12 @@ class Parser:
         if text in EFFECT_NAMES or text in MODIFIER_WORDS:
             plain = not called and not assigned and not member
             # `pure` alone on a line, or a comma-separated effect list.
+            # Inside a braced block newlines arrive as SEPARATOR rather than
+            # NEWLINE, so `audit` on its own line is an effect declaration in
+            # both block forms.
             terminator = nxt.kind in (TokenKind.NEWLINE, TokenKind.COMMA,
                                       TokenKind.DEDENT, TokenKind.RBRACE,
-                                      TokenKind.EOF)
+                                      TokenKind.SEPARATOR, TokenKind.EOF)
             chained = nxt.kind is TokenKind.IDENT and nxt.text in EFFECT_NAMES
             if plain and (terminator or chained):
                 self.adv()

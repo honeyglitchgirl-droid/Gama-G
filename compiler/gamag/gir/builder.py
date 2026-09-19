@@ -118,6 +118,8 @@ class FunctionBuilder:
         self.needs_epilogue = any(c.get("kind") == "ensures"
                                   for c in self.fn.contracts)
         self.policy_ctx_slot: Optional[int] = None
+        # How many parallel regions this function has lowered so far.
+        self.parallel_regions = 0
         self.declared: Set[str] = set()
         self.loop_breaks: List[str] = []
         self.loop_continues: List[str] = []
@@ -914,6 +916,12 @@ class FunctionBuilder:
                 enclosing[name] = slot
                 self.bind(name, slot)
 
+        # A function may contain several parallel regions; each needs its own
+        # namespace, or the task functions of one region would overwrite the
+        # other's in the program's function table.
+        region = self.parallel_regions
+        self.parallel_regions += 1
+
         visible = set(enclosing)
         tasks: List[Dict[str, Any]] = []
         for index, task_stmt in enumerate(statements):
@@ -940,7 +948,7 @@ class FunctionBuilder:
                     tj["depends_on"].append(ti["name"])
 
         for task in tasks:
-            fname = f"{self.fn.name}$par${task['name']}"
+            fname = f"{self.fn.name}$par{region}${task['name']}"
             fb = FunctionBuilder(self.prog, self.checker, fname, kind="task",
                                  ret=T.MapType(T.TEXT, T.ANY),
                                  global_names=self.global_names,
@@ -975,7 +983,7 @@ class FunctionBuilder:
         meta_tasks = [{
             "index": t["index"],
             "name": t["name"],
-            "function": f"{self.fn.name}$par${t['name']}",
+            "function": f"{self.fn.name}$par{region}${t['name']}",
             "params": t["params"],
             "param_slots": [enclosing.get(p) for p in t["params"]],
             "writes": t["writes"],

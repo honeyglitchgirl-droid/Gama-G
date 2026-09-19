@@ -1,0 +1,71 @@
+// Tests and property-based tests (spec section 26).
+//
+//   ggc test examples/property_tests.gg
+//   ggc test --json examples/property_tests.gg
+//
+// A `test property` runs its body over every value the generator produces;
+// any one failure fails the test, which is how a property differs from an
+// example-based test.
+
+fn double(x: I64) -> I64
+    pure
+    return x * 2
+
+// Collection methods build and return a *new* collection; they never change
+// the receiver.  Writing `out.insert(0, item)` as a bare statement would be a
+// compile error, not a silent no-op.
+fn reverse(xs: List<I64>) -> List<I64>
+    pure
+    var out: List<I64> = []
+    for item in xs
+        out = out.insert(0, item)
+    return out
+
+test "double of zero is zero"
+    assert double(0) == 0
+
+test "reverse is its own inverse"
+    let xs = [1, 2, 3, 4]
+    assert reverse(reverse(xs)) == xs
+
+test "sorted output is non-decreasing"
+    let unsorted = [5, 1, 4, 2, 8]
+    let ascending = sorted(unsorted)
+    assert ascending == [1, 2, 4, 5, 8]
+
+test property "division identity"
+    for all x in range(1, 50)
+        assert x / x == 1
+
+test property "double is always even"
+    for all x in range(-20, 20)
+        assert double(x) % 2 == 0
+
+test property "reverse preserves length"
+    for all n in range(0, 8)
+        let xs = range(0, n)
+        assert reverse(xs).length == n
+
+test property "addition is commutative over a range"
+    for all x in range(0, 12)
+        for all y in range(0, 12)
+            assert x + y == y + x
+
+// A Result-returning function is tested by destructuring, not by unwrapping,
+// so a failure reports the error instead of faulting.  The arguments are
+// written `10.0`, not `10`: Gama-G performs no implicit numeric conversion
+// (spec section 6), and the checker says so.
+test "division by zero is a Fail, not a crash"
+    match safeDiv(10.0, 0.0)
+        fail(err) => assert contains(err, "zero")
+        ok(_) => assert false
+
+fn safeDiv(a: F64, b: F64) -> Result<F64, Text>
+    pure
+    if b == 0.0
+        return fail("division by zero")
+    return ok(a / b)
+
+fn main() -> Unit
+    io
+    print("run these with: ggc test examples/property_tests.gg")

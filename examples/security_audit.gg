@@ -1,0 +1,91 @@
+// Security: capabilities, secret lifecycle, and the audit trail
+// (spec sections 8, 12 and 13).
+//
+//   ggc run examples/security_audit.gg
+//   ggc run --audit /tmp/trail.jsonl examples/security_audit.gg
+//
+// Try deleting a `grant` line: the program stops compiling, because a
+// Gama-G program has no ambient authority.
+
+grant PatientRead, Read, CryptoSign, SecretExpose, AuditWrite
+
+record PatientStore
+    rows: Map<Text, Text>
+
+// Authority arrives as a parameter, never from the environment.  A caller
+// that does not hold a `PatientStore[Read]` handle cannot call this at all.
+fn readPatient(store: PatientStore[Read], key: Text) -> Result<Text, Text>
+    io
+    audit
+    let rows = store.rows
+    if not contains(rows, key)
+        return fail("no such patient")
+    audit.record {
+        actor: "clinical-app"
+        action: "PATIENT_READ"
+        object: key
+        reason: "direct clinical care"
+    }
+    return ok(rows[key])
+
+fn reportSecret(token: Text) -> Unit
+    crypto
+    audit
+    // A secret value is typed `secret Text`.  It cannot be printed, cannot be
+    // concatenated into ordinary Text, and cannot appear in an audit field --
+    // all three are compile errors, not runtime surprises.
+    let credential = secrets.wrap(token, "api_token")
+    print("  is secret     :", secrets.is_secret(credential))
+    print("  printed as    :", secrets.redact(credential))
+    print("  fingerprint   :", secrets.fingerprint(credential))
+
+    // Revealing it is allowed, but only with a reason, and the reveal is
+    // itself audited.
+    let revealed = secrets.expose(credential, "incident response 4412")
+    print("  exposed length:", revealed.length)
+
+fn signReport(body: Text) -> Unit
+    crypto
+    let key = "signing-key-material"
+    let signature = crypto.sign(key, body)
+    print("  signature     :", crypto.hex(signature))
+    print("  verifies      :", crypto.verify(key, body, signature))
+    print("  tamper check  :", crypto.verify(key, body + ".", signature))
+
+fn main() -> Unit
+    io
+    crypto
+    audit
+    print("capability-qualified access")
+    let records = PatientStore { rows: {"P-1": "Ada Lovelace", "P-2": "Grace Hopper"} }
+    let read_only = capabilities.open("PatientStore", ["Read"], records)
+    print("  handle        :", read_only)
+    print("  grants Read   :", capabilities.grants(read_only, "Read"))
+    print("  grants Write  :", capabilities.grants(read_only, "Write"))
+
+    match readPatient(read_only, "P-1")
+        ok(name) => print("  P-1           :", name)
+        fail(err) => print("  refused       :", err)
+    match readPatient(read_only, "P-404")
+        ok(name) => print("  unexpected    :", name)
+        fail(err) => print("  P-404         :", err)
+
+    print("")
+    print("secret lifecycle")
+    reportSecret("hunter2-token")
+
+    print("")
+    print("signing")
+    signReport("discharge summary for P-1")
+
+    print("")
+    print("deterministic execution (spec 1.3): the same seed gives the same stream")
+    print("  draw 1        :", crypto.random_int(1, 1000000))
+    print("  draw 2        :", crypto.random_int(1, 1000000))
+
+    print("")
+    // Spec section 13: append-only, hash-chained, signed.
+    let ok = audit.verify()
+    print("audit records   :", audit.count())
+    print("chain valid     :", ok)
+    print("latest hash     :", audit.head())

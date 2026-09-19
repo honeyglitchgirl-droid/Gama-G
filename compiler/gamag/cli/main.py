@@ -259,7 +259,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             exit_code = EXIT_RUNTIME
         if args.audit:
             with open(args.audit, "w", encoding="utf-8") as handle:
-                handle.write(ctx.audit.export())
+                handle.write(ctx.audit.to_jsonl())
             print(f"audit log written to {args.audit} "
                   f"({len(ctx.audit.records)} records, chain "
                   f"{'valid' if ctx.audit.verify()[0] else 'INVALID'})")

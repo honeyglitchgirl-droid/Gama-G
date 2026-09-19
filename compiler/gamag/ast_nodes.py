@@ -309,6 +309,9 @@ class Require(Stmt):
 
     expr: Optional[Expr] = None
     message: Optional[str] = None
+    # The condition exactly as written, kept so a policy decision can quote
+    # the rule that produced it (spec section 17: explainable decisions).
+    phrase: str = ""
 
 
 @dataclass

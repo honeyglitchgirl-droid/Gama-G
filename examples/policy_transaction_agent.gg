@@ -1,0 +1,119 @@
+// Policy, transactions and agents (spec sections 9B, 17 and 18).
+//
+//   ggc run --audit /tmp/trail.jsonl examples/policy_transaction_agent.gg
+//   ggc explain examples/policy_transaction_agent.gg
+//
+// Three things a plain function cannot express on its own: an explainable
+// authorization decision, an all-or-nothing group of effects, and an
+// event-driven component that owns no shared mutable state.
+
+grant AuditWrite, Read
+
+// ---------------------------------------------------------------- policy
+// Decisions are explainable: the engine reports which rules matched and
+// quotes the rule text that produced the outcome (spec section 17).
+policy payrollAccess
+    allow role("payroll_admin")
+    deny role("contractor")
+    audit all
+
+policy releaseGate
+    require passed_tests
+    require coverage >= 0.8
+    allow signed_off
+    audit all
+
+// ----------------------------------------------------------- transaction
+// Spec section 18: if an operation fails before commit, the transaction does
+// not leave its effects half applied -- it is marked aborted and the audit
+// trail records why.
+transaction payment
+    audit
+    print("  debiting  account A")
+    print("  crediting account B")
+    print("  committing")
+
+var payment_attempts = 0
+
+// The first attempt faults before it commits, so it is aborted; the retry
+// succeeds.  A transaction whose fault is permanent would exhaust its
+// service's recovery policy and propagate as a RecoveryExhausted fault --
+// it never quietly commits half of its work.
+transaction flakyPayment
+    audit
+    payment_attempts = payment_attempts + 1
+    print("  attempt", payment_attempts, ": debiting account A")
+    if payment_attempts < 2
+        panic("settlement gateway timeout")
+    print("  attempt", payment_attempts, ": crediting account B")
+    print("  attempt", payment_attempts, ": committing")
+
+// Spec section 18 says a failed transaction "enters a recovery state".  A
+// service is what expresses that: it protects the call and declares a bounded
+// recovery policy, so the abort is observed rather than crashing the program.
+service PaymentService
+    protect
+        flakyPayment.run()
+
+    recover
+        retry 2
+        alert operator
+
+// ----------------------------------------------------------------- agent
+// Agents do not share mutable state; they communicate through typed messages.
+agent Monitor
+    on alert
+        print("  Monitor received alert:", alert)
+    on heartbeat
+        print("  Monitor is alive")
+
+fn describe(decision: PolicyDecision) -> Text
+    pure
+    if decision.allow
+        return "ALLOW"
+    return "DENY"
+
+fn main() -> Unit
+    io
+    audit
+    print("policy decisions")
+    for subject in [{"role": "payroll_admin"}, {"role": "contractor"},
+                    {"role": "intern"}]
+        let decision = payrollAccess.evaluate(subject)
+        print("  ", subject["role"], "->", describe(decision))
+        print("      reason :", decision.reason)
+        print("      matched:", decision.matched)
+
+    print("")
+    print("a policy with `require` gates")
+    let green = releaseGate.evaluate({"passed_tests": true, "coverage": 0.91,
+                                      "signed_off": true})
+    let red = releaseGate.evaluate({"passed_tests": false, "coverage": 0.91,
+                                    "signed_off": true})
+    print("   tests pass  ->", describe(green), "|", green.reason)
+    print("   tests fail  ->", describe(red), "|", red.reason)
+
+    print("")
+    print("transaction that commits")
+    payment.run()
+
+    print("")
+    print("transaction that faults before commit, under a service")
+    let outcome = PaymentService()
+    print("  recovered      :", outcome.recovered)
+    print("  recovery level :", outcome.level, "-", outcome.level_name)
+    print("  attempts       :", outcome.attempts)
+    print("  actions        :", outcome.actions)
+    print("  escalated      :", outcome.escalated)
+
+    print("")
+    print("agent messages")
+    Monitor.send("alert", "cpu above 90%")
+    Monitor.send("heartbeat", "tick")
+
+    print("")
+    print("everything above is in one hash-chained trail")
+    print("audit records   :", audit.count())
+    print("chain valid     :", audit.verify())
+    print("problems        :", audit.problems())
+    print("latest hash     :", audit.head())

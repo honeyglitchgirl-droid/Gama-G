@@ -1,0 +1,73 @@
+// Operation graphs and data parallelism (spec sections 3 and 9C).
+//
+// `parallel` is not a thread pragma: the compiler builds a graph of typed
+// operations, finds the dependencies between them, and only runs
+// independent operations concurrently.  Results are committed in program
+// order, so the outcome never depends on the schedule.
+//
+//   ggc run examples/parallel_pipeline.gg
+//   ggc gir --fn "main$par$t2" examples/parallel_pipeline.gg
+
+fn loadVitals(patient: Text) -> List<F64>
+    io
+    print("  loading vitals for", patient)
+    return [36.8, 37.1, 36.9, 37.4]
+
+fn loadLabs(patient: Text) -> List<F64>
+    io
+    print("  loading labs for", patient)
+    return [4.1, 5.2, 4.8]
+
+fn loadHistory(patient: Text) -> I64
+    io
+    print("  loading history for", patient)
+    return 12
+
+fn mean(values: List<F64>) -> F64
+    pure
+    var total = 0.0
+    for v in values
+        total = total + v
+    // I64 -> F64 is written explicitly: spec section 6 allows no
+    // implicit numeric conversion, since it can lose precision.
+    return total / float(values.length)
+
+fn summarise(vitals: F64, labs: F64, visits: I64) -> Text
+    pure
+    return "mean temperature " + str(vitals) + ", mean lab " + str(labs) +
+        ", " + str(visits) + " prior visits"
+
+// The specification's pipeline form (section 3), with the optional explicit
+// block syntax used for generated or embedded source.
+pipeline patientRisk {
+    input patient: Text
+    normalize
+    extract features
+    audit
+    return result
+}
+
+fn main() -> Unit
+    io
+    print("independent loads run concurrently; the summary waits for all three")
+    parallel
+        vitals = mean(loadVitals("P-1"))
+        labs = mean(loadLabs("P-1"))
+        visits = loadHistory("P-1")
+        summary = summarise(vitals, labs, visits)
+
+    print("vitals :", vitals)
+    print("labs   :", labs)
+    print("visits :", visits)
+    print("summary:", summary)
+
+    // The dependency graph is visible in the GIR: `summary` depends on all
+    // three loads, which depend on nothing, so the first level has three
+    // tasks and the second has one.
+    print("")
+    print("a region whose statements are all dependent still runs correctly")
+    parallel
+        a = 1 + 1
+        b = a * 10
+        c = b + a
+    print("a =", a, " b =", b, " c =", c)

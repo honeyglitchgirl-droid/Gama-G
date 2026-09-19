@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from .. import ast_nodes as A
+from .. import methods as M
 from ..diagnostics import Diagnostic, DiagnosticBag, Phase, Severity, SourcePos
 from ..std import library as L
 from . import types as T
@@ -99,6 +100,11 @@ class Checker:
         self.bag = DiagnosticBag()
         self.globals = Scope(name="<module>")
         self.records: Dict[str, T.RecordType] = {}
+        # Records the runtime itself produces (policy decisions, recovery
+        # outcomes).  Programs must be able to name these in signatures, or a
+        # value the language hands back could never be passed to a function.
+        for builtin_name, builtin_rec in L.BUILTIN_RECORDS.items():
+            self.records[builtin_name] = builtin_rec
         self.enums: Dict[str, T.EnumType] = {}
         self.variants: Dict[str, Tuple[str, T.EnumType]] = {}
         self.functions: Dict[str, FunctionInfo] = {}
@@ -512,7 +518,9 @@ class Checker:
         info.scope = scope
         previous = self.current_fn
         self.current_fn = info
-        for st in (decl.body.stmts if decl.body else []):
+        statements = list(decl.body.stmts if decl.body else [])
+        self._declare_pipeline_stages(statements, scope, info)
+        for st in statements:
             self.check_stmt(st, scope)
         self.check_effects(decl, info)
         self.current_fn = previous
@@ -602,11 +610,20 @@ class Checker:
 
     def check_policy(self, decl: A.PolicyDecl) -> None:
         scope = self.globals.child(f"policy:{decl.name}")
-        for rule in decl.rules:
-            if isinstance(rule, A.PolicyRule) and rule.expr is not None:
-                self.infer(rule.expr, scope)
-            elif isinstance(rule, A.Require) and rule.expr is not None:
-                self.infer(rule.expr, scope)
+        expressions = [rule.expr for rule in decl.rules
+                       if isinstance(rule, (A.PolicyRule, A.Require))
+                       and getattr(rule, "expr", None) is not None]
+        # A policy rule is evaluated against a subject that only exists at
+        # run time (`payrollAccess.evaluate({"role": ...})`), so a bare name
+        # in a rule refers to an attribute of that subject rather than to
+        # something in the enclosing scope.  Names that do resolve -- such as
+        # the `role(...)` builtin -- keep their real meaning.
+        for expr in expressions:
+            for name, pos in _free_names(expr):
+                if scope.lookup(name) is None:
+                    scope.define(Symbol(name, T.ANY, "subject", pos=pos))
+        for expr in expressions:
+            self.infer(expr, scope)
 
     def check_test(self, decl: A.TestDecl) -> None:
         scope = self.globals.child(f"test:{decl.name}")
@@ -746,6 +763,29 @@ class Checker:
         elif isinstance(ty, T.OptionType):
             self.warn("this expression produces an Option which is discarded",
                       st.pos, code="W-unused-option")
+        elif self._is_discarded_collection_call(st.expr):
+            name = st.expr.callee.attr
+            self.error(
+                f"`.{name}(...)` returns a new collection and does not change "
+                f"the receiver, so this statement does nothing",
+                st.pos, code="E-discarded-value",
+                help_text=f"bind the result, e.g. `let updated = x.{name}(...)`, "
+                          f"or reassign it: `x = x.{name}(...)` on a `var`")
+
+    def _is_discarded_collection_call(self, expr: A.Expr) -> bool:
+        """True for a bare `xs.push(v)`-style statement whose result is thrown away.
+
+        `infer` has already run over the whole expression, so the receiver's
+        type is on the node and nothing needs re-checking (which would risk
+        reporting the same problem twice).
+        """
+        callee = getattr(expr, "callee", None)
+        if not isinstance(expr, A.Call) or not isinstance(callee, A.Member):
+            return False
+        if callee.attr not in M.VALUE_RETURNING:
+            return False
+        receiver = getattr(callee.obj, "inferred", None)
+        return isinstance(receiver, (T.ListType, T.MapType, T.SetType))
 
     def stmt_If(self, st: A.If, scope: Scope) -> None:
         cond = self.infer(st.cond, scope)
@@ -1098,9 +1138,39 @@ class Checker:
         if self.current_fn is not None:
             self.current_fn.effects.add("audit")
 
+    def _declare_pipeline_stages(self, statements: List[A.Stmt], scope: Scope,
+                                 info: "FunctionInfo") -> None:
+        """Bind the names a pipeline's stages introduce.
+
+        Spec section 3 writes a pipeline as a chain of named stages::
+
+            pipeline patientRisk {
+                input patient: Medical.Patient
+                normalize
+                extract features
+                predict risk using model
+                audit
+                return result
+            }
+
+        Each stage's label is the name of the value it produces, which the
+        following stages and the final `return result` can refer to.  They are
+        declared up front so the graph can be checked in one pass.
+        """
+        scope.define(Symbol("result", info.fn_type.ret
+                            if not isinstance(info.fn_type.ret, T.UnitType)
+                            else T.ANY, "stage", pos=None))
+        for st in statements:
+            if not isinstance(st, A.StageDirective):
+                continue
+            for arg in st.args:
+                if isinstance(arg, A.Name) and scope.lookup(arg.id) is None:
+                    scope.define(Symbol(arg.id, T.ANY, "stage", pos=arg.pos))
+
     def stmt_StageDirective(self, st: A.StageDirective, scope: Scope) -> None:
-        for arg in st.args:
-            self.infer(arg, scope)
+        # Stage labels are bindings, not calls, so they are not inferred here;
+        # _declare_pipeline_stages already put them in scope.  A `using`
+        # clause does name a real value (the model to predict with).
         if st.using is not None:
             self.infer(st.using, scope)
 
@@ -1815,24 +1885,70 @@ def _literal_numeric(ty: T.Type, node: A.Expr, other: T.Type) -> T.Type:
     return ty
 
 
+def _free_names(node: Any) -> List[Tuple[str, Any]]:
+    """Every `Name` reference in an expression tree, with its position.
+
+    Used by policy rules, whose free names bind to attributes of the subject
+    record supplied at evaluation time.
+    """
+    found: List[Tuple[str, Any]] = []
+
+    def walk(item: Any) -> None:
+        if isinstance(item, A.Name):
+            found.append((item.id, item.pos))
+            return
+        if isinstance(item, (list, tuple)):
+            for part in item:
+                walk(part)
+            return
+        if isinstance(item, A.Node):
+            for field_name in getattr(item, "__dataclass_fields__", {}):
+                if field_name == "pos":
+                    continue
+                walk(getattr(item, field_name, None))
+
+    walk(node)
+    return found
+
+
 def _member_table(ty: T.Type) -> Optional[Dict[str, T.Type]]:
-    """Static members of the built-in structured types."""
+    """Static members of the built-in structured types.
+
+    Method names come from `gamag.methods`, the same table the VM dispatches
+    through, so a method can never be callable at run time while rejected at
+    compile time.  Methods are calls rather than values, so they type as
+    `Any`; the property entries below then overlay the precise types.
+    """
+    def with_methods(kind: str, props: Dict[str, T.Type]) -> Dict[str, T.Type]:
+        table = {name: T.ANY for name in M.table_for(kind)}
+        table.update(props)
+        return table
+
+    if isinstance(ty, T.SecretType):
+        return with_methods("secret", {"label": T.TEXT})
     if isinstance(ty, T.OptionType):
-        return {"some": T.BOOL, "value": ty.inner, "is_some": T.BOOL}
+        return with_methods("option", {"some": T.BOOL, "value": ty.inner,
+                                       "is_some": T.BOOL, "is_none": T.BOOL})
     if isinstance(ty, T.ResultType):
-        return {"ok": T.BOOL, "value": ty.ok, "error": ty.err}
+        return with_methods("result", {"ok": T.BOOL, "value": ty.ok,
+                                       "error": ty.err})
     if isinstance(ty, T.TensorType):
-        return {"shape": T.ListType(T.I64), "rank": T.I64, "size": T.I64,
-                "dtype": T.TEXT, "data": T.ListType(ty.elem)}
+        table = {name: T.ANY for name in M.TENSOR_NATIVE}
+        table.update({"shape": T.ListType(T.I64), "rank": T.I64,
+                      "size": T.I64, "dtype": T.TEXT,
+                      "data": T.ListType(ty.elem)})
+        return table
     if isinstance(ty, T.TextType):
-        return {"length": T.I64, "len": T.I64}
+        return with_methods("text", {"length": T.I64, "len": T.I64})
     if isinstance(ty, T.ListType):
-        return {"length": T.I64, "size": T.I64, "len": T.I64}
+        return with_methods("list", {"length": T.I64, "size": T.I64,
+                                     "len": T.I64})
     if isinstance(ty, T.SetType):
-        return {"size": T.I64, "len": T.I64}
+        return with_methods("set", {"size": T.I64, "len": T.I64})
     if isinstance(ty, T.MapType):
-        return {"size": T.I64, "len": T.I64, "keys": T.ListType(ty.key),
-                "values": T.ListType(ty.value)}
+        return with_methods("map", {"size": T.I64, "len": T.I64,
+                                    "keys": T.ListType(ty.key),
+                                    "values": T.ListType(ty.value)})
     if isinstance(ty, T.DurationType):
         return {"seconds": T.F64, "ms": T.F64}
     if isinstance(ty, T.InstantType):

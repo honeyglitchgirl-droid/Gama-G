@@ -1,0 +1,74 @@
+// Tensors, automatic differentiation and AI safety (spec sections 14 and 15).
+//
+// Trains a linear model from scratch on y = 2x + 1 using the language's own
+// tensor type and reverse-mode autodiff, then treats the model's output as
+// data rather than authority.
+//
+//   ggc run examples/train_linear_model.gg
+
+model LinearModel
+    input features: Tensor<F64>
+    output prediction: F64
+
+    predict features
+        return tensor.item(features) * 0.5
+
+fn train(x: Tensor<F64>, y: Tensor<F64>, steps: I64, lr: F64) -> List<F64>
+    model
+    autodiff.begin()
+    let w = autodiff.parameter(tensor.from_list([[0.0]]))
+    let b = autodiff.parameter(tensor.from_list([[0.0]]))
+    var history: List<F64> = []
+    var step = 0
+    while step < steps
+        let prediction = autodiff.linear(x, w, b)
+        let loss = autodiff.mse(prediction, y)
+        autodiff.backward(loss)
+        autodiff.step([w, b], lr)
+        history = history.append(tensor.item(loss))
+        step = step + 1
+    return [tensor.item(w), tensor.item(b)]
+
+fn main() -> Unit
+    io
+    model
+    let x = tensor.from_list([[1.0], [2.0], [3.0], [4.0]])
+    let y = tensor.from_list([[3.0], [5.0], [7.0], [9.0]])   // y = 2x + 1
+
+    print("training on y = 2x + 1, starting from w = 0, b = 0")
+    let learned = train(x, y, 400, 0.05)
+    print("  learned w    :", learned[0])
+    print("  learned b    :", learned[1])
+
+    // Inference through the declared model, whose signature came from its
+    // `input`/`output` declarations rather than an annotation.
+    let features = tensor.from_list([[0.84]])
+    let risk = LinearModel.predict(features)
+    print("")
+    print("model inference")
+    print("  input        :", tensor.to_list(features))
+    print("  prediction   :", risk)
+
+    // Spec section 15: AI output is data, not authority.  A `require` that
+    // does not hold is a runtime fault, not a suggestion.
+    let threshold = 0.1
+    let model_version = "1.0.0"
+    let approved_version = "1.0.0"
+    let input_schema = "features:Tensor<F64>[1]"
+    let approved_schema = "features:Tensor<F64>[1]"
+    require risk >= threshold, "prediction below the accepted threshold"
+    require model_version == approved_version,
+        "model version is not the approved one"
+    require input_schema == approved_schema,
+        "input schema changed since the model was approved"
+    print("  passed the AI-safety requires (threshold", threshold, ")")
+
+    print("")
+    print("tensor operations")
+    let a = tensor.from_list([[1.0, 2.0], [3.0, 4.0]])
+    let m = tensor.from_list([[5.0, 6.0], [7.0, 8.0]])
+    print("  a @ m        :", tensor.to_list(tensor.matmul(a, m)))
+    print("  transpose(a) :", tensor.to_list(tensor.transpose(a)))
+    print("  softmax(a)   :", tensor.to_list(tensor.softmax(a)))
+    // Broadcasting: a [4,1] column against a [1,1] bias.
+    print("  x + bias     :", tensor.to_list(x + tensor.from_list([[100.0]])))

@@ -378,6 +378,15 @@ class GProgram:
     tests: List[str] = field(default_factory=list)
 
     def add(self, fn: GFunction) -> GFunction:
+        # Overwriting a function would silently redirect every call to it, so
+        # a duplicate name is a compiler defect rather than something to
+        # absorb.  Synthetic names (parallel tasks, protect bodies) are
+        # namespaced by their producer.
+        existing = self.functions.get(fn.name)
+        if existing is not None and existing is not fn:
+            raise AssertionError(
+                f"GIR already contains a function named `{fn.name}`; "
+                f"a later definition would silently replace it")
         self.functions[fn.name] = fn
         return fn
 

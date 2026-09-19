@@ -1162,9 +1162,23 @@ def _policy_role(ctx, name):
     return to_text(name) in list(getattr(ctx, "roles", []))
 
 
-@reg("policy.evaluate", ("rules", "context"), ret=T.RecordType(
-    "PolicyDecision", (("allow", T.BOOL), ("reason", T.TEXT),
-                       ("matched", T.ListType(T.TEXT)))),
+# Records produced by the runtime rather than declared by the program.  The
+# checker seeds these into its record table so a program can name them in a
+# function signature and pass a policy decision or recovery outcome around.
+BUILTIN_RECORDS: Dict[str, T.RecordType] = {
+    "PolicyDecision": T.RecordType(
+        "PolicyDecision", (("allow", T.BOOL), ("reason", T.TEXT),
+                           ("matched", T.ListType(T.TEXT)),
+                           ("policy", T.TEXT))),
+    "RecoveryOutcome": T.RecordType(
+        "RecoveryOutcome", (("recovered", T.BOOL), ("level", T.I64),
+                            ("level_name", T.TEXT), ("attempts", T.I64),
+                            ("actions", T.ListType(T.TEXT)),
+                            ("escalated", T.BOOL))),
+}
+
+
+@reg("policy.evaluate", ("rules", "context"), ret=BUILTIN_RECORDS["PolicyDecision"],
      effects=("audit",), doc="Explainable policy decision (spec section 17).")
 def _policy_evaluate(ctx, rules, context=None):
     matched = []

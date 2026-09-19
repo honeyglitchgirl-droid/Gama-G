@@ -98,35 +98,10 @@ TEXT_METHODS = {
     "parse_int": "text.parse_int", "parse_float": "text.parse_float",
     "join": "text.join",
 }
-LIST_METHODS = {
-    "push": "collections.push", "pop": "collections.pop",
-    "get": "collections.get", "set_at": "collections.set_at",
-    "insert": "collections.insert", "remove": "collections.remove",
-    "map": "collections.map", "filter": "collections.filter",
-    "reduce": "collections.reduce", "count": "collections.count",
-    "is_empty": "collections.is_empty", "sorted": "sorted",
-    "reversed": "reversed", "contains": "contains", "len": "len",
-    "sum": "sum", "min": "min", "max": "max",
-}
-MAP_METHODS = {
-    "get": "collections.map_get", "set": "collections.map_set",
-    "has": "collections.map_has", "keys": "collections.keys",
-    "values": "collections.values", "items": "collections.items",
-    "len": "len", "is_empty": "collections.is_empty", "contains": "contains",
-}
-SET_METHODS = {
-    "add": "collections.set_add", "has": "collections.set_has",
-    "union": "collections.union", "intersect": "collections.intersect",
-    "difference": "collections.difference", "len": "len",
-    "is_empty": "collections.is_empty",
-}
-OPTION_METHODS = {
-    "unwrap": "unwrap", "or_default": "or_default", "is_some": "is_some",
-    "is_none": "is_none",
-}
-RESULT_METHODS = {
-    "unwrap": "unwrap", "is_ok": "is_ok", "is_fail": "is_fail",
-}
+from ..methods import (  # single source of truth, shared with the checker
+    LIST_METHODS, MAP_METHODS, OPTION_METHODS, RESULT_METHODS, SET_METHODS,
+    TENSOR_NATIVE, TEXT_METHODS,
+)
 
 
 class VM:
@@ -322,21 +297,33 @@ class VM:
             self.ctx.stats.calls += 1
             bid = fn.entry
             steps = 0
-            while bid is not None:
-                block = fn.block(bid)
-                if block is None:
-                    raise GamaRuntimeFault(
-                        "BadGIR", f"block `{bid}` is missing from `{fn.name}`")
-                next_bid, value, returned = self.run_block(frame, block)
-                if returned:
-                    return self.coerce_return(value, fn)
-                bid = next_bid
-                steps += 1
-                if steps > 5_000_000:
-                    raise GamaRuntimeFault("RunawayLoop",
-                                           f"`{fn.name}` exceeded the basic-block "
-                                           f"step budget")
-            return UNIT
+            try:
+                while bid is not None:
+                    block = fn.block(bid)
+                    if block is None:
+                        raise GamaRuntimeFault(
+                            "BadGIR", f"block `{bid}` is missing from `{fn.name}`")
+                    next_bid, value, returned = self.run_block(frame, block)
+                    if returned:
+                        return self.coerce_return(value, fn)
+                    bid = next_bid
+                    steps += 1
+                    if steps > 5_000_000:
+                        raise GamaRuntimeFault(
+                            "RunawayLoop",
+                            f"`{fn.name}` exceeded the basic-block step budget")
+                return UNIT
+            except GamaRuntimeFault as fault:
+                # Spec section 18: a transaction that fails before it commits
+                # must not leave its effects half applied.  The builder emits
+                # begin ... body ... commit with no branch between them, so
+                # this is the only place a failed transaction can be marked
+                # aborted; otherwise it would stay "open" forever and the
+                # audit trail would show a begin with no matching outcome.
+                if fn.kind == "transaction":
+                    self.ctx.abort_transaction(
+                        fn.name, f"{fault.kind}: {fault.message}")
+                raise
         finally:
             with self.lock:
                 self.depth -= 1
