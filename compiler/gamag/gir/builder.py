@@ -1224,8 +1224,12 @@ class Builder:
 
     # ------------------------------------------------------------------
     def _contracts_of(self, decl: A.FnDecl) -> List[Dict[str, Any]]:
+        # `text` is the condition as written, so a violation can quote it
+        # (spec section 27).  It was being set to the contract's kind, which
+        # made every `ensures` failure read "ensures contract violated:
+        # ensures" instead of naming the condition that did not hold.
         return [{"kind": c.kind, "expr": c.expr, "pos": c.pos,
-                 "text": c.kind} for c in decl.contracts]
+                 "text": c.text or c.kind} for c in decl.contracts]
 
     def build_function(self, decl: A.FnDecl) -> None:
         info = self.checker.functions[decl.name]

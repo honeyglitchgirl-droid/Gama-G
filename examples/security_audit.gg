@@ -29,6 +29,7 @@ fn readPatient(store: PatientStore[Read], key: Text) -> Result<Text, Text>
     return ok(rows[key])
 
 fn reportSecret(token: Text) -> Unit
+    io
     crypto
     audit
     // A secret value is typed `secret Text`.  It cannot be printed, cannot be
@@ -45,6 +46,7 @@ fn reportSecret(token: Text) -> Unit
     print("  exposed length:", revealed.length)
 
 fn signReport(body: Text) -> Unit
+    io
     crypto
     let key = "signing-key-material"
     let signature = crypto.sign(key, body)

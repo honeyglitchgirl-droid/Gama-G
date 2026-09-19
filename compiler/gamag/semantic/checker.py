@@ -88,6 +88,8 @@ class FunctionInfo:
     deterministic: bool = False
     scope: Optional[Scope] = None
     returns: bool = False
+    # True when some statement provably does not return, e.g. `panic(...)`.
+    diverges: bool = False
     kind: str = "fn"
 
 
@@ -471,7 +473,7 @@ class Checker:
         ret = info.fn_type.ret
         if isinstance(ret, (T.UnitType, T.NeverType)):
             return
-        if not info.returns:
+        if not info.returns and not info.diverges:
             self.error(
                 f"function `{decl.name}` declares a return type of "
                 f"{ret.render()} but never returns a value",
@@ -502,15 +504,22 @@ class Checker:
                     help_text="spec section 1.3 requires reproducible results; "
                               "time, I/O and unseeded entropy break that")
         # An undeclared effect that the body performs is worth reporting so
-        # signatures stay honest.
+        # signatures stay honest.  Spec section 7 makes effects part of a
+        # function's contract, so under the strict profile a signature that
+        # understates what the body does is an error rather than advice; the
+        # looser profiles keep it a warning so existing code can be migrated.
         undeclared = sorted(inferred - set(info.declared_effects) - {"pure"})
         if undeclared and info.declared_effects:
-            self.warn(
-                f"function `{decl.name}` performs "
-                f"{', '.join(undeclared)} but does not declare it",
-                decl.pos, phase=Phase.EFFECT, code="W-effect-undeclared",
-                help_text="add the effect to the function body, e.g. a line "
-                          "reading `" + ", ".join(undeclared) + "`")
+            message = (f"function `{decl.name}` performs "
+                       f"{', '.join(undeclared)} but does not declare it")
+            help_text = ("add the effect to the function body, e.g. a line "
+                         "reading `" + ", ".join(undeclared) + "`")
+            if self.profile == "strict":
+                self.error(message, decl.pos, phase=Phase.EFFECT,
+                           code="E-effect-undeclared", help_text=help_text)
+            else:
+                self.warn(message, decl.pos, phase=Phase.EFFECT,
+                          code="W-effect-undeclared", help_text=help_text)
 
     def check_pipeline(self, decl: A.PipelineDecl) -> None:
         info = self.functions[decl.name]
@@ -751,6 +760,11 @@ class Checker:
 
     def stmt_ExprStmt(self, st: A.ExprStmt, scope: Scope) -> None:
         ty = self.infer(st.expr, scope)
+        if isinstance(ty, T.NeverType) and self.current_fn is not None:
+            # `panic(...)` and friends never fall through, so a body ending in
+            # one has no missing return; demanding `return` after it would ask
+            # for unreachable code.
+            self.current_fn.diverges = True
         if isinstance(ty, T.ResultType):
             self.used_results.discard(id(st.expr))
             self.bag.add(Diagnostic(
@@ -920,6 +934,10 @@ class Checker:
                 self.error(
                     f"pattern of type {lit.render()} cannot match "
                     f"{subject.render()}", pat.pos, code="E-pattern-type")
+            # A Bool has exactly two inhabitants, so `true`/`false` arms are
+            # coverage in the same way enum variants are.
+            if isinstance(subject, T.BoolType) and isinstance(pat.value, bool):
+                out["tags"].add("true" if pat.value else "false")
             return out
         if isinstance(pat, A.CtorPat):
             tag = pat.tag
@@ -999,6 +1017,8 @@ class Checker:
             required = {"some", "none"}
         elif isinstance(subject, T.EnumType):
             required = {v.name for v in subject.variants}
+        elif isinstance(subject, T.BoolType):
+            required = {"true", "false"}
         if required is None:
             return
         missing = sorted(required - covered)

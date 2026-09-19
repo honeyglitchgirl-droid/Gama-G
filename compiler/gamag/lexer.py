@@ -256,11 +256,6 @@ class Lexer:
                 self._emit(kind, ch, start)
                 continue
 
-            if ch == "_" and not _is_ident_char(self.src[self.i + 1:self.i + 2] or " "):
-                self.i += 1
-                self._emit(TokenKind.UNDERSCORE, "_", start)
-                continue
-
             raise self._fail(
                 f"unexpected character {ch!r}", start,
                 help_text="Gama-G source must be valid UTF-8 text; this "
@@ -387,6 +382,15 @@ class Lexer:
             j += 1
         text = self.src[self.i:j]
         self.i = j
+        if text == "_":
+            # A bare `_` is the wildcard, not a name.  It has to be decided
+            # here: `_` is a legal identifier start, so this scanner always
+            # reaches it before the dedicated UNDERSCORE branch below could,
+            # and `_ => ...` was being parsed as a *binding* named `_`.  That
+            # silently broke match exhaustiveness, because the checker was
+            # told the arm covered nothing.
+            self._emit(TokenKind.UNDERSCORE, text, start, text)
+            return
         kind = HARD_KEYWORDS.get(text) if text in HARD_KEYWORD_SET else TokenKind.IDENT
         self._emit(kind, text, start, text)
 

@@ -50,7 +50,13 @@ class Outcome:
         return [d.code for d in self.diagnostics if d.code]
 
     def messages(self) -> str:
-        return "\n".join(d.message for d in self.diagnostics)
+        """Messages with their help text, which is where the fix-it lives."""
+        parts = []
+        for d in self.diagnostics:
+            parts.append(d.message)
+            if getattr(d, "help_text", None):
+                parts.append("  help: " + d.help_text)
+        return "\n".join(parts)
 
     def has_code(self, code: str) -> bool:
         return code in self.codes()
@@ -190,6 +196,29 @@ def spec_block(first: int, last: int) -> str:
         else:
             out.append(line.strip() if line.strip() else "")
     return "\n".join(out).strip() + "\n"
+
+
+def spec_block_from(first: int, limit: int = 40) -> str:
+    """The code example beginning at line `first`, to the end of its indent.
+
+    The blueprint indents examples by four spaces and returns to prose at
+    column zero, so the extent can be found rather than hard-coded; a test
+    then keeps working if lines are inserted above it.
+    """
+    lines = spec_lines()
+    out: List[str] = []
+    for line in lines[first - 1:first - 1 + limit]:
+        if line.startswith("    "):
+            out.append(line[4:])
+        elif not line.strip():
+            if out and not out[-1].strip():
+                break
+            out.append("")
+        else:
+            break
+    while out and not out[-1].strip():
+        out.pop()
+    return "\n".join(out) + "\n"
 
 
 def spec_section(number: str) -> Optional[int]:
