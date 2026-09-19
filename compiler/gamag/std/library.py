@@ -1329,10 +1329,18 @@ def _tape(ctx) -> Tape:
     return tape
 
 
+@reg("tensor.item", ("t",), ret=T.F64,
+     doc="The single scalar in a rank-0 or one-element Tensor.")
+def _tensor_item(ctx, t):
+    tensor = t if isinstance(t, GTensor) else GTensor.from_nested(t)
+    return tensor.item()
+
+
 @reg("autodiff.begin", (), ret=T.UNIT, effects=("model",),
      doc="Start recording a training graph.")
 def _ad_begin(ctx):
     ctx._autodiff_tape = Tape()
+    _NODES.clear()
     return UNIT
 
 
@@ -1365,19 +1373,16 @@ def _ad_linear(ctx, x, w, b):
     out = prod.add(b)
     parents = [p for p in (_node_of(x), _node_of(w), _node_of(b)) if p]
 
-    def backward(grad: GTensor, _x=x, _w=w, _prod=prod, _parents=parents):
-        for p in _parents:
-            pass
+    def backward(grad: GTensor, _x=x, _w=w, _prod=prod):
         if _node_of(_x) is not None:
             tape.accumulate(_node_of(_x), grad.matmul(_w.transpose()))
         if _node_of(_w) is not None:
             tape.accumulate(_node_of(_w), _x.transpose().matmul(grad))
-        if _node_of(b) is not None:
-            node = _node_of(b)
-            if node.grad is None:
-                tape.accumulate(node, grad.sum(axis=0) if grad.rank == 2 else grad)
-            else:
-                tape.accumulate(node, grad.sum(axis=0) if grad.rank == 2 else grad)
+        node = _node_of(b)
+        if node is not None:
+            # The bias is added to every row, so its gradient is the sum of
+            # the incoming gradients over the batch axis.
+            tape.accumulate(node, grad.sum(axis=0) if grad.rank == 2 else grad)
 
     node = tape.record(out, parents, backward, "linear")
     _NODES[id(out)] = node
@@ -1451,9 +1456,14 @@ def _ad_step(ctx, params, lr):
         if p._grad is None:
             continue
         p.data = [v - float(lr) * g for v, g in zip(p.data, p._grad.data)]
-        p._grad = None
-    ctx._autodiff_tape = Tape()
-    _NODES.clear()
+    # Zero the gradients but keep the leaves registered: a training loop
+    # reuses the same parameters on the next iteration.
+    tape = getattr(ctx, "_autodiff_tape", None)
+    if tape is not None:
+        tape.reset()
+    else:
+        for p in params:
+            p._grad = None
     return UNIT
 
 

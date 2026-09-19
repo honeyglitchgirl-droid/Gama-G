@@ -269,29 +269,75 @@ class GTensor(GamaValue):
     def _binary(self, other: Any, op: Callable[[Any, Any], Any],
                 name: str, dtype: Optional[str] = None) -> "GTensor":
         out_dtype = dtype or self.dtype
-        if isinstance(other, GTensor):
-            if other.shape == ():
-                scalar = other.data[0] if other.data else 0
-                return GTensor(out_dtype, self.shape,
-                               [op(v, scalar) for v in self.data])
-            if self.shape == ():
-                s = self.data[0] if self.data else 0
-                return GTensor(out_dtype, other.shape,
-                               [op(s, v) for v in other.data])
-            if other.shape != self.shape:
-                raise TensorError(
-                    f"shape mismatch in `{name}`: {self.type_name()} vs "
-                    f"{other.type_name()}",
-                    left=list(self.shape), right=list(other.shape),
-                    hint="Gama-G v0.1 broadcasts scalars only; align shapes "
-                         "explicitly with `tensor.reshape` or `tensor.broadcast`")
-            return GTensor(out_dtype, self.shape,
-                           [op(a, b) for a, b in zip(self.data, other.data)])
-        if isinstance(other, (int, float, bool)):
+        if isinstance(other, bool):
+            other = int(other)
+        if isinstance(other, (int, float)):
             return GTensor(out_dtype, self.shape,
                            [op(v, other) for v in self.data])
-        raise TensorError(f"`{name}` expects a Tensor or scalar operand, "
-                          f"got {type(other).__name__}")
+        if not isinstance(other, GTensor):
+            raise TensorError(
+                f"`{name}` expects a Tensor or scalar operand, got "
+                f"{type(other).__name__}")
+        if other.shape == self.shape:
+            return GTensor(out_dtype, self.shape,
+                           [op(a, b) for a, b in zip(self.data, other.data)])
+        if other.shape == ():
+            scalar = other.data[0] if other.data else 0
+            return GTensor(out_dtype, self.shape,
+                           [op(v, scalar) for v in self.data])
+        if self.shape == ():
+            s = self.data[0] if self.data else 0
+            return GTensor(out_dtype, other.shape,
+                           [op(s, v) for v in other.data])
+
+        out_shape = _broadcast_shapes(self.shape, other.shape)
+        if out_shape is None:
+            raise TensorError(
+                f"shape mismatch in `{name}`: {self.type_name()} vs "
+                f"{other.type_name()}",
+                left=list(self.shape), right=list(other.shape),
+                hint="shapes broadcast when every trailing dimension is equal "
+                     "or 1; align them with `tensor.reshape`")
+        left_strides = _broadcast_strides(self.shape, out_shape)
+        right_strides = _broadcast_strides(other.shape, out_shape)
+        out_strides = _strides_for(out_shape)
+        rank = len(out_shape)
+        data: List[Any] = []
+        index = [0] * rank
+        for _ in range(_prod(out_shape)):
+            left_off = 0
+            right_off = 0
+            for d in range(rank):
+                left_off += index[d] * left_strides[d]
+                right_off += index[d] * right_strides[d]
+            data.append(op(self.data[left_off], other.data[right_off]))
+            for d in range(rank - 1, -1, -1):
+                index[d] += 1
+                if index[d] < out_shape[d]:
+                    break
+                index[d] = 0
+        return GTensor(out_dtype, out_shape, data)
+
+    # Python operator hooks, so host code (and the interpreter's BINOP path)
+    # can use ordinary arithmetic on tensors.
+    def __add__(self, other): return self.add(other)
+    def __radd__(self, other): return _scalar_or_tensor(other, self.dtype).add(self)
+    def __sub__(self, other): return self.sub(other)
+    def __rsub__(self, other): return _scalar_or_tensor(other, self.dtype).sub(self)
+    def __mul__(self, other): return self.mul(other)
+    def __rmul__(self, other): return _scalar_or_tensor(other, self.dtype).mul(self)
+    def __truediv__(self, other): return self.div(other)
+    def __neg__(self): return self.neg()
+
+    def item(self) -> Any:
+        """The single scalar held by a rank-0 or one-element tensor."""
+        if len(self.data) != 1:
+            raise TensorError(
+                f"`item` needs a tensor with exactly one element, but "
+                f"{self.type_name()} has {len(self.data)}",
+                hint="reduce it first, e.g. `tensor.mean`, or index with "
+                     "`tensor.at`")
+        return self.data[0]
 
     def add(self, other): return self._binary(other, lambda a, b: a + b, "add")
     def sub(self, other): return self._binary(other, lambda a, b: a - b, "sub")
@@ -502,6 +548,33 @@ def _strides_for(shape: Sequence[int]) -> Tuple[int, ...]:
     return tuple(strides)
 
 
+def _broadcast_shapes(a: Tuple[int, ...],
+                      b: Tuple[int, ...]) -> Optional[Tuple[int, ...]]:
+    """NumPy broadcasting rules: align trailing dimensions, each pair must be
+    equal or contain a 1.  Returns None when the shapes are incompatible."""
+    rank = max(len(a), len(b))
+    pa = (1,) * (rank - len(a)) + tuple(a)
+    pb = (1,) * (rank - len(b)) + tuple(b)
+    out: List[int] = []
+    for x, y in zip(pa, pb):
+        if x == y or x == 1 or y == 1:
+            out.append(x if x >= y else y)
+        else:
+            return None
+    return tuple(out)
+
+
+def _broadcast_strides(shape: Tuple[int, ...],
+                       out_shape: Tuple[int, ...]) -> Tuple[int, ...]:
+    """Row-major strides for `shape` inside `out_shape`, with a stride of 0
+    wherever the source dimension is 1 -- which is what makes reading that
+    axis repeat the same element instead of advancing."""
+    rank = len(out_shape)
+    padded = (1,) * (rank - len(shape)) + tuple(shape)
+    strides = list(_strides_for(padded))
+    return tuple(0 if padded[d] == 1 else strides[d] for d in range(rank))
+
+
 def _scalar_or_tensor(value: Any, dtype: str) -> GTensor:
     return GTensor(dtype if dtype in _FLOAT_DTYPES else "F64", (), [value])
 
@@ -554,8 +627,11 @@ class Tape:
                 shape=list(loss_node.tensor.shape))
         loss_node.grad = GTensor(loss_node.tensor.dtype,
                                  loss_node.tensor.shape, [1.0])
-        order = self._topo(loss_node)
-        for node in reversed(order):
+        # `_topo` yields the loss first and every node before its own
+        # parents, which is the order reverse-mode differentiation needs:
+        # a node's backward can only run once its gradient has arrived from
+        # the node that consumed it.
+        for node in self._topo(loss_node):
             if node.backward is None or node.grad is None:
                 continue
             node.backward(node.grad)
@@ -564,17 +640,42 @@ class Tape:
                 leaf.tensor._grad = leaf.grad
 
     def _topo(self, root: TapeNode) -> List[TapeNode]:
+        """Post-order DFS over the parents, then reversed.
+
+        A plain preorder walk is not enough: when a node is reachable by two
+        paths it can be emitted before one of its own parents, and gradients
+        would then arrive too late to be propagated.
+        """
         order: List[TapeNode] = []
-        seen = set()
-        stack = [root]
+        seen: set = set()
+        stack: List[Tuple[TapeNode, bool]] = [(root, False)]
         while stack:
-            node = stack.pop()
+            node, expanded = stack.pop()
+            if expanded:
+                order.append(node)
+                continue
             if id(node) in seen:
                 continue
             seen.add(id(node))
-            order.append(node)
-            stack.extend(node.parents)
+            stack.append((node, True))
+            for parent in node.parents:
+                if id(parent) not in seen:
+                    stack.append((parent, False))
+        order.reverse()
         return order
+
+    def reset(self) -> None:
+        """Drop intermediate nodes and zero gradients, keeping the leaves.
+
+        A training loop records a fresh subgraph every iteration but reuses
+        the same parameters, so the leaves must stay registered while their
+        accumulated gradients are cleared.
+        """
+        for leaf in self.leaves:
+            leaf.grad = GTensor(leaf.tensor.dtype, leaf.tensor.shape)
+            leaf.tensor._grad = None
+        self.nodes = {id(leaf.tensor): leaf for leaf in self.leaves}
+        self.ops = 0
 
     def accumulate(self, node: TapeNode, grad: GTensor) -> None:
         if node.grad is None:

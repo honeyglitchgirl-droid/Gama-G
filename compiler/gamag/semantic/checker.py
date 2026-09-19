@@ -1176,6 +1176,30 @@ class Checker:
                 if op == "/" and isinstance(left, T.DurationType) and \
                         isinstance(right, (T.IntType, T.FloatType)):
                     return T.DURATION
+            if isinstance(left, T.TensorType) or isinstance(right, T.TensorType):
+                # Spec section 14: tensors are first-class, so elementwise
+                # arithmetic on them is an operator, not a library call.
+                tensor_ty = left if isinstance(left, T.TensorType) else right
+                other = right if isinstance(left, T.TensorType) else left
+                if isinstance(other, T.TensorType):
+                    joined = T.unify(tensor_ty.elem, other.elem)
+                    if isinstance(joined, T.ErrorType):
+                        self.error(
+                            f"`{op}` cannot combine Tensor elements of type "
+                            f"{tensor_ty.elem.render()} with "
+                            f"{other.elem.render()}", e.pos,
+                            code="E-binop-type")
+                        return T.ERROR
+                    return T.TensorType(joined, tensor_ty.shape)
+                if isinstance(other, (T.IntType, T.FloatType, T.DecimalType)):
+                    return tensor_ty
+                self.error(
+                    f"`{op}` cannot apply to {left.render()} and "
+                    f"{right.render()}", e.pos, code="E-binop-type",
+                    help_text="a Tensor combines elementwise with another "
+                              "Tensor or with a scalar; use `tensor.matmul` "
+                              "for matrix products")
+                return T.ERROR
             if not left.is_numeric or not right.is_numeric:
                 self.error(
                     f"`{op}` cannot apply to {left.render()} and "
@@ -1647,6 +1671,10 @@ def _is_text(ty: T.Type) -> bool:
 def _numeric_op_applies(op: str, left: T.Type, right: T.Type) -> bool:
     if op == "+" and (_is_text(left) and _is_text(right)):
         return True
+    if isinstance(left, T.TensorType) or isinstance(right, T.TensorType):
+        other = right if isinstance(left, T.TensorType) else left
+        return isinstance(other, (T.TensorType, T.IntType, T.FloatType,
+                                  T.DecimalType, T.AnyType, T.ErrorType))
     return left.is_numeric and right.is_numeric and \
         not isinstance(T.unify(left, right), T.ErrorType)
 
