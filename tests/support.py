@@ -146,14 +146,24 @@ def compile_only(source: str, *, profile: str = "strict", opt_level: int = 1,
 
 def run(source: str, *, entry: str = "main", profile: str = "standard",
         opt_level: int = 1, grants: Tuple[str, ...] = (),
-        path: str = "<test>", seed: int = 0) -> Outcome:
-    """Compile and run, capturing the program's output and context."""
+        path: str = "<test>", seed: int = 0,
+        deterministic: bool = True) -> Outcome:
+    """Compile and run, capturing the program's output and context.
+
+    Deterministic by default, as `ggc run` is, so the audit chain and the
+    RNG stream are reproducible across runs (spec section 1.3).
+    """
     compilation = compile_source(source, path, profile=profile,
                                  opt_level=opt_level, grants=grants)
     if not compilation.ok:
         return Outcome(source=source, compilation=compilation)
     buffer = io.StringIO()
-    context = Context(grants=set(grants), stdout=buffer, seed=seed)
+    # The module's own `grant` header is part of the program; without merging
+    # it in, every example that declares capabilities would fail here for a
+    # reason that has nothing to do with the language.
+    declared = set(compilation.checker.grants) if compilation.checker else set()
+    context = Context(grants=declared | set(grants), stdout=buffer, seed=seed,
+                      deterministic=deterministic)
     name = find_entry(compilation, preferred=entry)
     execution = execute(compilation, entry=name, context=context, grants=grants)
     return Outcome(source=source, compilation=compilation,

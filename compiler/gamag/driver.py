@@ -189,8 +189,14 @@ def execute(compilation: Compilation, *, entry: str = "main",
     """Run a compiled program on the GAEM reference interpreter."""
     if compilation.program is None:
         raise ValueError("cannot execute a compilation that produced no GIR")
+    # Deterministic by default, matching `ggc run`.  Spec section 1.3 makes
+    # reproducibility the promise the language is sold on, so tying it to the
+    # strict profile meant a library caller using the default profile got
+    # wall-clock timestamps and random event ids in the audit chain -- and
+    # therefore a different chain hash on every run.  Non-determinism is the
+    # explicit opt-out: pass your own Context, or `--lenient-runtime`.
     ctx = context or Context(
-        deterministic=(compilation.profile == "strict"),
+        deterministic=True,
         grants=set(grants) | set(compilation.checker.grants
                                  if compilation.checker else ()),
         program_version=GIR_VERSION)
