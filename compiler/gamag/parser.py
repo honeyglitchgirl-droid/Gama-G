@@ -67,6 +67,11 @@ _CMP_OPS = {
 }
 
 
+# Type names whose arguments the specification writes in parentheses rather
+# than angle brackets: `Tuple(I64, Text)` (spec section 6).
+PAREN_TYPE_ARGS = {"Tuple", "Fn"}
+
+
 class Parser:
     def __init__(self, tokens: List[Token], filename: str = "<input>",
                  source: str = ""):
@@ -544,6 +549,12 @@ class Parser:
         args: List[A.TypeArg] = []
         if self.at(TokenKind.LT):
             args = self._parse_type_args()
+        elif self.at(TokenKind.LPAREN) and parts[-1] in PAREN_TYPE_ARGS:
+            # The specification writes this family with parentheses --
+            # `Tuple(...)` in section 6 -- rather than angle brackets.  It is
+            # limited to the names that use that spelling so a type followed
+            # by an unrelated `(` cannot be misread as a type argument list.
+            args = self._parse_type_args()
         caps: List[str] = []
         if self.at(TokenKind.LBRACKET):
             self.adv()
@@ -566,16 +577,21 @@ class Parser:
                          args=args, caps=caps)
 
     def _parse_type_args(self) -> List[A.TypeArg]:
-        self.expect(TokenKind.LT, "`<`")
+        parenthesised = self.at(TokenKind.LPAREN)
+        opener = TokenKind.LPAREN if parenthesised else TokenKind.LT
+        closer = TokenKind.RPAREN if parenthesised else TokenKind.GT
+        self.expect(opener, "`<` or `(` to open a type argument list")
         args: List[A.TypeArg] = []
-        while not self.at(TokenKind.GT, TokenKind.EOF):
+        while not self.at(closer, TokenKind.EOF):
             if self.at(TokenKind.LBRACKET):
                 args.append(self._parse_shape())
             else:
                 args.append(self.parse_type())
             if not self.accept(TokenKind.COMMA):
                 break
-        self.expect(TokenKind.GT, "`>` to close a type argument list")
+        self.expect(closer,
+                    ("`)`" if parenthesised else "`>`")
+                    + " to close a type argument list")
         return args
 
     def _parse_shape(self) -> A.ShapeLit:

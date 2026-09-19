@@ -31,7 +31,8 @@ from ..diagnostics import GamaRuntimeFault, TypeFault
 from ..runtime.context import KNOWN_CAPABILITIES
 from ..runtime.tensor import GTensor, Tape, TapeNode, parameter as _parameter
 from ..runtime.values import (GCapability, GDuration, GFunction, GInstant,
-                              GOption, GRecord, GResult, GSecret, GUnit, GUuid,
+                              GBytes, GOption, GRecord, GResult, GSecret,
+                              GUnit, GUri, GUuid,
                               GVariant, UNIT, canonical, display, to_text,
                               truthy, type_name, unwrap_secret)
 from ..semantic import types as T
@@ -222,6 +223,55 @@ def _to_text(ctx, value):
 @reg("str", ("value",), ret=T.TEXT, prelude=True, doc="Alias of `to_text`.")
 def _str(ctx, value):
     return to_text(value)
+
+
+# `Bytes` and `URI` are listed among the language's types (spec section 6) but
+# had no way to be constructed, which made them uninhabited: a program could
+# annotate a binding with them and never produce a value.
+# Registered under the `bytes.` prefix rather than as a bare `bytes`, because
+# a bare builtin of that name shadows the whole module: `bytes.length(b)`
+# would parse as member access on the constructor.  Module-qualified spelling
+# matches the rest of the library (`text.upper`, `crypto.uuid`).
+@reg("bytes.from_text", ("value",), ret=T.BYTES, prelude=True,
+     doc="Encode Text as UTF-8 Bytes.")
+def _bytes(ctx, value):
+    if isinstance(value, GBytes):
+        return value
+    if isinstance(value, (bytes, bytearray)):
+        return GBytes(bytes(value))
+    return GBytes(to_text(value).encode("utf-8"))
+
+
+@reg("bytes.to_text", ("value",), ret=T.TEXT, prelude=True,
+     doc="Decode Bytes as UTF-8 Text, replacing undecodable bytes.")
+def _bytes_to_text(ctx, value):
+    data = value.data if isinstance(value, GBytes) else bytes(value or b"")
+    return data.decode("utf-8", "replace")
+
+
+@reg("bytes.length", ("value",), ret=T.I64, prelude=True,
+     doc="The number of bytes.")
+def _bytes_length(ctx, value):
+    data = value.data if isinstance(value, GBytes) else bytes(value or b"")
+    return len(data)
+
+
+@reg("bytes.hex", ("value",), ret=T.TEXT, prelude=True,
+     doc="Lower-case hexadecimal, for logging a digest safely.")
+def _bytes_hex(ctx, value):
+    data = value.data if isinstance(value, GBytes) else bytes(value or b"")
+    return data.hex()
+
+
+@reg("uri", ("value",), ret=T.URI, prelude=True,
+     doc="Construct a URI from Text.")
+def _uri(ctx, value):
+    if isinstance(value, GUri):
+        return value
+    text = to_text(value)
+    if "://" not in text and not text.startswith("/"):
+        raise BuiltinFault(f"`{text}` is not a URI: it has no scheme")
+    return GUri(text)
 
 
 def _numeric_cast(kind):
@@ -1743,16 +1793,13 @@ def _cap_grants(ctx, cap, permission):
 # ----------------------------------------------------------------------
 # lookup helpers used by the checker and the VM
 # ----------------------------------------------------------------------
-MODULE_TYPE_NAMES = {
-    "core": T.ModuleType("core"), "math": T.ModuleType("math"),
-    "text": T.ModuleType("text"), "collections": T.ModuleType("collections"),
-    "time": T.ModuleType("time"), "io": T.ModuleType("io"),
-    "crypto": T.ModuleType("crypto"), "secrets": T.ModuleType("secrets"),
-    "audit": T.ModuleType("audit"), "identity": T.ModuleType("identity"),
-    "policy": T.ModuleType("policy"), "tensor": T.ModuleType("tensor"),
-    "autodiff": T.ModuleType("autodiff"), "model": T.ModuleType("model"),
-    "dataset": T.ModuleType("dataset"), "medical": T.ModuleType("medical"),
-    "capabilities": T.ModuleType("capabilities"),
+# Every module that exposes at least one dotted builtin is a name a program
+# can write.  This is derived from MODULES, which `reg` fills in as each
+# builtin is registered, rather than being a second hand-maintained list: a
+# manually kept table silently drifts, and then `bytes.to_text(b)` fails with
+# "cannot find `bytes`" even though the builtin exists.
+MODULE_TYPE_NAMES: Dict[str, T.ModuleType] = {
+    module: T.ModuleType(module) for module in sorted(MODULES)
 }
 
 

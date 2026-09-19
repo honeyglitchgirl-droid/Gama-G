@@ -1408,6 +1408,7 @@ class Checker:
         self._record_builtin_effects(b, e)
         self.check_capability_requirements(b.caps, e.pos, b.name)
         self.check_secret_arguments(b, arg_types, e)
+        self._check_literal_capability_request(b, e)
 
         if b.variadic:
             minimum = b.min_args if b.min_args is not None else len(b.params)
@@ -1483,6 +1484,33 @@ class Checker:
             if self.current_fn is not None:
                 self.current_fn.caps.update(target.caps)
         return ftype.ret
+
+    def _check_literal_capability_request(self, b: L.Builtin,
+                                          e: A.Call) -> None:
+        """Reject `capabilities.open(base, ["Write"])` when Write is not granted.
+
+        The permission list and the module's `grant` header are both usually
+        written literally, so the runtime's capability check can be brought
+        forward to compile time.  When the list is computed at run time this
+        returns without a verdict and the runtime still enforces it, so the
+        guarantee in spec section 12 does not depend on this check.
+        """
+        if b.name != "capabilities.open" or len(e.args) < 2:
+            return
+        requested = e.args[1]
+        if not isinstance(requested, A.ListLit):
+            return
+        caps: List[str] = []
+        for element in requested.items:
+            if not (isinstance(element, A.Literal)
+                    and isinstance(element.value, str)):
+                return
+            caps.append(element.value)
+        base = e.args[0]
+        label = (base.value if isinstance(base, A.Literal)
+                 and isinstance(base.value, str) else "resource")
+        self.check_capability_requirements(
+            caps, requested.pos, f"capabilities.open({label})")
 
     def check_capability_requirements(self, caps: Sequence[str],
                                       pos: SourcePos, what: str) -> None:
@@ -1569,6 +1597,14 @@ class Checker:
         if isinstance(obj_type, T.EnumType):
             for variant in obj_type.variants:
                 if variant.name == e.attr:
+                    # A payload-less variant is a value of the enum, while a
+                    # variant with a payload is a constructor function.  The
+                    # variant symbol already carries whichever it is; returning
+                    # the enum type unconditionally made `Route.Oral(250.0)`
+                    # look like a call on a non-callable.
+                    sym = self.globals.lookup(e.attr)
+                    if sym is not None and sym.kind == "variant":
+                        return sym.type
                     return obj_type
             self.error(f"enum `{obj_type.name}` has no variant `{e.attr}`",
                        e.pos, code="E-no-member")
@@ -1949,6 +1985,9 @@ def _member_table(ty: T.Type) -> Optional[Dict[str, T.Type]]:
         return with_methods("map", {"size": T.I64, "len": T.I64,
                                     "keys": T.ListType(ty.key),
                                     "values": T.ListType(ty.value)})
+    if isinstance(ty, T.BytesType):
+        return with_methods("bytes", {"length": T.I64, "len": T.I64,
+                                      "text": T.TEXT})
     if isinstance(ty, T.DurationType):
         return {"seconds": T.F64, "ms": T.F64}
     if isinstance(ty, T.InstantType):

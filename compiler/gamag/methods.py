@@ -99,6 +99,12 @@ TEXT_METHODS: Dict[str, Optional[str]] = {
     "join": "text.join",
 }
 
+# ------------------------------------------------------------------- bytes
+BYTES_METHODS: Dict[str, Optional[str]] = {
+    "to_text": "bytes.to_text", "length": "bytes.length",
+    "len": "bytes.length", "size": "bytes.length", "hex": "bytes.hex",
+}
+
 # ------------------------------------------------------------------ tensor
 TENSOR_NATIVE = {
     "add", "sub", "mul", "div", "matmul", "dot", "relu", "sigmoid", "tanh",
@@ -138,4 +144,5 @@ def table_for(kind: str) -> Dict[str, Optional[str]]:
         "result": RESULT_METHODS,
         "text": TEXT_METHODS,
         "secret": SECRET_METHODS,
+        "bytes": BYTES_METHODS,
     }[kind]

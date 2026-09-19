@@ -351,6 +351,14 @@ class FunctionBuilder:
             return self.slot_op(dst)
 
         if isinstance(callee, A.Member):
+            variant = self._qualified_variant(callee.obj, callee.attr)
+            if variant is not None:
+                # `Route.Oral(250.0)`: same construction as the bare name.
+                name, enum_name, _ = variant
+                self.emit(Op.MAKE_VARIANT, args, dst=dst,
+                          type_=(e.inferred or T.ANY),
+                          meta={"tag": name, "enum": enum_name}, pos=e.pos)
+                return self.slot_op(dst)
             obj_sym = self.checker.resolved.get(id(callee.obj)) \
                 if isinstance(callee.obj, A.Name) else None
             if isinstance(obj_sym, Symbol) and obj_sym.kind == "module":
@@ -382,11 +390,38 @@ class FunctionBuilder:
         if isinstance(obj_sym, Symbol) and obj_sym.kind == "module":
             return Operand(kind="builtin", name=f"{obj_sym.name}.{e.attr}",
                            type=(e.inferred or T.ANY))
+        variant = self._qualified_variant(e.obj, e.attr)
+        if variant is not None:
+            # `Colour.Red`: the enum name is a type, not a value, so it cannot
+            # be lowered as a global.  The variant itself is already a symbol
+            # under its bare name; qualify it to the same constant.
+            name, enum_name, vtype = variant
+            return self.const(Const.variant(name, enum_name), vtype)
         obj = self.expr(e.obj)
         dst = self.temp(e.inferred or T.ANY)
         self.emit(Op.FIELD, [obj], dst=dst, type_=(e.inferred or T.ANY),
                   meta={"name": e.attr}, pos=e.pos)
         return self.slot_op(dst)
+
+    def _qualified_variant(self, obj: Optional[A.Expr],
+                           attr: str) -> Optional[Tuple[str, str, T.Type]]:
+        """Resolve `EnumName.Variant` to (variant, enum, type), or None.
+
+        Payload-less variants are values (`Colour.Red`) and variants with
+        payloads are constructors (`Route.Oral(250)`); both are written
+        qualified, and neither has a runtime value behind the enum name.
+        """
+        if not isinstance(obj, A.Name):
+            return None
+        obj_sym = self.checker.globals.lookup(obj.id)
+        if obj_sym is None or obj_sym.kind != "enum":
+            return None
+        enum_name = self.checker.variants.get(attr, ("", None))[0]
+        if enum_name != obj.id:
+            return None
+        variant_sym = self.checker.globals.lookup(attr)
+        vtype = variant_sym.type if variant_sym is not None else T.ANY
+        return attr, enum_name, vtype
 
     def e_Index(self, e: A.Index) -> Operand:
         obj = self.expr(e.obj)
