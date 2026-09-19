@@ -243,8 +243,12 @@ class RecoveryEngine:
         fields = {
             "component": name,
             "recovery_action": step.raw or step.action,
-            "level": action.level,
-            "level_name": LEVEL_NAMES.get(action.level, str(action.level)),
+            # Named `recovery_level`, not `level`: `level` is the audit
+            # record's severity, and colliding with it would silently drop
+            # one of the two from the trail.
+            "recovery_level": action.level,
+            "recovery_level_name": LEVEL_NAMES.get(action.level,
+                                                   str(action.level)),
             "succeeded": ok,
             "detail": action.detail,
         }

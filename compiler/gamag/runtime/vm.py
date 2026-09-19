@@ -143,6 +143,8 @@ class VM:
         self.depth = 0
         self._armed_checkpoint: Optional[float] = None
         self._since_poll = 0
+        # Whether the `<main>` module initializer has run yet.
+        self._initialized = False
         self.dispatch = {
             Op.CONST: self.op_const, Op.COPY: self.op_copy,
             Op.LOAD_GLOBAL: self.op_load_global,
@@ -241,7 +243,24 @@ class VM:
     # ------------------------------------------------------------------
     # entry points
     # ------------------------------------------------------------------
+    def _ensure_initialized(self) -> None:
+        """Run the module initializer exactly once.
+
+        Top-level bindings are lowered into a synthetic `<main>` function, so
+        it must execute before any user entry point reads them.
+        """
+        if self._initialized:
+            return
+        self._initialized = True
+        init = self.prog.functions.get("<main>")
+        if init is not None:
+            self.execute(init, [])
+
     def run(self, entry: str = "<main>", args: Sequence[Any] = ()) -> Any:
+        if entry == "<main>":
+            self._initialized = True
+        else:
+            self._ensure_initialized()
         fn = self.prog.functions.get(entry)
         if fn is None:
             raise GamaRuntimeFault("NoEntryPoint",
@@ -474,7 +493,12 @@ class VM:
         self.store(frame, instr.dst, self.globals[instr.meta["name"]])
 
     def op_store_global(self, frame: Frame, instr: Instr) -> None:
-        self.globals[instr.meta["name"]] = self.resolve(frame, instr.args[0])
+        name = instr.meta["name"]
+        value = self.resolve(frame, instr.args[0])
+        # A top-level `secret` binding stays secret wherever it is read from.
+        if instr.meta.get("secret") and not isinstance(value, GSecret):
+            value = GSecret(value, name)
+        self.globals[name] = value
 
     def op_binop(self, frame: Frame, instr: Instr) -> None:
         a = self.resolve(frame, instr.args[0])
@@ -867,6 +891,24 @@ class VM:
                   pos: Optional[SourcePos] = None) -> Any:
         if isinstance(obj, GSecret):
             raise SecretLeak("cannot index into a secret value", pos)
+        if isinstance(obj, GVariant):
+            # `NegativeInput(reason)` binds its payload positionally.
+            i = int(index)
+            if not -len(obj.args) <= i < len(obj.args):
+                raise GamaRuntimeFault(
+                    "IndexOutOfRange",
+                    f"variant `{obj.tag}` carries {len(obj.args)} payload "
+                    f"value(s); index {i} is out of range", pos)
+            return obj.args[i]
+        if isinstance(obj, GTensor):
+            flat = obj.flat()
+            i = int(index)
+            if not -len(flat) <= i < len(flat):
+                raise GamaRuntimeFault(
+                    "IndexOutOfRange",
+                    f"index {i} is out of range for a Tensor with "
+                    f"{len(flat)} element(s)", pos)
+            return flat[i]
         if isinstance(obj, list) or isinstance(obj, tuple):
             i = int(index)
             if not -len(obj) <= i < len(obj):
@@ -1036,37 +1078,51 @@ class VM:
     # parallel regions -- the operation graph (spec sections 3, 9C)
     # ------------------------------------------------------------------
     def op_parallel(self, frame: Frame, instr: Instr) -> None:
+        """Execute a data-parallel operation graph (spec sections 3 and 9C).
+
+        Dependence analysis in the builder produced a partial order over the
+        region's tasks.  Tasks are grouped into topological levels; everything
+        within a level is independent and runs concurrently, and a level's
+        writes are committed before the next level reads them -- which is what
+        makes `c = computeC(a, b)` see the values `a` and `b` produced.
+
+        Writes within a level are applied in program order, so the region's
+        final state does not depend on the schedule the graph happened to
+        admit.  That is the determinism guarantee of spec section 1.3.
+        """
         tasks = instr.meta["tasks"]
         if not tasks:
             return
         self.ctx.stats.parallel_regions += 1
-        results: Dict[str, Dict[str, Any]] = {}
 
         for level in _topological_levels(tasks):
+            level = sorted(level, key=lambda t: t["index"])
             if len(level) == 1:
-                task = level[0]
-                results[task["name"]] = self._run_task(frame, task)
-                continue
-            with ThreadPoolExecutor(max_workers=min(len(level), 8),
-                                    thread_name_prefix="gaem") as pool:
-                futures = [(task, pool.submit(self._run_task, frame, task))
-                           for task in level]
-                for task, future in futures:
-                    results[task["name"]] = future.result()
+                produced = {level[0]["name"]: self._run_task(frame, level[0])}
+            else:
+                produced = {}
+                with ThreadPoolExecutor(max_workers=min(len(level), 8),
+                                        thread_name_prefix="gaem") as pool:
+                    futures = [(task, pool.submit(self._run_task, frame, task))
+                               for task in level]
+                    for task, future in futures:
+                        produced[task["name"]] = future.result()
+            self._commit_writes(frame, level, produced)
 
-        # Writes are applied in program order, so the region's result is
-        # deterministic regardless of the schedule the graph admitted.
-        for task in tasks:
-            produced = results.get(task["name"]) or {}
-            for name, slot in zip(task["writes"], task["write_slots"]):
-                if name not in produced:
-                    continue
-                if slot is not None and slot >= 0:
-                    self.store(frame, slot, produced[name])
-                else:
-                    self.globals[name] = produced[name]
         if instr.dst >= 0:
             self.store(frame, instr.dst, len(tasks))
+
+    def _commit_writes(self, frame: Frame, tasks: List[Dict[str, Any]],
+                       produced: Dict[str, Dict[str, Any]]) -> None:
+        for task in tasks:
+            values = produced.get(task["name"]) or {}
+            for name, slot in zip(task["writes"], task["write_slots"]):
+                if name not in values:
+                    continue
+                if slot is not None and slot >= 0:
+                    self.store(frame, slot, values[name])
+                else:
+                    self.globals[name] = values[name]
 
     def _run_task(self, frame: Frame, task: Dict[str, Any]) -> Dict[str, Any]:
         self.ctx.stats.parallel_tasks += 1
@@ -1108,6 +1164,7 @@ class VM:
         if outcome.recovered:
             self.ctx.stats.recoveries_succeeded += 1
         record = GRecord("RecoveryOutcome", {
+            "value": outcome.value,
             "recovered": outcome.recovered,
             "level": outcome.level,
             "level_name": outcome.level_name,

@@ -22,12 +22,7 @@ from ..std import library as L
 from . import types as T
 
 # Builtins allowed to receive a `secret` value (spec section 8).
-SECRET_SAFE = {
-    "secrets.wrap", "secrets.expose", "secrets.redact", "secrets.is_secret",
-    "secrets.fingerprint", "crypto.sha256", "crypto.sha512", "crypto.blake2b",
-    "crypto.hmac_sha256", "crypto.sign", "crypto.constant_time_eq",
-    "crypto.hex", "audit.emit",
-}
+SECRET_SAFE = L.SECRET_SAFE
 
 # Effects that a `deterministic` function must not perform (spec 1.3).
 NONDETERMINISTIC_EFFECTS = {"io", "network", "storage"}
@@ -116,6 +111,12 @@ class Checker:
         self.transactions: Dict[str, A.TransactionDecl] = {}
         self.tests: List[A.TestDecl] = []
         self.grants: Set[str] = set(module.grants)
+        # ids of NamePat nodes that denote an enum variant rather than a
+        # binding; the GIR builder reads this to emit a tag test.
+        self.variant_patterns: Set[int] = set()
+        # Suppresses diagnostics during speculative inference (see
+        # _declare_parallel_outputs).
+        self._quiet = False
         self.imports: Set[str] = set()
         self.current_fn: Optional[FunctionInfo] = None
         self.used_results: Set[int] = set()
@@ -137,12 +138,14 @@ class Checker:
     def error(self, message: str, pos: Optional[SourcePos] = None,
               phase: Phase = Phase.TYPE, code: Optional[str] = None,
               help_text: Optional[str] = None) -> None:
+        if self._quiet:
+            return
         self.bag.error(message, pos, phase=phase, code=code, help_text=help_text)
 
     def warn(self, message: str, pos: Optional[SourcePos] = None,
              phase: Phase = Phase.TYPE, code: Optional[str] = None,
              help_text: Optional[str] = None) -> None:
-        if self.profile == "lenient":
+        if self._quiet or self.profile == "lenient":
             return
         self.bag.warning(message, pos, phase=phase, code=code,
                          help_text=help_text)
@@ -808,6 +811,27 @@ class Checker:
             out["wildcard"] = True
             return out
         if isinstance(pat, A.NamePat):
+            # A bare identifier in a pattern is genuinely ambiguous: it is
+            # either a binding (`x`) or a nullary enum variant
+            # (`DivideByZero`).  The parser cannot tell them apart without
+            # semantic information, so the checker resolves it here: a name
+            # that denotes a variant tests the tag and binds nothing.
+            if pat.name in self.variants:
+                enum_name, enum = self.variants[pat.name]
+                if isinstance(subject, T.EnumType) \
+                        and subject.name != enum_name:
+                    self.error(
+                        f"pattern `{pat.name}` belongs to enum {enum_name} but "
+                        f"the subject is {subject.name}", pat.pos,
+                        code="E-pattern-type")
+                out["tags"].add(pat.name)
+                self.variant_patterns.add(id(pat))
+                return out
+            if pat.name == "none" and isinstance(
+                    subject, (T.OptionType, T.AnyType, T.ErrorType)):
+                out["tags"].add("none")
+                self.variant_patterns.add(id(pat))
+                return out
             scope.define(Symbol(pat.name, subject, "var", pos=pat.pos))
             return out
         if isinstance(pat, A.LiteralPat):
@@ -907,17 +931,54 @@ class Checker:
                           "spec section 6 requires explicit handling")
 
     def stmt_Parallel(self, st: A.Parallel, scope: Scope) -> None:
-        if self.current_fn is not None:
-            self.current_fn.effects.add("concurrency")
+        # Spec section 7 lists pure/io/network/storage/crypto/model/medical/
+        # audit/unsafe as the effect vocabulary.  Concurrency is a scheduling
+        # property the compiler derives from the operation graph (section 3),
+        # not an effect a function declares, so a `parallel` region adds none.
         inner = scope.child("parallel")
         for sym_name, sym in scope.symbols.items():
             inner.symbols.setdefault(sym_name, sym)
         if st.body:
+            self._declare_parallel_outputs(st.body.stmts, inner)
             for body_stmt in st.body.stmts:
                 self.check_stmt(body_stmt, inner)
         for name, sym in inner.symbols.items():
             if name not in scope.symbols:
                 scope.define(sym)
+
+    def _declare_parallel_outputs(self, stmts: List[A.Stmt],
+                                  inner: Scope) -> None:
+        """Bind the names a parallel region writes before checking its body.
+
+        Spec section 9C writes::
+
+            parallel
+                a = computeA()
+                b = computeB()
+                c = computeC(a, b)
+
+        Those names are *outputs* of the region, not pre-existing variables,
+        and they remain visible afterwards.  Declaring them up front, in
+        program order, is also what lets `c` see `a` and `b`.  Types come
+        from the right-hand side; that inference is run silently because the
+        body is checked properly immediately afterwards and the diagnostics
+        would otherwise be reported twice.
+        """
+        previous = self._quiet
+        self._quiet = True
+        try:
+            for st in stmts:
+                if not isinstance(st, A.Assign) or st.op != "=":
+                    continue
+                if not isinstance(st.target, A.Name):
+                    continue
+                name = st.target.id
+                if inner.lookup(name) is not None:
+                    continue
+                ty = self.infer(st.value, inner)
+                inner.define(Symbol(name, ty, "var", mutable=True))
+        finally:
+            self._quiet = previous
 
     def stmt_AuditRecord(self, st: A.AuditRecord, scope: Scope) -> None:
         if self.current_fn is not None:
@@ -1063,8 +1124,14 @@ class Checker:
         return None
 
     def expr_Binary(self, e: A.Binary, scope: Scope, at: bool) -> T.Type:
-        left = self.infer(e.left, scope)
-        right = self.infer(e.right, scope)
+        left_raw = self.infer(e.left, scope)
+        right_raw = self.infer(e.right, scope)
+        # Spec section 6 forbids implicit *unsafe* conversion, but an integer
+        # literal such as the `0` in `weight > 0` carries no precision to
+        # lose: it simply denotes a value of whatever numeric type it meets.
+        # Without this, comparing any F64 against a literal would be an error.
+        left = _literal_numeric(left_raw, e.left, right_raw)
+        right = _literal_numeric(right_raw, e.right, left_raw)
         op = e.op
         if op in ("and", "or"):
             for side, ty in (("left", left), ("right", right)):
@@ -1641,6 +1708,14 @@ def _iterable_element(ty: T.Type, pos: SourcePos, checker: Checker) -> T.Type:
                   help_text="`for` iterates over List, Set, Map, Text and "
                             "Tensor values")
     return T.ERROR
+
+
+def _literal_numeric(ty: T.Type, node: A.Expr, other: T.Type) -> T.Type:
+    """Give an integer literal the numeric type of the operand it meets."""
+    if isinstance(node, A.Literal) and node.lit_kind == "int" \
+            and isinstance(other, (T.FloatType, T.DecimalType)):
+        return other
+    return ty
 
 
 def _member_table(ty: T.Type) -> Optional[Dict[str, T.Type]]:

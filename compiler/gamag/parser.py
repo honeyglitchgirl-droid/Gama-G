@@ -702,7 +702,12 @@ class Parser:
         if text == "audit" and member and self.kw_ahead(2, "record") \
                 and self.peek(3).kind is TokenKind.LBRACE:
             return self.parse_audit_record()
-        if text == "audit" and not member and not called and not assigned:
+        if text == "audit" and not member and not called and not assigned \
+                and nxt.kind is TokenKind.IDENT:
+            # `audit all` inside a policy is a directive (spec section 17).
+            # A bare `audit` line at the top of a function body is instead the
+            # effect declaration of spec section 7, so it falls through to the
+            # EFFECT_NAMES branch below.
             self.adv()
             words: List[str] = []
             while not self.at_line_end() and self.at(TokenKind.IDENT):

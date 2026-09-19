@@ -28,6 +28,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from ..diagnostics import GamaRuntimeFault, TypeFault
+from ..runtime.context import KNOWN_CAPABILITIES
 from ..runtime.tensor import GTensor, Tape, TapeNode, parameter as _parameter
 from ..runtime.values import (GCapability, GDuration, GFunction, GInstant,
                               GOption, GRecord, GResult, GSecret, GUnit, GUuid,
@@ -1713,6 +1714,18 @@ MODULE_TYPE_NAMES = {
 
 def lookup(qualified: str) -> Optional[Builtin]:
     return BUILTINS.get(qualified)
+
+
+# Builtins permitted to receive a `secret` value (spec section 8: secrets have
+# stricter lifecycle controls, including restrictions on logging and conversion
+# to ordinary Text).  Every other callable rejects them at compile time and
+# again at runtime.
+SECRET_SAFE = frozenset({
+    "secrets.wrap", "secrets.expose", "secrets.redact", "secrets.is_secret",
+    "secrets.fingerprint", "crypto.sha256", "crypto.sha512", "crypto.blake2b",
+    "crypto.hmac_sha256", "crypto.sign", "crypto.constant_time_eq",
+    "crypto.hex", "audit.emit", "typeof", "type_of",
+})
 
 
 _CAP_SUFFIXES = ("Store", "Access", "Handle", "Connection", "Client", "Service")

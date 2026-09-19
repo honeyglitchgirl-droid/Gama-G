@@ -459,6 +459,19 @@ class FunctionBuilder:
         if not isinstance(ty, T.Type):
             sym = self.checker.globals.lookup(st.name)
             ty = sym.type if sym is not None else T.ANY
+        if self.fn.kind == "main" and st.name in self.global_names:
+            # A top-level binding lives in the module's global table, not in
+            # a local slot of the initializer -- otherwise every other
+            # function would read an unbound name.  `<main>` is the
+            # initializer that gives it its value, in source order.
+            if st.value is not None:
+                value = self.expr(st.value)
+            else:
+                value = self.const(Const.default(ty), ty)
+            self.emit(Op.STORE_GLOBAL, [value], dst=-1,
+                      meta={"name": st.name, "secret": bool(st.secret),
+                            "mutable": bool(st.mutable)}, pos=st.pos)
+            return
         slot = self.fn.new_slot(st.name, ty, "local", mutable=st.mutable,
                                 secret=st.secret)
         self.bind(st.name, slot)
@@ -771,6 +784,14 @@ class FunctionBuilder:
         if isinstance(pat, A.WildcardPat):
             return
         if isinstance(pat, A.NamePat):
+            # The checker reclassifies a bare identifier that names an enum
+            # variant: it tests the tag and binds nothing.
+            if id(pat) in self.checker.variant_patterns:
+                if pat.name == "none":
+                    tests.append(("field_bool", path, "some", False))
+                else:
+                    tests.append(("tag", path, pat.name))
+                return
             binds.append((pat.name, path))
             return
         if isinstance(pat, A.LiteralPat):
@@ -928,6 +949,7 @@ class FunctionBuilder:
                 writes=task["writes"], depends_on=task["depends_on"]))
 
         meta_tasks = [{
+            "index": t["index"],
             "name": t["name"],
             "function": f"{self.fn.name}$par${t['name']}",
             "params": t["params"],
@@ -1222,8 +1244,20 @@ class Builder:
             fb = self.new_fn(protect_name, kind="protect", ret=T.ANY,
                              effects=("io",), pos=decl.pos)
             fb.start()
-            for stmt in decl.protect.stmts:
-                fb.stmt(stmt)
+            statements = list(decl.protect.stmts)
+            for position, stmt in enumerate(statements):
+                # The value of a protected region is the value of its last
+                # statement, so `publish()` at the end of `protect` is what
+                # the service hands back to its caller.
+                if position == len(statements) - 1 \
+                        and isinstance(stmt, A.ExprStmt) \
+                        and stmt.expr is not None:
+                    slot = fb.temp(T.ANY)
+                    fb.emit(Op.COPY, [fb.expr(stmt.expr)], dst=slot,
+                            type_=T.ANY, pos=stmt.pos)
+                    fb.emit(Op.RETURN, [fb.slot_op(slot)], pos=stmt.pos)
+                else:
+                    fb.stmt(stmt)
             self.prog.add(fb.finish())
 
         steps = [{"action": s.action, "count": s.count, "target": s.target,
@@ -1235,12 +1269,14 @@ class Builder:
         entry = self.new_fn(decl.name, kind="service", ret=T.ANY,
                             effects=("io", "audit"), pos=decl.pos)
         entry.start()
-        entry.emit(Op.PROTECTED, [], dst=entry.temp(T.ANY),
+        outcome_slot = entry.temp(T.ANY)
+        entry.emit(Op.PROTECTED, [], dst=outcome_slot,
                    meta={"protect": protect_name, "steps": steps,
                          "checkpoints": checkpoints,
                          "audit_all": decl.audit_all,
                          "component": decl.name},
                    pos=decl.pos)
+        entry.emit(Op.RETURN, [entry.slot_op(outcome_slot)], pos=decl.pos)
         entry.fn.recovery_points += 1
         if decl.audit_all:
             entry.fn.audit_points += 1
