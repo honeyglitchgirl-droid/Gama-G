@@ -14,12 +14,15 @@ v0.1 surface described below is the research / vertical-slice reference
 implementation. On top of it sits the **v0.2 original language core**, the
 redesign that
 `Gama-G_Detailed_Audit_and_Verification_Report.txt` §16–18 asked for; it is
-covered in §10 here and in [`DESIGN_v0_2.md`](DESIGN_v0_2.md). The core
-elaborates into the v0.1 pipeline, so both surfaces are enforced by the same
-tested machinery.
+covered in §10 here and in [`DESIGN_v0_2.md`](DESIGN_v0_2.md). On top of that
+sits the **v0.3 native semantic IR**, the answer to
+`Gama-G_Complete_Originality_and_Technical_Audit.txt` §13 and its priorities 1–2;
+it is covered in §11 here and in [`DESIGN_v0_3.md`](DESIGN_v0_3.md). The core
+compiles through its own IR and runs on the v0.1 machine, so both surfaces are
+enforced by the same tested runtime.
 
 Everything claimed below is exercised by the test suite (`python3 -m unittest
-discover -s tests`, 236 tests, also green under `pytest`) and demonstrated by a
+discover -s tests`, 269 tests) and demonstrated by a
 runnable example in `examples/` or `examples/core/`. Where a claim is partial,
 the missing part is named.
 
@@ -30,14 +33,15 @@ the missing part is named.
 | | |
 |---|---|
 | Implementation language | Python 3.11+ (reference implementation) |
-| Compiler source | ~14,500 lines across 28 modules |
+| Compiler source | ~17,600 lines across 33 modules |
 | Standard library | 215 builtins across 18 modules |
 | Language surface | 23 hard keywords, 84 contextual keywords, 9 effects |
 | AST node types | 70 |
 | GIR operations | 41 |
-| Tests | 236 (all passing, under `unittest` and `pytest`) |
-| Examples | 8 v0.1 + 6 v0.2 core, each runnable with `ggc run` |
-| v0.2 core | 4 modules in `compiler/gamag/core/`; see §10 |
+| Tests | 269 (all passing under `unittest discover`) |
+| Examples | 8 v0.1 + 6 core, each runnable with `ggc run` |
+| Language core | 4 modules, ~2,900 lines in `compiler/gamag/core/`; see §10–11 |
+| Licence | Apache-2.0 (`LICENSE`); version in `VERSION`, packaging in `pyproject.toml` |
 | Dialects | selected per file by the `gama core <version>` pragma |
 | Native backend | **not implemented** — see §5 |
 
@@ -370,14 +374,14 @@ the derived levels are identical.
 
 | Piece | Path | Status |
 |---|---|---|
-| Core syntax, execution graph, alternative proofs | `core/ast.py` | complete |
+| Native semantic IR: expressions, patterns, constraints, node kinds, five graphs | `core/mir.py` | complete |
 | Declaration grammar, clause table, verbatim text capture | `core/parser.py` | complete |
 | Relationship validation, cycle detection, level derivation, guard proofs | `core/graph.py` | complete |
-| Graph → v0.1 AST elaboration | `core/elaborate.py` | complete |
+| Native checking and lowering to GIR | `core/native.py` | complete |
 | Dialect detection, two-phase front end | `driver.py::is_core_dialect` | complete |
 | `ggc graph [--edges] [--json]` | `cli/main.py` | complete |
 | Six examples, one per construct family | `examples/core/` | complete |
-| 49 tests | `tests/test_core_language.py` | complete |
+| 77 tests | `tests/test_core_language.py` | complete |
 
 Constructs: `intent` (with `purpose`, `authority`, `trail`), `source` (with
 `secret` and `from`), `state` (with `starts`, `authority`), `operation`,
@@ -393,8 +397,14 @@ dispatch), `transition` (state change under authority), `outcome`. Clauses:
 `E-duplicate-binding`, `E-unbounded-refinement`, `E-refine-incomplete`,
 `E-each-incomplete`, `E-resolve-incomplete`, `E-compute-after-commit`,
 `E-transition-target`, `E-state-uninitialised`, `E-no-outcome`,
-`E-no-yields`, `E-no-computes`, `E-unknown-effect`. At run time the core adds
-two classified faults: `NoActiveAlternative` and `RefinementDiverged`.
+`E-no-yields`, `E-no-yields-type`, `E-no-computes`, `E-unknown-effect`,
+`E-authority-unmet`, `E-dispatch-not-exhaustive`, `E-dispatch-unsupported`,
+`E-unknown-type`, `E-type-arity`, `E-yield-type`, `E-binop-type`, `E-unop-type`,
+`E-arg-type`, `E-arity`, `E-unknown-call`, `E-constraint-type`,
+`E-effect-undeclared`, `E-secret-escape`, `E-ice` — 33 codes in total. At run
+time the core adds three classified faults: `NoActiveAlternative`,
+`RefinementDiverged` and `UnresolvedDispatch`, plus `ContractViolation` for a
+`holds` constraint that data breaks.
 
 ### 10.4 What is proven versus only checked
 
@@ -403,13 +413,15 @@ in both directions; one producer per binding unless every alternative is
 guarded; that every repetition has a bound of at least one round; mutual
 exclusivity and exhaustiveness for a two-guard selection whose guards are
 syntactically complementary; that compute never depends on a committed change;
-plus everything v0.1 already proves about the elaborated code.
+plus types, arity, library signatures, effect coverage and secret propagation,
+all checked natively by `core/native.py`.
 
 Checked only at run time: data-dependent constraints, selections whose guards
 were not provably complementary, and refinements that reach their bound.
 
 **Not checked at all:** exhaustiveness for more than two alternatives (the
-compiler records `proven_exhaustive = False` and relies on the runtime fault —
+compiler records the constraint's discharge as `unprovable` and relies on the
+runtime fault —
 proving it over arbitrary predicate sets is a decision problem, and claiming
 otherwise would be exactly the kind of claim §6 of this document forbids); and
 re-deriving an operation's declared `effect` from its own clauses rather than
@@ -419,8 +431,9 @@ trusting the declaration.
 
 No native backend (it runs on the reference VM). No performance claim of any
 kind — nothing is benchmarked. No parallel execution: same-level operations are
-*known* to be independent, which is the precondition, but elaboration still
-emits them in sequence. `each` yields a `List`; there is no container choice. No
+*known* to be independent — and since v0.3 that knowledge is recorded on the GIR
+function as per-task reads, writes and dependencies — but the emission is still
+sequential. `each` yields a `List`; there is no container choice. No
 modules, imports, generics or user-defined types in the core — a core program is
 one intent, and composition between intents is not designed. Recovery is bounded
 repetition plus classified faults; the specification's richer
@@ -436,3 +449,65 @@ propagation, hash-chained audit, determinism, bounded recovery, tensors and
 autodiff, GIR, reference VM — actually work. And deleting a working
 implementation to make a report look tidier would be a worse engineering
 decision than the one the report criticises.
+
+---
+
+## 11. The v0.3 native semantic IR
+
+`Gama-G_Complete_Originality_and_Technical_Audit.txt` §13 made one structural
+finding: v0.2 had a new source language but compiled it by elaborating into the
+older implementation's abstract syntax, so `let`, `var`, `if`, `while` and
+`match` reappeared as the intermediate representation of a language whose purpose
+is not to have them. Priorities 1 and 2 of its §15 ask for a native semantic IR
+and a compiler that reaches GIR without the older AST.
+
+Both are implemented. Full detail is in [`DESIGN_v0_3.md`](DESIGN_v0_3.md).
+
+### 11.1 What was built
+
+| Piece | Path | Status |
+|---|---|---|
+| Native semantic IR — expressions, patterns, constraints with a `discharge`, seven node kinds | `core/mir.py` | complete |
+| Five graphs — intent, operations, constraints, authority, recovery | `core/mir.py`, built by `core/graph.py` | complete |
+| Native checker — types, arity, effects, authority, secrecy | `core/native.py::NativeChecker` | complete |
+| Native lowerer — semantic model → GIR, no older AST | `core/native.py::Lowerer` | complete |
+| Derived graph recorded on the GIR function | `gir/ir.py::GFunction.parallel_tasks` | complete |
+| `core/ast.py`, `core/elaborate.py` | — | **deleted** |
+
+### 11.2 What is checkable about it
+
+The property that matters is not "the source has no `if`" but "the compiler built
+no older AST". That is asserted directly:
+`test_no_older_abstract_syntax_is_built_for_a_core_program` compiles a core
+program and requires `compilation.module` to be `None`.
+
+Also asserted: the generated function's kind is `intent`; every basic block in
+every example ends with a terminator (the reference interpreter treats an
+unterminated block as `return ()`, so a missing jump would silently truncate
+rather than fail); the derived levels appear as GIR operation-graph metadata;
+constraint discharges are distinguished as proven / runtime / unprovable; the
+recovery graph enumerates every bound with its fault kind; and `ggc graph` prints
+all five graphs.
+
+### 11.3 What v0.3 does not do
+
+The audit's priorities 3–16 are untouched, in the order it sequences them: no
+native CPU backend, no memory model, no WASM or GPU target, no `gpm`, no FFI, no
+FHIR profile, no benchmarks and no fuzzing. **No performance number appears
+anywhere in this repository**, and §6's list of claims not made is unchanged.
+
+### 11.4 Test split (audit §14)
+
+The audit is right that `assert "if" not in grammar` proves an architectural
+property and not historical originality, and that presenting the first as
+evidence for the second is the failure mode to avoid. `tests/test_core_language.py`
+is now split accordingly:
+
+| Class | What it claims |
+|---|---|
+| `LanguageInvariants` | properties of the grammar and compiler, checked mechanically |
+| `NativeLowering`, `NativeChecks`, `TheFiveGraphs` | properties of the v0.3 pipeline |
+| `ProvenanceEvidence` | **no** assertion of originality — only that the repository's own documents do not claim more than the evidence supports, and that the audits they answer are kept |
+
+The class formerly named `OriginalityGuarantees` is `LanguageInvariants`. The old
+name asserted more than the tests delivered.

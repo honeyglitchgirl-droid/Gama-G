@@ -3,6 +3,16 @@
 This document is the answer to sections 16, 17 and 18 of
 `Gama-G_Detailed_Audit_and_Verification_Report.txt`.
 
+> **Partly superseded.** The *language* designed here is unchanged and still
+> current: the grammar (§5), the construct-by-construct originality answers (§6),
+> the inversion of order-from-declaration (§2) and the relationship rules (§2.1).
+> What changed is the *compilation path*. §4 and the elaboration table below
+> described a compiler that translated the core into the older implementation's
+> AST; the second audit found that unacceptable, and v0.3 replaced it with a
+> native semantic IR. Read [`DESIGN_v0_3.md`](DESIGN_v0_3.md) for how a core
+> program is compiled today. The superseded text is kept below, marked, because
+> an audit response is only checkable against what it actually said.
+
 The audit's verdict on v0.1 was that the implementation is real and working, but
 that the *language surface* fails the originality requirement: `fn`, `let`,
 `var`, `if`, `else`, `for`, `while`, `return`, `match`, `enum`, `record` and
@@ -28,16 +38,18 @@ ggc graph examples/core/selection.gg --edges
 
 **It is not** a rename of v0.1. None of the words the audit lists appear in the
 core grammar as declarations or control flow. `tests/test_core_language.py::
-OriginalityGuarantees::test_the_core_grammar_has_no_assignment_keyword` asserts
+LanguageInvariants::test_the_core_grammar_has_no_assignment_keyword` asserts
 this mechanically: it walks the core's declaration words and clause keywords and
 fails if `if`, `else`, `while`, `for`, `return`, `match`, `fn`, `let`, `var`,
 `assign`, `break`, `continue` or `loop` appears among them.
 
 **It is also not** a replacement for v0.1 in this milestone. v0.1 remains in the
 tree as what the audit calls the *research / vertical-slice reference
-implementation*, and it is now load-bearing in a second sense: v0.2 elaborates
-into it. The two dialects are selected per file by a pragma, and both test
-suites run green in the same checkout (236 tests).
+implementation*. The two dialects are selected per file by a pragma, and both
+test suites run green in the same checkout. *(v0.3 note: the core no longer
+elaborates into v0.1's AST — see [`DESIGN_v0_3.md`](DESIGN_v0_3.md). v0.1 is
+still the machine that runs it, and still supplies the shared type lattice and
+standard library.)*
 
 ---
 
@@ -132,46 +144,47 @@ as worth building on, not a construct to redesign.
 
 ## 4. Section 17's execution model, mapped to real modules
 
+> **Superseded by v0.3.** The mapping below is what the code did when this
+> document was written. It is retained for the audit trail. The current mapping
+> is in [`DESIGN_v0_3.md`](DESIGN_v0_3.md) §2 and §9.
+
 The report proposes: Intent → Meaning → Constraints → Operations →
 Relationships → Operation Graph → GIR → Optimization → Backend → Runtime.
-Here is where each arrow is in the code:
+Here is where each arrow **was** in the code:
 
-| Stage | Implementation |
-|---|---|
-| Intent | `core/parser.py` — `parse_core`, `_parse_intent` |
-| Meaning | `core/ast.py` — declarations and clauses |
-| Constraints | `core/ast.py::Clause` for `holds`/`when`/`until`, carrying **verbatim source text** |
-| Operations | `core/parser.py::_parse_operation` |
-| Relationships | `core/graph.py::free_names` + `_validate_relationships` |
-| Operation Graph | `core/graph.py::_order` → `ExecutionGraph` (levels, edges, alternatives, proofs) |
-| GIR | `core/elaborate.py` → v0.1 AST → `gir/builder.py` |
-| Optimization | `gir/optimizer.py` (unchanged) |
-| Backend | the reference VM, `runtime/vm.py` — **no native backend yet**, see §8 |
-| Runtime | `runtime/*` — audit, recovery, context, checkpoints |
+| Stage | Implementation (v0.2) | Implementation (v0.3) |
+|---|---|---|
+| Intent | `core/parser.py` | `core/parser.py` → `mir.IntentGraph` |
+| Meaning | `core/ast.py` | `core/mir.py` |
+| Constraints | `core/ast.py::Clause` | `mir.Constraint`, carrying verbatim text **and** a `discharge` |
+| Operations | `core/parser.py::_parse_operation` | `core/parser.py` → `mir.OpNode` subclasses |
+| Relationships | `core/graph.py` | `core/graph.py::build` → `mir.OperationGraph` |
+| Operation Graph | `ExecutionGraph` | `mir.OperationGraph` (levels, edges, selections, proofs) |
+| GIR | `core/elaborate.py` → **v0.1 AST** → `gir/builder.py` | `core/native.py::lower` → GIR, directly |
+| Optimization | `gir/optimizer.py` | `gir/optimizer.py` (unchanged) |
+| Backend | the reference VM | the reference VM — **no native backend yet** |
+| Runtime | `runtime/*` | `runtime/*` (unchanged) |
 
-The elaboration boundary is the honest part of this architecture and it is worth
-stating precisely: **the core decides what a program means; the reference slice
-decides how that meaning runs.** `core/elaborate.py` adds no feature. It only
-realises the core's decisions in a form the existing, already-tested machine
-understands.
+The v0.2 boundary was described here as honest, and it was: the core decided
+what a program meant and the reference slice decided how that meaning ran. What
+the second audit pointed out — correctly — is that "how that meaning runs" was
+being decided in the older language's *vocabulary*. `let`, `var`, `if`, `while`
+and `match` were the intermediate representation of a language whose entire
+purpose is not to have them. The table above existed to show the boundary;
+`core/elaborate.py` and `core/ast.py` have since been deleted.
 
-| Core construct | Elaborated form |
-|---|---|
-| `source x : T from e` | `let x : T = e` in `main`, passed as an argument |
-| `state s : T starts e` | `var s : T = e` |
-| `operation` | `let <yields> : T = <computes>`, then `require` per `holds`, then an audit record for `trail` |
-| guarded alternatives | `var` + `if`/`elif` chain whose `else` is `panic("NoActiveAlternative: …")` |
-| `refine … within n` | `var` + `while` with an explicit round counter that panics `RefinementDiverged` at `n` |
-| `each … over xs as x` | `var` accumulator + `for` |
-| `resolve … choose` | `var` + `match`, so the existing exhaustiveness rule applies |
-| `transition` | an assignment to the state, in the commit phase |
+The elaborated forms are recorded here only as history:
 
-Note what the elaborated code contains that a core program does not: mutable
-bindings, a loop, an `if`. Those are the reference machine's *implementation* of
-single-assignment bindings, bounded refinement and guarded selection. A core
-program still cannot express an unbounded loop, an assignment, or a selection
-whose alternatives are not exhaustive — the elaboration supplies the machinery,
-but only in the shapes the core's rules allow.
+| Core construct | v0.2 elaborated form | v0.3 native form |
+|---|---|---|
+| `source x : T from e` | `let x : T = e`, passed as an argument | a parameter of the intent function |
+| `state s : T starts e` | `var s : T = e` | a slot, copied in at entry |
+| `operation` | `let` + `require` + audit call | compute in level order; `REQUIRE` with verbatim text; `AUDIT` |
+| guarded alternatives | `if`/`elif` chain ending in `panic(…)` | `select.<binding>` blocks ending in a `FAULT` terminator |
+| `refine … within n` | `while` with a counter that panics at `n` | `refine.X.until` / `.round` / `.diverged` / `.next` / `.done` |
+| `each … over xs as x` | accumulator + `for` | `each.X.more` / `.item` / `.keep` / `.skip` / `.done` |
+| `resolve … choose` | `match` | one block per arm plus `resolve.R.join` |
+| `transition` | an assignment, in the commit phase | a copy into the state slot, in the commit phase |
 
 ---
 
@@ -380,8 +393,8 @@ claim.
 * a compute operation does not depend on a committed change
 * a transition alters a declared state and does not retype it
 * the intent has an outcome, and something produces it
-* everything the reference slice already proves about the elaborated code:
-  types, effect declarations, secret propagation, `match` exhaustiveness
+* types, arity, library signatures, effect declarations, secret propagation and
+  dispatch exhaustiveness — checked natively, by `core/native.py`
 
 **Checked at runtime, with a classified fault**
 
@@ -398,8 +411,8 @@ claim.
   exhaustiveness over arbitrary predicate sets is a decision-problem, and
   pretending otherwise would be the kind of claim this project forbids.
 * Whether an operation's declared `effect` matches what it actually does. The
-  reference slice checks this for the elaborated code, but the core does not yet
-  re-derive it from the operation's own clauses.
+  checker verifies that the library calls used are covered by the declared
+  effect, but it does not re-derive the effect from the operation's own clauses.
 
 ---
 
@@ -414,8 +427,9 @@ material was over-claiming.
 * **No performance claim of any kind.** Nothing here is benchmarked against
   anything. See §9 for the methodology that would have to be satisfied first.
 * **No parallel execution.** Same-level operations are *known* to be independent,
-  which is the precondition for parallelising them, but the elaboration still
-  emits them in sequence.
+  which is the precondition for parallelising them, and since v0.3 that
+  knowledge is recorded on the GIR function — but the emission is still
+  sequential.
 * **`each` yields a `List`.** Its declared type is the element type; there is no
   choice of container yet.
 * **No modules, imports, generics or user-defined types in the core.** A core
@@ -482,10 +496,10 @@ decision than the one the report is criticising.
 
 | Path | Contents |
 |---|---|
-| `compiler/gamag/core/ast.py` | core syntax, `ExecutionGraph`, `Alternative` and its proofs |
+| `compiler/gamag/core/mir.py` | the native semantic IR *(v0.3; was `core/ast.py`)* |
 | `compiler/gamag/core/parser.py` | the declaration grammar, clause table, verbatim text capture |
 | `compiler/gamag/core/graph.py` | relationship validation, cycle detection, level derivation, guard proofs |
-| `compiler/gamag/core/elaborate.py` | graph → reference-slice AST |
+| `compiler/gamag/core/native.py` | native checking and lowering to GIR *(v0.3; was `core/elaborate.py`)* |
 | `compiler/gamag/driver.py` | `is_core_dialect`, the two-phase front end, `Compilation.core_graph` |
 | `compiler/gamag/cli/main.py` | `ggc graph [--edges] [--json]` |
 | `examples/core/*.gg` | six runnable programs, one per construct family |

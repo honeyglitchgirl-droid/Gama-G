@@ -327,6 +327,9 @@ class ForbiddenClaims(unittest.TestCase):
             "section 43 defines the prohibition itself",
         "Gama-G_Detailed_Audit_and_Verification_Report.txt":
             "sections 9 and 10 audit the 99%/98% claims and reject them",
+        "Gama-G_Complete_Originality_and_Technical_Audit.txt":
+            "its performance, accuracy and processor-independence sections "
+            "quote the claims in order to reject them",
         "docs/IMPLEMENTATION.md":
             "section 6 records the claims this implementation does not make",
         "README.md":
@@ -397,6 +400,72 @@ class ForbiddenClaims(unittest.TestCase):
                               f"{relative} is exempted from the forbidden-claims "
                               f"scan but no longer says {needed!r}; either "
                               f"restore the disclaimer or drop the exemption")
+
+
+class Packaging(unittest.TestCase):
+    """The repository says what it is: licensed, versioned, installable.
+
+    Section 12 of the second audit records that the project shipped no LICENSE,
+    no VERSION and no packaging metadata, so there was no way to tell what anyone
+    was permitted to do with the code or which build they were looking at.
+
+    These tests keep those files present and, more usefully, keep them agreeing.
+    A version number duplicated into three places is a version number that will
+    eventually be wrong in two of them, so the agreement is what gets asserted.
+    """
+
+    def read(self, relative: str) -> str:
+        with open(os.path.join(S.REPO_ROOT, relative), encoding="utf-8") as fh:
+            return fh.read()
+
+    def test_the_repository_is_licensed(self):
+        text = self.read("LICENSE")
+        self.assertIn("Apache License", text)
+        self.assertIn("Version 2.0", text)
+        self.assertIn("END OF TERMS AND CONDITIONS", text)
+        self.assertIn("Copyright", text)
+        # an Apache-2.0 file without its disclaimer is not Apache-2.0
+        self.assertIn("Disclaimer of Warranty", text)
+        self.assertIn("Limitation of Liability", text)
+
+    def test_the_license_named_in_the_metadata_is_the_one_shipped(self):
+        pyproject = self.read("pyproject.toml")
+        self.assertIn('license = { file = "LICENSE" }', pyproject,
+                      "pyproject must point at the shipped file, not restate a "
+                      "licence identifier that might disagree with it")
+        self.assertIn("Apache Software License", pyproject)
+
+    def test_the_version_is_stated_once_and_agrees_everywhere(self):
+        version = self.read("VERSION").strip()
+        self.assertRegex(version, r"^\d+\.\d+\.\d+$",
+                         "VERSION should be a plain semantic version")
+        self.assertIn(f'version = "{version}"', self.read("pyproject.toml"))
+
+        import gamag
+        self.assertEqual(gamag.__version__, version,
+                         "the package must report the version in VERSION")
+        self.assertIn(f'return "{version}"',
+                      self.read("compiler/gamag/__init__.py"),
+                      "the installed-wheel fallback in __init__.py must equal "
+                      "VERSION; if you bumped one, bump the other")
+
+    def test_the_cli_reports_the_same_version(self):
+        import subprocess
+        import sys
+        version = self.read("VERSION").strip()
+        out = subprocess.run(
+            [sys.executable, os.path.join(S.REPO_ROOT, "tools", "bin", "ggc"),
+             "--version"],
+            capture_output=True, text=True, timeout=60)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn(version, out.stdout)
+
+    def test_the_package_can_be_found_without_installing_it(self):
+        """`git clone` then run is a supported workflow, not an accident."""
+        self.assertTrue(os.path.isfile(
+            os.path.join(S.REPO_ROOT, "tools", "bin", "ggc")))
+        self.assertIn('package-dir = { "" = "compiler" }',
+                      self.read("pyproject.toml"))
 
 
 if __name__ == "__main__":

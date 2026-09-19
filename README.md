@@ -115,9 +115,61 @@ ten-question originality test feature by feature — including the three places
 where the honest answer is "partly yes", with the technical reason — and
 separates what is proven at compile time from what is only checked at runtime.
 
-v0.1 is not deleted. It is the reference implementation the core elaborates
-into, so its tested type, effect, capability, secret-propagation and audit
-machinery is what actually enforces v0.2's promises.
+v0.1 is not deleted. Its tested type lattice, standard library, GIR, optimizer
+and reference interpreter are what actually run the core's promises.
+
+---
+
+## v0.3: a native semantic IR
+
+A [second audit](Gama-G_Complete_Originality_and_Technical_Audit.txt) accepted
+the language and found a problem underneath it. v0.2 compiled by *elaborating*
+the core into the older implementation's abstract syntax — so `let`, `var`, `if`,
+`while` and `match`, the constructs the core exists to avoid, reappeared one
+layer down as the intermediate representation. Its words:
+
+> the compiler still translates the new surface into the old model before doing
+> anything with it
+
+v0.3 removes that layer. The core now compiles through a **native semantic IR**
+(`compiler/gamag/core/mir.py`) that represents operations, dependencies,
+constraints, authority, transitions, refinement and outcomes directly:
+
+```
+core source → CoreParser → SemanticModel → NativeChecker → Lowerer → GIR → VM
+                              │
+                    five inspectable graphs:
+                    intent · operations · constraints · authority · recovery
+```
+
+`core/ast.py` and `core/elaborate.py` are deleted from the tree, so nothing can
+fall back to elaborating. The property is asserted, not just claimed:
+for a core program `compilation.module` — the older AST — is `None`.
+
+What else changed:
+
+* **Blocks are named after core concepts.** The GIR for a `refine` reads
+  `refine.G.until`, `refine.G.round`, `refine.G.diverged`, `refine.G.next`,
+  `refine.G.done`. A fan-out reads `each.X.item` and `each.X.skip`.
+* **Faults are terminators, not calls.** A diverging refinement emits a GIR
+  `FAULT` with `kind = "RefinementDiverged"`, so the classification is data
+  rather than a string prefix to be parsed.
+* **The derived graph survives into the GIR.** Each intent function carries
+  per-task reads, writes and dependencies, which is what a parallel backend
+  would need — and which the emission does not yet use.
+* **Constraints record how they are discharged**: `proven`, `runtime`, or
+  `unprovable`. The third value exists so that guard exhaustiveness beyond two
+  alternatives is reported as something the compiler cannot prove, rather than
+  quietly assumed.
+
+The language surface is unchanged — `gama core 0.2` still parses — because v0.3
+changed how the core is *compiled*, not what it says. The pragma names the
+dialect; the toolchain has its own version (`VERSION`).
+
+[`docs/DESIGN_v0_3.md`](docs/DESIGN_v0_3.md) is the design document: the IR, the
+five graphs, the 33 diagnostics, the lowering patterns, and the three categories
+of claim kept strictly apart — proven at compile time, checked only at runtime,
+and not checked at all.
 
 ---
 
@@ -128,22 +180,22 @@ This repository is a **working vertical slice** of
 not a finished implementation of it. The specification describes a multi-year,
 multi-team production language across Phases 0–7.
 
-What is here: two language surfaces and one machine. The **v0.2 core**
-(`compiler/gamag/core/`) is the original language described above. The **v0.1
-surface** is the research / vertical-slice reference implementation: a complete
-compiler front end (lexer, parser, name resolution,
-type/effect/capability/ownership checking), the Gama IR, an optimizer, and a
-reference interpreter, with the safety systems enforced end to end. The core
-elaborates into it, so both run on the same tested machinery — 236 passing
-tests.
+What is here: two language surfaces and one machine. The **core**
+(`compiler/gamag/core/`) is the original language described above, compiled
+through its own semantic IR. The **v0.1 surface** is the research /
+vertical-slice reference implementation: a complete compiler front end (lexer,
+parser, name resolution, type/effect/capability/ownership checking), the Gama IR,
+an optimizer, and a reference interpreter, with the safety systems enforced end
+to end. Both dialects run on that one tested machine — 269 passing tests.
 
 What is not: **there is no native backend, no package manager and no borrow
 checker.** Programs run on an interpreter. Performance is interpreter-grade and
 **no benchmark against native code has been run or is claimed.**
 
-The current milestone is **v0.2, the original language core**, because the
-audit sequences native backends and production v1.0 *after* that redesign. That
-is the order being followed.
+The current milestone is **v0.3, the native semantic IR**, because the second
+audit sequences native backends, a memory model and production v1.0 *after* the
+compiler stops depending on the older language's model. That is the order being
+followed: its priorities 3–16 are untouched.
 
 [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md) goes through the
 specification section by section and says what is done, what is partial and what
@@ -379,9 +431,12 @@ the forbidden phrases so they cannot creep in:
 
 ```
 Gama-G_v1.0_Production_Specification.txt   the blueprint
-Gama-G_Detailed_Audit_and_Verification_Report.txt   the audit this milestone answers
+Gama-G_Detailed_Audit_and_Verification_Report.txt   the first audit
+Gama-G_Complete_Originality_and_Technical_Audit.txt  the audit v0.3 answers
+LICENSE                                      Apache-2.0
+VERSION pyproject.toml                       the version, stated once
 compiler/gamag/
-  core/{ast,parser,graph,elaborate}.py     the v0.2 language core
+  core/{mir,parser,graph,native}.py        the language core and its own IR
   lexer.py parser.py ast_nodes.py          front end
   semantic/{types,checker}.py              type lattice and checking
   gir/{ir,builder,optimizer}.py            the IR, lowering, optimization
@@ -391,11 +446,13 @@ compiler/gamag/
   methods.py                               one method table, shared by checker and VM
   cli/main.py driver.py                    ggc
 tools/bin/{ggc,ggtest}                     entry points
-examples/core/                             six v0.2 core programs
+examples/core/                             six core programs
 examples/                                  eight v0.1 programs
-tests/                                     236 tests
-docs/DESIGN_v0_2.md                        the v0.2 design, and the audit's
-                                           ten originality questions answered
+tests/                                     269 tests
+docs/DESIGN_v0_3.md                        the native IR, the five graphs, and
+                                           what is proven vs. only checked
+docs/DESIGN_v0_2.md                        the language design, and the first
+                                           audit's ten originality questions
 docs/IMPLEMENTATION.md                     honest status, section by section
 ```
 
@@ -407,11 +464,13 @@ tests/support.py             harness; reads examples and word lists out of the
 tests/test_spec_vocabulary.py  the enumerations the spec lists (types, effects,
                              recovery levels, capabilities, modules, commands)
 tests/test_spec_examples.py  the spec's own code examples, lifted by line number
-tests/test_core_language.py  the v0.2 core: derived order, relationship
-                             checking, selection proofs, bounded repetition,
-                             constraints, state and authority
+tests/test_core_language.py  the core: derived order, relationship checking,
+                             selection proofs, bounded repetition, constraints,
+                             state and authority, the native lowering, the five
+                             graphs, and what the tests do not prove
 tests/test_language.py       positive semantics
-tests/test_enforcement.py    what must be refused
+tests/test_enforcement.py    what must be refused, the claims the docs may not
+                             make, and the packaging that must agree
 tests/test_runtime.py        autodiff, the audit chain, recovery, secrets,
                              determinism
 tests/test_examples.py       all fourteen examples, end to end

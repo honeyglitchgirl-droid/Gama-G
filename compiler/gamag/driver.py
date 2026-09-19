@@ -17,10 +17,10 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from . import ast_nodes as A
-from .core import ast as CoreAST
 from .core import graph as core_graph
-from .core.elaborate import elaborate as core_elaborate
-from .core.parser import CoreParser
+from .core import mir as CoreMIR
+from .core import native as core_native
+from .core.parser import CoreParser, CoreSyntax
 from .diagnostics import (DiagnosticBag, GamaError, Phase, Severity, SourcePos)
 from .gir.builder import build_program
 from .gir.ir import GProgram
@@ -75,8 +75,13 @@ class Compilation:
     # compiler derived from it.  `module` is always the elaborated form that the
     # rest of the pipeline consumes.
     dialect: str = "v0.1"
-    core: Optional[CoreAST.CoreModule] = None
-    core_graph: Optional[CoreAST.ExecutionGraph] = None
+    core_syntax: Optional[CoreSyntax] = None
+    core_model: Optional[CoreMIR.SemanticModel] = None
+
+    @property
+    def core_graph(self) -> Optional[CoreMIR.OperationGraph]:
+        """The derived operation graph, when this is a core program."""
+        return self.core_model.operations if self.core_model else None
 
     @property
     def ok(self) -> bool:
@@ -152,44 +157,17 @@ def compile_source(source: str, path: str = "<source>", *,
         return c
     c.timings.lex = time.perf_counter() - t0
 
-    t0 = time.perf_counter()
     if is_core_dialect(c.tokens):
-        c.dialect = "core"
-        try:
-            c.core = CoreParser(c.tokens, path, source).parse_core()
-        except GamaError as exc:
-            c.bag.add(exc.diagnostic)
-            c.stopped_at = "parse"
-            return c
-        # The graph *is* the meaning of a core program: relationships are
-        # inferred from `uses`/`yields`, then validated before anything is
-        # lowered.  Its diagnostics use their own bag so that a program with a
-        # broken graph never reaches the elaborator.
-        graph_bag = DiagnosticBag()
-        c.core_graph = core_graph.build(c.core, graph_bag)
-        for diag in graph_bag.diagnostics:
-            c.bag.add(diag)
-        if not graph_bag.ok:
-            c.stopped_at = "graph"
-            return c
-        try:
-            c.module = core_elaborate(c.core, c.core_graph)
-        except GamaError as exc:
-            c.bag.add(exc.diagnostic)
-            c.stopped_at = "elaborate"
-            return c
-        except Exception as exc:                    # noqa: BLE001
-            c.bag.error(f"internal compiler error while elaborating the core "
-                        f"program: {exc}", phase=Phase.PARSE, code="E-ice")
-            c.stopped_at = "elaborate"
-            return c
-    else:
-        try:
-            c.module = Parser(c.tokens, path, source).parse_module()
-        except GamaError as exc:
-            c.bag.add(exc.diagnostic)
-            c.stopped_at = "parse"
-            return c
+        return _compile_core(c, source, profile=profile,
+                             opt_level=opt_level, emit_gir=emit_gir)
+
+    t0 = time.perf_counter()
+    try:
+        c.module = Parser(c.tokens, path, source).parse_module()
+    except GamaError as exc:
+        c.bag.add(exc.diagnostic)
+        c.stopped_at = "parse"
+        return c
     c.timings.parse = time.perf_counter() - t0
     if grants:
         c.module.grants = tuple(dict.fromkeys(
@@ -228,6 +206,83 @@ def compile_source(source: str, path: str = "<source>", *,
                                   deterministic=(profile == "strict"))
         c.timings.optimize = time.perf_counter() - t0
 
+    return c
+
+
+def _compile_core(c: "Compilation", source: str, *, profile: str,
+                  opt_level: int, emit_gir: bool) -> Compilation:
+    """Compile a core program natively.
+
+    The path is source -> semantic model -> GIR.  Nothing here builds the older
+    language's abstract syntax, so `let`, `if`, `while` and `match` are never an
+    intermediate representation of a core program -- which was the audit's
+    central structural finding on the previous version.
+
+    The older front end is still used for the *type lattice* and the *standard
+    library signatures*.  Neither is a language model, and having two competing
+    definitions of what `F64` means would be a defect rather than independence.
+    """
+    c.dialect = "core"
+    t0 = time.perf_counter()
+    try:
+        c.core_syntax = CoreParser(c.tokens, c.path, source).parse()
+    except GamaError as exc:
+        c.bag.add(exc.diagnostic)
+        c.stopped_at = "parse"
+        return c
+    c.timings.parse = time.perf_counter() - t0
+
+    # The model *is* the meaning of a core program: relationships are derived
+    # from `uses`/`yields` and validated before anything is lowered.
+    t0 = time.perf_counter()
+    model_bag = DiagnosticBag()
+    c.core_model = core_graph.build(c.core_syntax, model_bag)
+    for diag in model_bag.diagnostics:
+        c.bag.add(diag)
+    if not model_bag.ok:
+        c.stopped_at = "graph"
+        return c
+
+    # The checker is kept, not discarded: it holds the resolved type of every
+    # binding and every expression, which is exactly what lowering needs.
+    # Building a second checker would lower against an empty environment.
+    checker = core_native.check(c.core_model, model_bag)
+    for diag in model_bag.diagnostics:
+        if diag not in c.bag.diagnostics:
+            c.bag.add(diag)
+    c.timings.check = time.perf_counter() - t0
+    if not model_bag.ok:
+        c.stopped_at = "check"
+        return c
+    if not emit_gir:
+        return c
+
+    t0 = time.perf_counter()
+    lower_bag = DiagnosticBag()
+    try:
+        c.program = core_native.lower(c.core_model, checker, lower_bag)
+    except GamaError as exc:
+        c.bag.add(exc.diagnostic)
+        c.stopped_at = "lower"
+        return c
+    except Exception as exc:                        # noqa: BLE001
+        c.bag.error(f"internal compiler error while lowering the core program "
+                    f"to GIR: {exc}", phase=Phase.GIR, code="E-ice")
+        c.stopped_at = "lower"
+        return c
+    for diag in lower_bag.diagnostics:
+        c.bag.add(diag)
+    if not lower_bag.ok:
+        c.program = None
+        c.stopped_at = "lower"
+        return c
+    c.timings.lower = time.perf_counter() - t0
+
+    if opt_level > 0:
+        t0 = time.perf_counter()
+        c.optimization = optimize(c.program, opt_level,
+                                  deterministic=(profile == "strict"))
+        c.timings.optimize = time.perf_counter() - t0
     return c
 
 

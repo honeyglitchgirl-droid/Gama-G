@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gama-g"
+version = "0.3.0"
+description = """Reference toolchain for the Gama-G language: an intent-and-operation \
+core, a native semantic IR, Gama IR, and a reference abstract execution model."""
+readme = "README.md"
+requires-python = ">=3.9"
+license = { file = "LICENSE" }
+authors = [{ name = "The Gama-G Authors" }]
+keywords = [
+    "compiler",
+    "language",
+    "semantic-ir",
+    "dependency-graph",
+    "capability-security",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Software Development :: Compilers",
+]
+dependencies = []
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[project.scripts]
+ggc = "gamag.cli.main:main"
+
+[project.urls]
+Homepage = "https://github.com/honeyglitchgirl-droid/Gama-G"
+
+[tool.setuptools]
+package-dir = { "" = "compiler" }
+
+[tool.setuptools.packages.find]
+where = ["compiler"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["compiler", "tests"]
+addopts = "-q"

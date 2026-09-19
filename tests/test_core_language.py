@@ -142,7 +142,7 @@ outcome b
 """))
         out.assert_ran(self)
         self.assertEqual(out.compilation.dialect, "core")
-        self.assertIsNotNone(out.compilation.core)
+        self.assertIsNotNone(out.compilation.core_model)
         self.assertIsNotNone(out.compilation.core_graph)
 
     def test_a_v01_program_is_still_the_v01_dialect(self):
@@ -268,7 +268,7 @@ operation Q
 outcome s
 """))
         out.assert_ran(self)
-        alt = out.compilation.core_graph.alternatives["s"]
+        alt = out.compilation.core_graph.selections["s"]
         self.assertTrue(alt.proven_exhaustive)
         self.assertTrue(alt.proven_exclusive)
         self.assertEqual(out.output.strip(), "1")
@@ -316,7 +316,7 @@ operation Q
 outcome s
 """))
         out.assert_compiled(self)
-        alt = out.compilation.core_graph.alternatives["s"]
+        alt = out.compilation.core_graph.selections["s"]
         self.assertFalse(alt.proven_exhaustive)
         self.assertFalse(alt.proven_exclusive)
 
@@ -337,8 +337,8 @@ operation Q
     computes 2
 outcome s
 """))
-        out.assert_faulted(self, "Panic")
-        self.assertIn("NoActiveAlternative", str(out.fault.message))
+        out.assert_faulted(self, "NoActiveAlternative")
+        self.assertEqual(out.fault_kind(), "NoActiveAlternative")
         self.assertIn("`s`", str(out.fault.message))
 
     def test_one_unguarded_alternative_among_guarded_ones_is_refused(self):
@@ -420,9 +420,11 @@ refine G
     within   4 rounds
 outcome g
 """))
-        out.assert_faulted(self, "Panic")
+        out.assert_faulted(self, "RefinementDiverged")
+        # the kind is the classification; the message names the constraint and
+        # the bound, in the program's own words
+        self.assertEqual(out.fault_kind(), "RefinementDiverged")
         message = str(out.fault.message)
-        self.assertIn("RefinementDiverged", message)
         self.assertIn("within 4 rounds", message)
         self.assertIn("g > 1000000", message)
 
@@ -728,10 +730,10 @@ operation B
 outcome b
 """)
         out.assert_ran(self)
-        intent = out.compilation.core.intent
+        intent = out.compilation.core_model.intent
         self.assertEqual(intent.purpose,
                          "keep   the   spacing exactly as written")
-        self.assertEqual(out.compilation.core.operations[0].trail,
+        self.assertEqual(out.compilation.core_model.operations.nodes["B"].trail,
                          "dose decision")
 
 
@@ -759,17 +761,19 @@ class CoreExamples(unittest.TestCase):
             with self.subTest(example=os.path.basename(path)):
                 out = S.run_file(path)
                 out.assert_compiled(self)
-                self.assertTrue(out.compilation.core.intent.purpose.strip(),
+                self.assertTrue(out.compilation.core_model.intent.purpose.strip(),
                                 "an intent should say what it is for")
 
 
-class OriginalityGuarantees(unittest.TestCase):
-    """The properties that make this a different language, checked as such.
+class LanguageInvariants(unittest.TestCase):
+    """Properties of the language, checked mechanically.
 
-    Section 18 of the audit report asks whether a construct is merely a renamed
-    convention.  These tests pin down the ones that are not: in each case the
-    conventional spelling is absent from the grammar and the property that
-    replaces it is enforced.
+    Section 14 of the second audit is precise about what these tests do and do
+    not establish: `assert "if" not in grammar` proves that `if` is not in the
+    grammar.  It does not prove the replacement has no prior art anywhere.  That
+    is a different category of claim, and it lives in
+    :class:`ProvenanceEvidence` below, which is deliberately not a set of
+    assertions about history.
     """
 
     def test_the_core_grammar_has_no_assignment_keyword(self):
@@ -818,9 +822,456 @@ operation B
 outcome b
 """))
         out.assert_ran(self)
-        text = out.compilation.core_graph.describe()
+        text = out.compilation.core_model.render()
         self.assertIn("level 0: B", text)
-        self.assertIn("B yields b", text)
+        self.assertIn("derived execution order", text)
+        # the edges are a fact about the model, not a formatting choice
+        self.assertEqual(out.compilation.core_graph.edges(), [])
+
+
+class NativeLowering(unittest.TestCase):
+    """v0.3: the core compiles to GIR without passing through the older AST.
+
+    The second audit's central structural finding was that v0.2 elaborated into
+    the older language's abstract syntax, so `let`, `if`, `while` and `match`
+    reappeared as an intermediate representation.  These tests check that it no
+    longer does -- not by inspecting source text, but by checking what the
+    compiler actually built.
+    """
+
+    def compile(self, body: str, head: str = HEAD):
+        return S.compile_only(core(body, head)).assert_compiled(self)
+
+    SIMPLE = """
+operation B
+    uses     a
+    yields   b : I64
+    effect   pure
+    computes a + 1
+outcome b
+"""
+
+    def test_no_older_abstract_syntax_is_built_for_a_core_program(self):
+        out = self.compile(self.SIMPLE)
+        self.assertIsNone(out.compilation.module,
+                          "a core program must not be elaborated into the older "
+                          "language's AST; it lowers to GIR from the semantic "
+                          "model directly")
+
+    def test_the_semantic_model_is_what_gets_compiled(self):
+        out = self.compile(self.SIMPLE)
+        self.assertIsNotNone(out.compilation.core_syntax)
+        self.assertIsNotNone(out.compilation.core_model)
+        self.assertIsNotNone(out.compilation.program)
+
+    def test_the_generated_function_is_an_intent_not_a_function(self):
+        out = self.compile(self.SIMPLE)
+        functions = out.compilation.program.functions
+        self.assertIn("T", functions)
+        self.assertEqual(functions["T"].kind, "intent")
+
+    def test_the_intent_carries_its_authority_as_capabilities(self):
+        out = S.compile_only("""gama core 0.2
+intent T
+    authority PatientRead, AuditWrite
+source a : I64 from 5
+operation B
+    uses     a
+    yields   b : I64
+    effect   pure
+    computes a
+outcome b
+""").assert_compiled(self)
+        self.assertEqual(sorted(out.compilation.program.functions["T"].caps),
+                         ["AuditWrite", "PatientRead"])
+
+    def test_the_derived_graph_is_recorded_in_the_gir(self):
+        """The graph survives the descent into a register machine.
+
+        GIR has metadata for an operation graph -- reads, writes, dependencies --
+        and the derived levels are exactly that.  A backend can therefore see
+        the graph without re-deriving it.
+        """
+        out = self.compile("""
+operation First
+    uses     a
+    yields   x : I64
+    effect   pure
+    computes a + 1
+operation Second
+    uses     x
+    yields   y : I64
+    effect   pure
+    computes x * 2
+outcome y
+""")
+        tasks = out.compilation.program.functions["T"].parallel_tasks
+        by_name = {t.name: t for t in tasks}
+        self.assertEqual(set(by_name), {"First", "Second"})
+        self.assertEqual(by_name["Second"].depends_on, ["First"])
+        self.assertEqual(by_name["First"].depends_on, [])
+        self.assertEqual(by_name["First"].writes, ["x"])
+        self.assertIn("x", by_name["Second"].reads)
+
+    def test_every_basic_block_ends_with_a_terminator(self):
+        """A block with no terminator reads as `return ()`, so this is not style.
+
+        The reference interpreter treats the end of a block as a return.  A
+        lowering that forgot a jump would therefore silently truncate the
+        program rather than fail, which makes this worth asserting on every
+        example rather than trusting the six outputs to catch it.
+        """
+        from gamag.gir.ir import TERMINATORS
+        root = os.path.join(S.EXAMPLES_DIR, "core")
+        for path in sorted(glob.glob(os.path.join(root, "*.gg"))):
+            with self.subTest(example=os.path.basename(path)):
+                out = S.compile_only(open(path, encoding="utf-8").read(),
+                                     path=path).assert_compiled(self)
+                for fn in out.compilation.program.functions.values():
+                    for block in fn.blocks:
+                        self.assertTrue(
+                            block.instrs and
+                            block.instrs[-1].op in TERMINATORS,
+                            f"{fn.name}/{block.id} ({block.label}) has no "
+                            f"terminator")
+
+    def test_slots_are_named_after_bindings(self):
+        out = self.compile(self.SIMPLE)
+        names = [s.name for s in out.compilation.program.functions["T"].slots]
+        self.assertIn("b", names, "a binding should be visible in the IR by the "
+                                  "name the program gave it")
+        self.assertIn("a", names)
+
+    def test_a_constraint_reaches_the_ir_with_its_own_words(self):
+        out = self.compile("""
+operation B
+    uses     a
+    yields   b : I64
+    effect   pure
+    holds    b < 100
+    computes a
+outcome b
+""")
+        rendered = out.compilation.program.functions["T"].render()
+        self.assertIn("holds `b < 100`", rendered)
+
+    def test_a_bound_reaches_the_ir_as_a_number(self):
+        out = self.compile("""
+refine G
+    uses     a
+    yields   g : I64
+    effect   pure
+    starts   a
+    repeats  g + 1
+    until    g > 100
+    within   7 rounds
+outcome g
+""")
+        rendered = out.compilation.program.functions["T"].render()
+        # the bound is a literal in the IR, and the diverged path is a block
+        # named after the core's own concept rather than after a loop keyword
+        self.assertIn("binop >= %t0, 7", rendered.replace("%t1", "%t0"))
+        self.assertIn("refine.G.diverged", rendered)
+        self.assertIn("within 7 rounds", rendered)
+
+    def test_the_fault_kinds_are_the_cores_own(self):
+        """Not a call to a panic function: GIR terminators with core kinds."""
+        out = self.compile("""
+refine G
+    uses     a
+    yields   g : I64
+    effect   pure
+    starts   a
+    repeats  g + 1
+    until    g > 100
+    within   7 rounds
+outcome g
+""")
+        from gamag.gir.ir import Op
+        faults = [i.meta.get("kind")
+                  for fn in out.compilation.program.functions.values()
+                  for b in fn.blocks for i in b.instrs if i.op is Op.FAULT]
+        self.assertIn("RefinementDiverged", faults)
+
+
+class NativeChecks(unittest.TestCase):
+    """What the native checker refuses, without help from the older one."""
+
+    def test_a_yield_type_mismatch_is_refused(self):
+        out = S.run(core("""
+operation B
+    uses     a
+    yields   b : Text
+    effect   pure
+    computes a + 1
+outcome b
+"""))
+        out.assert_rejected(self, "E-yield-type")
+        self.assertIn("does not convert between types silently",
+                      out.messages())
+
+    def test_an_unknown_library_operation_is_refused(self):
+        out = S.run(core("""
+operation B
+    uses     a
+    yields   b : I64
+    effect   pure
+    computes math.teleport(a)
+outcome b
+"""))
+        out.assert_rejected(self, "E-unknown-call")
+
+    def test_a_wrong_arity_is_refused(self):
+        out = S.run(core("""
+operation B
+    uses     a
+    yields   b : F64
+    effect   pure
+    computes math.clamp(float(a), 0.0)
+outcome b
+"""))
+        out.assert_rejected(self, "E-arity")
+
+    def test_an_unknown_type_is_refused(self):
+        out = S.run(core("""
+operation B
+    uses     a
+    yields   b : Money
+    effect   pure
+    computes a
+outcome b
+"""))
+        out.assert_rejected(self, "E-unknown-type")
+
+    def test_a_pure_node_may_not_call_effectful_work(self):
+        out = S.run(core("""
+operation B
+    uses     a
+    yields   b : Unit
+    effect   pure
+    computes print(a)
+outcome b
+"""))
+        out.assert_rejected(self, "E-effect-undeclared")
+
+    def test_a_constraint_must_be_a_question(self):
+        out = S.run(core("""
+operation B
+    uses     a
+    yields   b : I64
+    effect   pure
+    holds    b + 1
+    computes a
+outcome b
+"""))
+        out.assert_rejected(self, "E-constraint-type")
+        self.assertIn("a yes or no answer", out.messages())
+
+    def test_a_secret_must_keep_propagating(self):
+        out = S.run("""gama core 0.2
+intent T
+source secret pin : I64 from 1234
+operation B
+    uses     pin
+    yields   b : I64
+    effect   crypto
+    computes pin
+outcome b
+""")
+        out.assert_rejected(self, "E-secret-escape")
+        self.assertIn("yields secret b", out.messages())
+
+    def test_a_secret_binding_may_be_declared_as_such(self):
+        out = S.compile_only("""gama core 0.2
+intent T
+source secret pin : I64 from 1234
+operation B
+    uses     pin
+    yields   secret b : I64
+    effect   crypto
+    computes pin
+outcome b
+""")
+        out.assert_compiled(self)
+
+    def test_an_operation_may_not_exceed_the_intents_authority(self):
+        out = S.run("""gama core 0.2
+intent T
+    authority PatientRead
+source a : I64 from 5
+operation B
+    uses     a
+    yields   b : I64
+    effect   pure
+    needs    CryptoSign
+    computes a
+outcome b
+""")
+        out.assert_rejected(self, "E-authority-unmet")
+        self.assertIn("but the intent holds", out.messages())
+
+    def test_a_dispatch_without_a_catch_all_is_refused(self):
+        out = S.run("""gama core 0.2
+intent T
+source code : Text from "red"
+resolve Label
+    over     code
+    yields   label : Text
+    effect   pure
+    choose
+        "red" => "stop"
+        "green" => "go"
+outcome label
+""")
+        out.assert_rejected(self, "E-dispatch-not-exhaustive")
+        self.assertIn("_ =>", out.messages())
+
+
+class TheFiveGraphs(unittest.TestCase):
+    """The model is five inspectable views, not one opaque structure."""
+
+    def model(self, body: str, head: str = HEAD):
+        return S.compile_only(core(body, head)).assert_compiled(
+            self).compilation.core_model
+
+    def test_every_graph_is_present_and_separate(self):
+        model = self.model("""
+operation B
+    uses     a
+    yields   b : I64
+    effect   pure
+    holds    b > 0
+    computes a
+outcome b
+""")
+        self.assertTrue(model.intent.name)
+        self.assertTrue(model.operations.nodes)
+        self.assertTrue(model.constraints.constraints)
+        self.assertIsNotNone(model.authority)
+        self.assertIsNotNone(model.recovery)
+
+    def test_constraints_are_grouped_by_how_they_are_discharged(self):
+        model = self.model("""
+operation P
+    uses     a
+    yields   s : I64
+    effect   pure
+    when     a >= 3
+    computes 1
+operation Q
+    uses     a
+    yields   s : I64
+    effect   pure
+    when     not (a >= 3)
+    computes 2
+outcome s
+""")
+        from gamag.core import mir as MIR
+        kinds = {c.kind: c.discharge for c in model.constraints.constraints}
+        self.assertEqual(kinds["exclusive"], MIR.DISCHARGE_PROVEN)
+        self.assertTrue(all(c.discharge == MIR.DISCHARGE_RUNTIME
+                            for c in model.constraints.constraints
+                            if c.kind == "when"))
+
+    def test_an_unprovable_selection_is_recorded_as_unprovable(self):
+        """Honesty about the limits of the proof is part of the model."""
+        model = self.model("""
+operation P
+    uses     a
+    yields   s : I64
+    effect   pure
+    when     a >= 75
+    computes 1
+operation Q
+    uses     a
+    yields   s : I64
+    effect   pure
+    when     a >= 50
+    computes 2
+outcome s
+""")
+        from gamag.core import mir as MIR
+        unprovable = model.constraints.unprovable()
+        self.assertEqual(len(unprovable), 1)
+        self.assertEqual(unprovable[0].discharge, MIR.DISCHARGE_UNPROVABLE)
+
+    def test_the_recovery_graph_enumerates_every_bound(self):
+        model = self.model("""
+refine G
+    uses     a
+    yields   g : I64
+    effect   pure
+    starts   a
+    repeats  g + 1
+    until    g > 100
+    within   12 rounds
+outcome g
+""")
+        refinements = [o for o in model.recovery.obligations
+                       if o.kind == "refinement"]
+        self.assertEqual(len(refinements), 1)
+        self.assertEqual(refinements[0].bound, 12)
+        self.assertEqual(refinements[0].fault, "RefinementDiverged")
+
+    def test_the_authority_graph_records_what_is_held(self):
+        model = self.model("""
+operation B
+    uses     a
+    yields   b : I64
+    effect   pure
+    computes a
+outcome b
+""", "gama core 0.2\nintent T\n    authority PatientRead\nsource a : I64 from 5\n")
+        self.assertEqual(model.authority.held, ["PatientRead"])
+        self.assertEqual(model.authority.unmet(), [])
+
+
+class ProvenanceEvidence(unittest.TestCase):
+    """What would be needed to support an originality claim -- and what is not.
+
+    The second audit is explicit that a test asserting `"if" not in grammar`
+    proves an architectural property and *not* historical originality, and that
+    the project should keep the two categories apart.  So this class contains no
+    assertion that the language has no prior art, because no test can make one.
+
+    What can be checked mechanically is the weaker, useful part: that the
+    repository's own claims stay inside what the evidence supports.
+    """
+
+    def read(self, relative: str) -> str:
+        with open(os.path.join(S.REPO_ROOT, relative), encoding="utf-8") as fh:
+            return fh.read()
+
+    def test_no_document_claims_the_concepts_are_unprecedented(self):
+        """The defensible claim is the combination, not the invention."""
+        for relative in ("README.md", "docs/IMPLEMENTATION.md",
+                         "docs/DESIGN_v0_2.md"):
+            text = self.read(relative).lower()
+            with self.subTest(document=relative):
+                for phrase in ("invented dependency graph",
+                               "first language to",
+                               "no prior art",
+                               "never been done",
+                               "completely unprecedented"):
+                    self.assertNotIn(phrase, text,
+                                     f"{relative} claims more than the evidence "
+                                     f"supports")
+
+    def test_the_design_document_separates_proven_from_checked(self):
+        """Section 14: the three categories must not be blurred into one list."""
+        text = self.read("docs/DESIGN_v0_3.md")
+        self.assertIn("Proven at compile time", text)
+        self.assertIn("Checked only at runtime", text)
+        self.assertIn("Not checked at all", text)
+
+    def test_the_audit_reports_are_kept_as_evidence(self):
+        for relative in ("Gama-G_Detailed_Audit_and_Verification_Report.txt",
+                         "Gama-G_Complete_Originality_and_Technical_Audit.txt"):
+            with self.subTest(report=relative):
+                self.assertTrue(os.path.exists(
+                    os.path.join(S.REPO_ROOT, relative)),
+                    "an audit the project responds to should stay in the "
+                    "repository; the response is only checkable against it")
 
 
 if __name__ == "__main__":

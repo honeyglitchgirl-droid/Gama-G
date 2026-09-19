@@ -224,11 +224,14 @@ def cmd_gir(args: argparse.Namespace) -> int:
 
 
 def cmd_graph(args: argparse.Namespace) -> int:
-    """Print the derived execution graph of a core program.
+    """Print the semantic model the core derived from relationships.
 
     In a language where the programmer never writes an order, being able to see
-    the order the compiler derived is not a nicety -- it is how the programmer
-    checks that the relationships they declared mean what they intended.
+    what the compiler derived is not a nicety -- it is how the programmer checks
+    that the relationships they declared mean what they intended.  It prints all
+    five graphs, because a promise that is only checked at runtime and a
+    capability demand the intent does not meet are exactly the things a reader
+    needs to see next to the order.
     """
     compilations, status = _compile(args.files, args)
     if status != EXIT_OK:
@@ -236,75 +239,66 @@ def cmd_graph(args: argparse.Namespace) -> int:
             _report(compilation, not args.no_color, args.json)
         return status
     for compilation in compilations:
-        graph = compilation.core_graph
-        if graph is None:
-            print(f"{compilation.path}: not a core program.  Only a source "
-                  f"that opens with `gama core <version>` has a derived graph; "
-                  f"the v0.1 surface writes its own order.", file=sys.stderr)
+        model = compilation.core_model
+        if model is None:
+            print(f"{compilation.path}: not a core program.  Only a source that "
+                  f"opens with `gama core <version>` has a derived model; the "
+                  f"v0.1 surface writes its own order.", file=sys.stderr)
             return EXIT_USAGE
+        graph = model.operations
         if getattr(args, "json", False):
-            payload = {
+            print(json.dumps({
                 "path": compilation.path,
                 "dialect": compilation.dialect,
-                "intent": (compilation.core.intent.name
-                           if compilation.core and compilation.core.intent
-                           else None),
-                "outcome": graph.outcome,
+                "backend": "native semantic IR -> GIR",
+                "intent": {"name": model.intent.name,
+                           "purpose": model.intent.purpose,
+                           "authority": model.intent.authority,
+                           "trail": model.intent.trail,
+                           "outcome": model.intent.outcome},
                 "sources": graph.sources,
                 "states": graph.states,
                 "levels": graph.levels,
-                "edges": [{"from": producer, "to": consumer}
-                          for name, node in sorted(graph.nodes.items())
-                          for producer in node.upstream
-                          for consumer in [name]],
+                "edges": [{"from": up, "to": name} for up, name
+                          in graph.edges()],
                 "selections": {
-                    binding: {
-                        "alternatives": [m.name for m in alt.members],
-                        "proven_exhaustive": alt.proven_exhaustive,
-                        "proven_exclusive": alt.proven_exclusive,
-                    } for binding, alt in sorted(graph.alternatives.items())},
-            }
-            print(json.dumps(payload, indent=2))
+                    binding: {"alternatives": sel.members,
+                              "proven_exhaustive": sel.proven_exhaustive,
+                              "proven_exclusive": sel.proven_exclusive}
+                    for binding, sel in sorted(graph.selections.items())},
+                "constraints": [
+                    {"kind": c.kind, "text": c.text, "node": c.node,
+                     "discharge": c.discharge, "fault": c.fault}
+                    for c in model.constraints.constraints],
+                "authority": {
+                    "held": model.authority.held,
+                    "unmet": [{"node": d.node, "missing": d.missing}
+                              for d in model.authority.unmet()]},
+                "recovery": [{"node": o.node, "kind": o.kind,
+                              "bound": o.bound, "fault": o.fault}
+                             for o in model.recovery.obligations],
+            }, indent=2))
             continue
-        core = compilation.core
-        intent = core.intent if core else None
-        if intent is not None:
-            print(f"intent {intent.name}")
-            if intent.purpose:
-                print(f"  purpose    {intent.purpose}")
-            if intent.authority:
-                print(f"  authority  {', '.join(intent.authority)}")
-        if graph.sources:
-            print(f"  sources    {', '.join(graph.sources)}")
-        if graph.states:
-            print(f"  states     {', '.join(graph.states)}")
-        print(f"  outcome    {graph.outcome}")
-        print()
-        print("derived execution order (never written in the source):")
-        for index, level in enumerate(graph.levels):
-            phase = ""
-            if any(graph.nodes[n].decl.kind == "transition" for n in level
-                   if n in graph.nodes):
-                phase = "   [commit]"
-            print(f"  level {index}: {', '.join(level)}{phase}")
+        print(model.render())
         if args.edges:
             print()
             print("derived dependency edges:")
             for name in graph.order():
                 node = graph.nodes[name]
                 upstream = ", ".join(node.upstream) or "(inputs only)"
-                print(f"  {node.produces} <- {upstream}   [{name}]")
-        for binding, alt in sorted(graph.alternatives.items()):
-            proof = []
-            if alt.proven_exclusive:
-                proof.append("mutually exclusive")
-            if alt.proven_exhaustive:
-                proof.append("exhaustive")
-            verdict = ("proven " + " and ".join(proof)) if proof else \
-                "not provable statically; a NoActiveAlternative check runs"
-            names = ", ".join(m.name for m in alt.members)
+                writes = node.produces
+                print(f"  {writes} <- {upstream}   [{node.kind} {name}]")
+        recorded = [f for f in (compilation.program.functions.values()
+                                if compilation.program else [])
+                    if f.parallel_tasks]
+        if recorded and args.edges:
             print()
-            print(f"selection of `{binding}` from {names}: {verdict}")
+            print("recorded in GIR as operation-graph metadata:")
+            for fn in recorded:
+                for task in fn.parallel_tasks:
+                    print(f"  {task.name}: reads={','.join(task.reads) or '-'} "
+                          f"writes={','.join(task.writes) or '-'} "
+                          f"depends_on={','.join(task.depends_on) or '-'}")
     return EXIT_OK
 
 

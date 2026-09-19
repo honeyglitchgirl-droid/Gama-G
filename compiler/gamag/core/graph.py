@@ -1,96 +1,69 @@
-"""Relationship inference and validation: the core's semantic heart.
+"""Deriving the semantic model: the core's structural heart.
 
 The programmer writes operations and the bindings they consume and produce.
-Nothing else.  This module turns that into an execution graph and checks the
-properties that make the graph trustworthy:
+Nothing else.  This module turns that into the five graphs of
+:mod:`gamag.core.mir` and checks the properties that make them trustworthy.
 
-**Relationships must be real.**  Every name an operation actually refers to,
-that names another binding in the intent, must be declared in `uses`.  A
-dependency that exists in the expression but not in the declaration is an
-error, and one that is declared but never used is a warning.  This is the check
-that makes the derived order mean something: without it, `uses` would be
-documentation that could drift from the code.
+**Relationships must be real.**  Every binding an operation actually refers to,
+that this intent produces, must be declared in `uses`; and everything declared
+must be real.  This is the check that makes derived order mean anything --
+without it `uses` would be a comment that could drift from the code.
 
 **The graph must be acyclic.**  A cycle means two operations each need the
-other's result, which has no value.  The error names the cycle.
+other's result, which has no value. The error names the cycle.
 
-**One binding, one producer -- unless the alternatives are guarded.**  Several
-operations may yield the same binding only if every one of them carries a
-`when` guard.  Where the guards are syntactically complementary the compiler
-records the selection as proven mutually exclusive and exhaustive; where it
-cannot prove that, the elaborated code keeps a runtime check that faults with
-"NoActiveAlternative" rather than silently producing nothing.
+**One binding, one producer -- unless every alternative is guarded.**  Where
+the guards are syntactically complementary the model records the selection as
+proven mutually exclusive and exhaustive. Where it cannot prove that, it says
+so explicitly (`DISCHARGE_UNPROVABLE`) and the lowering keeps a classified
+`NoActiveAlternative` fault rather than silently producing nothing.
 
-**Two phases.**  Compute operations produce bindings and are ordered purely by
-data.  Transitions commit changes to `state` resources and run after the
-compute phase.  A compute operation may not depend on a transition: that would
-make the derived order depend on an effect rather than on data, which is the
-one thing this language refuses to allow.
+**Two phases.**  Compute nodes produce bindings and are ordered purely by data.
+Transitions commit changes to `state` resources afterwards. A compute node may
+not depend on a transition: that would make derived order depend on an effect
+rather than on data, which is the one thing this language refuses.
 
-**Every traversal is bounded.**  `refine` requires `within`; there is no way to
-write a repetition that has no limit.
+**Every repetition is bounded.**  `refine` requires `within`, so the
+RecoveryGraph can enumerate a number for every loop the program contains.
 """
 
 from __future__ import annotations
 
 import re
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Tuple
 
-from .. import ast_nodes as A
 from ..diagnostics import DiagnosticBag, Phase
-from . import ast as C
+from . import mir as M
+from .parser import CoreSyntax
 
-COMPUTE_KINDS = ("operation", "refine", "each", "resolve")
+COMPUTE_KINDS = ("compute", "refine", "fanout", "dispatch")
+
+# The effect algebra is the specification's own, and the audit lists the effect
+# system among the assets worth building on rather than redesigning.
+EFFECTS = frozenset({"pure", "io", "network", "storage", "crypto", "audit",
+                     "medical", "model", "unsafe"})
 
 
 def _norm(text: str) -> str:
     return re.sub(r"\s+", "", text or "")
 
 
-def _is_complement(g1: str, g2: str) -> bool:
+def is_complement(g1: str, g2: str) -> bool:
     """True when one guard is the syntactic negation of the other."""
     a, b = _norm(g1), _norm(g2)
     if not a or not b:
         return False
-    return b in ("not(" + a + ")", "not" + a) or a in ("not(" + b + ")",
-                                                       "not" + b)
+    return b in ("not(" + a + ")", "not" + a) or \
+        a in ("not(" + b + ")", "not" + b)
 
 
-def free_names(expr: Optional[A.Expr], out: Optional[Set[str]] = None
-               ) -> Set[str]:
-    """Every identifier an expression mentions.
-
-    Deliberately shallow about meaning: names that turn out to be modules or
-    builtins are filtered by the caller, which only cares about names that
-    refer to bindings this intent actually declares.
-    """
-    found: Set[str] = out if out is not None else set()
-    if expr is None:
-        return found
-    stack = [expr]
-    while stack:
-        node = stack.pop()
-        if node is None:
-            continue
-        if isinstance(node, A.Name):
-            found.add(node.id)
-        for value in getattr(node, "__dict__", {}).values():
-            if isinstance(value, A.Node):
-                stack.append(value)
-            elif isinstance(value, (list, tuple)):
-                stack.extend(v for v in value if isinstance(v, A.Node))
-    return found
-
-
-class GraphBuilder:
-    """Builds and validates the :class:`~gamag.core.ast.ExecutionGraph`."""
-
-    def __init__(self, module: C.CoreModule, bag: DiagnosticBag):
-        self.m = module
+class ModelBuilder:
+    def __init__(self, syntax: CoreSyntax, bag: DiagnosticBag):
+        self.s = syntax
         self.bag = bag
-        self.graph = C.ExecutionGraph()
-        self.bindings: Dict[str, str] = {}      # binding -> producer kind
-        self.transitions: List[C.OperationDecl] = []
+        self.model = M.SemanticModel(version=syntax.version,
+                                     filename=syntax.filename)
+        self.produced_by: Dict[str, str] = {}   # binding -> what produces it
 
     # ------------------------------------------------------------------
     def error(self, message: str, pos=None, code: str = "E-graph",
@@ -104,306 +77,391 @@ class GraphBuilder:
                          help_text=help_text)
 
     # ------------------------------------------------------------------
-    def build(self) -> C.ExecutionGraph:
-        self._collect_bindings()
-        self._validate_shapes()
-        self._validate_relationships()
+    def build(self) -> M.SemanticModel:
+        self.model.intent = self.s.intent
+        self.model.intent.outcome = self.s.outcome
+        self._collect()
+        self._shapes()
+        self._relationships()
+        self._authority()
         if self.bag.ok:
             self._order()
-        return self.graph
+        self._constraints()
+        self._recovery()
+        return self.model
 
     # ------------------------------------------------------------------
-    def _collect_bindings(self) -> None:
-        g = self.graph
-        for src in self.m.sources:
-            if src.name in self.bindings:
-                self.error(f"`{src.name}` is produced more than once", src.pos,
-                           code="E-duplicate-binding")
-            self.bindings[src.name] = "source"
-            g.sources.append(src.name)
-            g.producers_of.setdefault(src.name, [])
-
-        for st in self.m.states:
-            if st.name in self.bindings:
-                self.error(f"`{st.name}` is produced more than once", st.pos,
-                           code="E-duplicate-binding")
-            if st.starts is None or st.starts.expr is None:
-                self.error(f"state `{st.name}` has no `starts` value, so it "
-                           f"would have no initial meaning", st.pos,
-                           code="E-state-uninitialised")
-            self.bindings[st.name] = "state"
-            g.states.append(st.name)
-            g.producers_of.setdefault(st.name, [])
-
-        for op in self.m.operations:
-            if op.kind == "transition":
-                if not op.alters:
-                    self.error(f"transition `{op.name}` does not say which "
-                               f"state it alters", op.pos,
-                               code="E-transition-target")
-                elif op.alters not in self.bindings or \
-                        self.bindings[op.alters] != "state":
+    def _collect(self) -> None:
+        graph = self.model.operations
+        for node in self.s.nodes:
+            if node.kind == "source":
+                if node.produces in self.produced_by:
+                    self.error(f"`{node.produces}` is produced more than once",
+                               node.pos, code="E-duplicate-binding")
+                    continue
+                self.produced_by[node.produces] = "source"
+                graph.inputs[node.produces] = node      # type: ignore[index]
+                graph.sources.append(node.produces)
+                graph.producers_of.setdefault(node.produces, [])
+            elif node.kind == "state":
+                if node.produces in self.produced_by:
+                    self.error(f"`{node.produces}` is produced more than once",
+                               node.pos, code="E-duplicate-binding")
+                    continue
+                if node.initial is None:                # type: ignore[attr-defined]
                     self.error(
-                        f"transition `{op.name}` alters `{op.alters}`, which is "
-                        f"not a declared state", op.pos,
+                        f"state `{node.produces}` has no `starts` value, so it "
+                        f"would have no initial meaning", node.pos,
+                        code="E-state-uninitialised")
+                self.produced_by[node.produces] = "state"
+                graph.resources[node.produces] = node   # type: ignore[index]
+                graph.states.append(node.produces)
+                graph.producers_of.setdefault(node.produces, [])
+            elif node.kind == "transition":
+                state = node.state                      # type: ignore[attr-defined]
+                if not state:
+                    self.error(f"transition `{node.name}` does not say which "
+                               f"state it alters", node.pos,
+                               code="E-transition-target")
+                elif self.produced_by.get(state) != "state":
+                    self.error(
+                        f"transition `{node.name}` alters `{state}`, which is "
+                        f"not a declared state", node.pos,
                         code="E-transition-target",
                         help_text="only `state` resources may change; bindings "
                                   "produced by operations are single-assignment")
-                self.transitions.append(op)
-                continue
-
-            if not op.yields:
-                self.error(f"{op.kind} `{op.name}` does not `yield` a binding",
-                           op.pos, code="E-no-yields",
-                           help_text="every compute operation produces exactly "
-                                     "one binding; that is how the graph gets "
-                                     "its edges")
-                continue
-
-            producers = g.producers_of.setdefault(op.yields, [])
-            if op.yields in self.bindings and not producers:
-                self.error(
-                    f"`{op.yields}` is already produced by a "
-                    f"{self.bindings[op.yields]} and cannot also be yielded by "
-                    f"`{op.name}`", op.pos, code="E-duplicate-binding")
-                continue
-            self.bindings.setdefault(op.yields, op.kind)
-            producers.append(op.name)
-            g.nodes[op.name] = C.GraphNode(
-                decl=op, produces=op.yields, consumes=list(op.uses),
-                guarded=op.when is not None)
+                graph.nodes[node.name] = node
+            else:
+                if not node.produces:
+                    self.error(
+                        f"{node.kind} `{node.name}` does not `yield` a binding",
+                        node.pos, code="E-no-yields",
+                        help_text="every compute operation produces exactly one "
+                                  "binding; that is how the graph gets its "
+                                  "edges")
+                    continue
+                producers = graph.producers_of.setdefault(node.produces, [])
+                if node.produces in self.produced_by and not producers:
+                    self.error(
+                        f"`{node.produces}` is already produced by a "
+                        f"{self.produced_by[node.produces]} and cannot also be "
+                        f"yielded by `{node.name}`", node.pos,
+                        code="E-duplicate-binding")
+                    continue
+                self.produced_by.setdefault(node.produces, node.kind)
+                producers.append(node.name)
+                graph.nodes[node.name] = node
 
     # ------------------------------------------------------------------
-    def _validate_shapes(self) -> None:
-        for op in self.m.operations:
-            kind = op.kind
-            # `resolve` takes its value from `choose` and `refine` from
-            # `repeats`; only a plain operation must say `computes`.
-            if kind in COMPUTE_KINDS and op.computes is None and \
-                    kind not in ("resolve", "refine"):
-                self.error(f"{kind} `{op.name}` has no `computes` expression",
-                           op.pos, code="E-no-computes")
+    def _shapes(self) -> None:
+        for node in self.s.nodes:
+            kind = node.kind
+            if kind == "compute" and node.value is None:  # type: ignore[attr-defined]
+                self.error(f"operation `{node.name}` has no `computes` "
+                           f"expression", node.pos, code="E-no-computes")
             if kind == "refine":
-                for clause_name in ("starts", "repeats", "until"):
-                    if getattr(op, clause_name) is None:
+                # the model's field names, and the clause the programmer writes
+                parts = (("start", "`starts`"), ("step", "`repeats`"),
+                         ("stop", "`until`"))
+                for field_name, clause_name in parts:
+                    if getattr(node, field_name) is None:
                         self.error(
-                            f"refine `{op.name}` is missing `{clause_name}`",
-                            op.pos, code="E-refine-incomplete",
+                            f"refine `{node.name}` is missing {clause_name}",
+                            node.pos, code="E-refine-incomplete",
                             help_text="a refine needs `starts` (the first "
                                       "approximation), `repeats` (the next "
                                       "one), `until` (when to stop) and "
                                       "`within` (how long it may take)")
-                if op.within is None:
+                if node.bound is None:                  # type: ignore[attr-defined]
                     self.error(
-                        f"refine `{op.name}` has no `within` bound", op.pos,
+                        f"refine `{node.name}` has no `within` bound", node.pos,
                         code="E-unbounded-refinement",
-                        help_text="an unbounded repetition cannot be written "
-                                  "in Gama-G core; state how many rounds it "
-                                  "may take, e.g. `within 50 rounds`")
-                elif op.within < 1:
-                    self.error(f"refine `{op.name}` must allow at least one "
-                               f"round", op.pos, code="E-unbounded-refinement")
-            if kind == "each":
-                if op.over is None:
-                    self.error(f"each `{op.name}` does not say what it is over",
-                               op.pos, code="E-each-incomplete")
-                elif not op.over.item:
-                    self.error(
-                        f"each `{op.name}` does not name its item", op.pos,
-                        code="E-each-incomplete",
-                        help_text="write `over readings as reading`")
-            if kind == "resolve":
-                if op.over is None:
-                    self.error(f"resolve `{op.name}` does not say what it "
-                               f"resolves", op.pos, code="E-resolve-incomplete")
-                if not op.choices:
-                    self.error(f"resolve `{op.name}` has no `choose` "
-                               f"alternatives", op.pos,
+                        help_text="an unbounded repetition cannot be written in "
+                                  "Gama-G core; state how many rounds it may "
+                                  "take, e.g. `within 50 rounds`")
+                elif node.bound < 1:                    # type: ignore[attr-defined]
+                    self.error(f"refine `{node.name}` must allow at least one "
+                               f"round", node.pos,
+                               code="E-unbounded-refinement")
+            if kind == "fanout":
+                if node.collection is None:             # type: ignore[attr-defined]
+                    self.error(f"each `{node.name}` does not say what it is "
+                               f"over", node.pos, code="E-each-incomplete")
+                elif not node.item:                     # type: ignore[attr-defined]
+                    self.error(f"each `{node.name}` does not name its item",
+                               node.pos, code="E-each-incomplete",
+                               help_text="write `over readings as reading`")
+                if node.value is None:                  # type: ignore[attr-defined]
+                    self.error(f"each `{node.name}` has no `computes` "
+                               f"expression", node.pos, code="E-no-computes")
+            if kind == "dispatch":
+                if node.subject is None:                # type: ignore[attr-defined]
+                    self.error(f"resolve `{node.name}` does not say what it "
+                               f"resolves", node.pos,
                                code="E-resolve-incomplete")
-            if kind == "transition" and op.computes is None:
-                self.error(f"transition `{op.name}` has no `computes` "
-                           f"expression", op.pos, code="E-no-computes")
-            if op.effect and op.effect not in _EFFECTS:
-                self.error(f"`{op.effect}` is not an effect", op.pos,
+                if not node.cases:                      # type: ignore[attr-defined]
+                    self.error(f"resolve `{node.name}` has no `choose` "
+                               f"alternatives", node.pos,
+                               code="E-resolve-incomplete")
+                elif not any(isinstance(p, (M.PWild, M.PBind))
+                             for p, _ in node.cases):    # type: ignore[attr-defined]
+                    self.error(
+                        f"resolve `{node.name}` has no catch-all alternative, "
+                        f"so some values would resolve to nothing", node.pos,
+                        code="E-dispatch-not-exhaustive",
+                        help_text="end the `choose` block with `_ => ...`")
+            if kind == "transition" and node.value is None:  # type: ignore[attr-defined]
+                self.error(f"transition `{node.name}` has no `computes` "
+                           f"expression", node.pos, code="E-no-computes")
+            if node.effect and node.effect not in EFFECTS:
+                self.error(f"`{node.effect}` is not an effect", node.pos,
                            code="E-unknown-effect",
-                           help_text="effects are: " + ", ".join(sorted(_EFFECTS)))
+                           help_text="effects are: " + ", ".join(sorted(EFFECTS)))
 
     # ------------------------------------------------------------------
-    def _validate_relationships(self) -> None:
-        """Declared relationships must match real ones."""
-        known = set(self.bindings)
-        for op in self.m.operations:
+    def _relationships(self) -> None:
+        """Declared relationships must match real ones, in both directions."""
+        known = set(self.produced_by)
+        for node in self.s.nodes:
+            if node.kind in ("source", "state"):
+                continue
             local: Set[str] = set()
-            if op.kind == "each" and op.over is not None:
-                local.add(op.over.item)
-            if op.kind == "resolve":
-                for pattern, _value in op.choices:
-                    local |= _pattern_names(pattern)
+            if node.kind == "fanout":
+                local.add(node.item)                    # type: ignore[attr-defined]
+            if node.kind == "dispatch":
+                for pattern, _value in node.cases:      # type: ignore[attr-defined]
+                    local |= M.pattern_bindings(pattern)
 
             referenced: Set[str] = set()
-            for clause in [op.computes, op.when, op.starts, op.repeats,
-                           op.until, op.over] + list(op.holds):
-                if clause is None:
-                    continue
-                expr = clause.expr
-                if op.kind == "each" and clause is op.over:
-                    # the collection being traversed is external; the item is
-                    # internal
-                    referenced |= free_names(expr) - local
-                else:
-                    referenced |= free_names(expr)
-            # `holds` may constrain the binding this operation produces
-            own = {op.yields} if op.kind != "transition" else {op.alters}
+            for expr in M.node_expressions(node):
+                referenced |= M.references(expr)
             referenced -= local
-            referenced -= own
+            # a node may constrain the binding it produces
+            referenced.discard(node.produces)
+            if node.kind == "transition":
+                referenced.discard(node.state)          # type: ignore[attr-defined]
 
             real = referenced & known
-            declared = set(op.uses)
-            # An `over` clause *is* the declaration of the relationship to the
-            # collection being traversed or resolved, so it needs no `uses` too.
-            if op.over is not None and op.over.expr is not None:
-                declared |= free_names(op.over.expr) & known
+            declared = set(node.consumes)
+            # an `over` clause *is* the declaration of the relationship to the
+            # collection being traversed or resolved
+            subject = getattr(node, "collection", None) or \
+                getattr(node, "subject", None)
+            if subject is not None:
+                declared |= M.references(subject) & known
+
             for name in sorted(real - declared):
                 self.error(
-                    f"`{op.name}` refers to `{name}` but does not declare it in "
-                    f"`uses`", op.pos, code="E-undeclared-relationship",
+                    f"`{node.name}` refers to `{name}` but does not declare it "
+                    f"in `uses`", node.pos, code="E-undeclared-relationship",
                     help_text="the execution graph is derived from declared "
                               "relationships, so a real dependency must be "
                               "written down: add it to `uses`")
             for name in sorted(declared - real):
                 if name in known:
                     self.warn(
-                        f"`{op.name}` declares `{name}` in `uses` but never "
-                        f"refers to it", op.pos, code="W-unused-relationship",
+                        f"`{node.name}` declares `{name}` in `uses` but never "
+                        f"refers to it", node.pos,
+                        code="W-unused-relationship",
                         help_text="an edge that is not real costs a dependency "
                                   "and can create a cycle; remove it")
                 else:
                     self.error(
-                        f"`{op.name}` uses `{name}`, which nothing produces",
-                        op.pos, code="E-unresolved-relationship",
+                        f"`{node.name}` uses `{name}`, which nothing produces",
+                        node.pos, code="E-unresolved-relationship",
                         help_text="every relationship must connect to a "
                                   "`source`, a `state` or another operation's "
                                   "`yields`")
 
-        # the outcome must exist
-        if self.m.outcome is None:
+        if not self.s.outcome:
             self.error("the intent has no `outcome`, so it produces nothing",
-                       self.m.pos, code="E-no-outcome")
-        elif self.m.outcome.binding not in self.bindings:
-            self.error(
-                f"outcome `{self.m.outcome.binding}` is produced by nothing",
-                self.m.outcome.pos, code="E-unresolved-relationship")
+                       self.s.intent.pos, code="E-no-outcome")
+        elif self.s.outcome not in self.produced_by:
+            self.error(f"outcome `{self.s.outcome}` is produced by nothing",
+                       self.s.outcome_pos, code="E-unresolved-relationship")
         else:
-            self.graph.outcome = self.m.outcome.binding
+            self.model.operations.outcome = self.s.outcome
 
-        # compute phase must not depend on the commit phase
-        for op in self.m.operations:
-            if op.kind in COMPUTE_KINDS:
-                for name in op.uses:
-                    if any(t.alters == name for t in self.transitions):
+        altered = {n.state for n in self.s.nodes        # type: ignore[attr-defined]
+                   if n.kind == "transition"}
+        for node in self.s.nodes:
+            if node.kind in COMPUTE_KINDS:
+                for name in node.consumes:
+                    if name in altered:
                         self.error(
-                            f"`{op.name}` uses `{name}`, which a transition "
+                            f"`{node.name}` uses `{name}`, which a transition "
                             f"alters; compute operations may only depend on "
-                            f"data, never on a committed change", op.pos,
+                            f"data, never on a committed change", node.pos,
                             code="E-compute-after-commit")
 
     # ------------------------------------------------------------------
+    def _authority(self) -> None:
+        """Every capability demand must be met by the intent's authority."""
+        held = set(self.model.intent.authority)
+        graph = self.model.authority
+        graph.held = list(self.model.intent.authority)
+        for node in self.s.nodes:
+            if not node.needs:
+                continue
+            missing = sorted(set(node.needs) - held)
+            demand = M.AuthorityDemand(node=node.name, needs=list(node.needs),
+                                       granted=not missing, missing=missing)
+            graph.demands.append(demand)
+            if missing:
+                self.error(
+                    f"`{node.name}` needs {'`' + '`, `'.join(missing) + '`'} "
+                    f"but the intent holds "
+                    f"{'`' + '`, `'.join(sorted(held)) + '`' if held else 'no authority'}",
+                    node.pos, code="E-authority-unmet",
+                    help_text="an operation may not require authority its "
+                              "intent does not have; add it to the intent's "
+                              "`authority` or remove the demand")
+        for name, state in self.model.operations.resources.items():
+            missing = sorted(set(state.authority) - held)
+            if missing:
+                self.error(
+                    f"state `{name}` is guarded by "
+                    f"{'`' + '`, `'.join(missing) + '`'}, which the intent does "
+                    f"not hold", state.pos, code="E-authority-unmet")
+
+    # ------------------------------------------------------------------
     def _order(self) -> None:
-        g = self.graph
-        # edges: producer operation -> consumer operation
-        deps: Dict[str, Set[str]] = {name: set() for name in g.nodes}
-        for name, node in g.nodes.items():
+        graph = self.model.operations
+        # Transitions are not scheduled by data: they form the commit phase.
+        # Including them in the Kahn walk would place a transition twice -- once
+        # where its inputs are ready and once in the commit phase.
+        compute = {name: node for name, node in graph.nodes.items()
+                   if node.phase == "compute"}
+        deps: Dict[str, Set[str]] = {name: set() for name in compute}
+        for name, node in compute.items():
             for binding in node.consumes:
-                for producer in g.producers_of.get(binding, []):
-                    if producer != name and producer in g.nodes:
+                for producer in graph.producers_of.get(binding, []):
+                    if producer != name and producer in compute:
                         deps[name].add(producer)
 
         cycle = _find_cycle(deps)
         if cycle:
-            first = g.nodes[cycle[0]].decl
             self.error(
                 "the operation graph has a cycle: "
-                + " -> ".join(cycle + [cycle[0]]), first.pos,
-                code="E-graph-cycle",
+                + " -> ".join(cycle + [cycle[0]]),
+                graph.nodes[cycle[0]].pos, code="E-graph-cycle",
                 help_text="each operation in the cycle needs another's result, "
                           "so none of them has a value; break the cycle by "
                           "splitting an operation in two")
             return
 
-        # Kahn by levels: everything whose dependencies are met runs together.
         done: Set[str] = set()
-        remaining = set(g.nodes)
+        remaining = set(compute)
         while remaining:
             level = sorted(n for n in remaining if deps[n] <= done)
-            if not level:                      # pragma: no cover - cycle caught
+            if not level:                       # pragma: no cover - cycle caught
                 break
             for name in level:
-                g.nodes[name].level = len(g.levels)
-                g.nodes[name].upstream = sorted(deps[name])
+                compute[name].level = len(graph.levels)
+                compute[name].upstream = sorted(deps[name])
                 done.add(name)
                 remaining.discard(name)
-            g.levels.append(level)
-        for name, node in g.nodes.items():
-            node.downstream = sorted(
-                other for other, dep in deps.items() if name in dep)
+            graph.levels.append(level)
+        for name, node in compute.items():
+            node.downstream = sorted(o for o, d in deps.items() if name in d)
 
         # selections: several guarded producers of one binding
-        for binding, producers in g.producers_of.items():
-            members = [g.nodes[p].decl for p in producers if p in g.nodes]
+        for binding, producers in graph.producers_of.items():
+            members = [graph.nodes[p] for p in producers if p in graph.nodes]
             if len(members) < 2:
                 continue
-            alt = C.Alternative(binding=binding, members=members)
             unguarded = [m for m in members if m.when is None]
             if unguarded:
                 names = ", ".join(f"`{m.name}`" for m in unguarded)
                 self.error(
                     f"`{binding}` is yielded by {len(members)} operations, but "
-                    f"{names} "
-                    f"{'has' if len(unguarded) == 1 else 'have'} no `when` "
-                    f"guard, so the intent does not say which one applies",
-                    unguarded[0].pos,
-                    code="E-ambiguous-selection",
+                    f"{names} {'has' if len(unguarded) == 1 else 'have'} no "
+                    f"`when` guard, so the intent does not say which one "
+                    f"applies", unguarded[0].pos, code="E-ambiguous-selection",
                     help_text="selection in Gama-G core is several guarded "
                               "operations yielding one binding; give every "
                               "alternative a `when`")
                 continue
-            if len(members) == 2:
-                g1 = members[0].when.text
-                g2 = members[1].when.text
-                if _is_complement(g1, g2):
-                    alt.proven_exclusive = True
-                    alt.proven_exhaustive = True
-            g.alternatives[binding] = alt
+            selection = M.Selection(binding=binding,
+                                    members=[m.name for m in members])
+            if len(members) == 2 and is_complement(members[0].when.text,
+                                                   members[1].when.text):
+                selection.proven_exclusive = True
+                selection.proven_exhaustive = True
+            graph.selections[binding] = selection
 
-        # transitions are ordered after the compute phase, by their own data
-        # dependencies and then by declaration order
-        if self.transitions:
-            commit: List[str] = []
-            for index, tr in enumerate(self.transitions):
-                commit.append(tr.name)
-                g.nodes[tr.name] = C.GraphNode(
-                    decl=tr, produces=tr.alters, consumes=list(tr.uses),
-                    level=len(g.levels), upstream=sorted(
-                        n for n in g.nodes if n in commit[:-1]
-                        and g.nodes[n].produces == tr.alters))
-            g.levels.append(commit)
+        # transitions form the commit phase, after every derivation of data
+        commit = [n for n in self.s.nodes if n.kind == "transition"]
+        if commit:
+            names = [n.name for n in commit]
+            for index, node in enumerate(commit):
+                node.level = len(graph.levels)
+                # a transition reads data produced in the compute phase, and
+                # any earlier transition that altered the same state
+                data = sorted(p for binding in node.consumes
+                              for p in graph.producers_of.get(binding, [])
+                              if p in compute)
+                earlier = [n for n in names[:index]
+                           if graph.nodes[n].state == node.state]  # type: ignore[attr-defined]
+                node.upstream = sorted(set(data) | set(earlier))
+            graph.levels.append(names)
 
+    # ------------------------------------------------------------------
+    def _constraints(self) -> None:
+        """Every promise, with its discharge status recorded honestly."""
+        constraints = self.model.constraints
+        for node in self.s.nodes:
+            for hold in node.holds:
+                constraints.add(hold)
+            stop = getattr(node, "stop", None)
+            if stop is not None:
+                stop.fault = "RefinementDiverged"
+                constraints.add(stop)
+        for binding, selection in self.model.operations.selections.items():
+            for member in selection.members:
+                guard = self.model.operations.nodes[member].when
+                if guard is not None:
+                    constraints.add(guard)
+            # the selection property itself is a constraint on the graph
+            constraints.add(M.Constraint(
+                kind="exclusive",
+                text=f"exactly one of {', '.join(selection.members)} yields "
+                     f"`{binding}`",
+                node=", ".join(selection.members), binding=binding,
+                discharge=(M.DISCHARGE_PROVEN
+                           if selection.proven_exhaustive
+                           and selection.proven_exclusive
+                           else M.DISCHARGE_UNPROVABLE),
+                fault=selection.fallback_fault,
+                pos=self.model.operations.nodes[selection.members[0]].pos))
 
-# The effect algebra is the one the specification defines and the reference
-# slice enforces: the core declares effects in the same vocabulary, so an
-# effect written in the core means the same thing everywhere.
-_EFFECTS = {"pure", "io", "network", "storage", "crypto", "audit",
-            "medical", "model", "unsafe"}
+    # ------------------------------------------------------------------
+    def _recovery(self) -> None:
+        """Every bound, and every fault this program can classify."""
+        recovery = self.model.recovery
+        for node in self.s.nodes:
+            if node.kind == "refine":
+                recovery.obligations.append(M.RecoveryObligation(
+                    node=node.name, kind="refinement", bound=node.bound,  # type: ignore[attr-defined]
+                    fault="RefinementDiverged",
+                    reason=(node.stop.text if node.stop else "")))  # type: ignore[attr-defined]
+            for _hold in node.holds:
+                recovery.obligations.append(M.RecoveryObligation(
+                    node=node.name, kind="constraint",
+                    fault="ContractViolation", reason=_hold.text))
+        for binding, selection in self.model.operations.selections.items():
+            if not (selection.proven_exhaustive and selection.proven_exclusive):
+                recovery.obligations.append(M.RecoveryObligation(
+                    node=", ".join(selection.members), kind="selection",
+                    fault=selection.fallback_fault,
+                    reason=f"{len(selection.members)} guards over `{binding}` "
+                           f"were not proven complementary"))
 
-
-def _pattern_names(pattern: A.Pattern) -> Set[str]:
-    names: Set[str] = set()
-    if isinstance(pattern, A.NamePat):
-        names.add(pattern.name)
-    elif isinstance(pattern, A.CtorPat):
-        for arg in pattern.args or []:
-            names |= _pattern_names(arg)
-    return names
+    # ------------------------------------------------------------------
+    # the old names, kept as views so existing tools and tests keep working
+    @property
+    def alternatives(self):
+        return self.model.operations.selections
 
 
 def _find_cycle(deps: Dict[str, Set[str]]) -> Optional[List[str]]:
@@ -435,6 +493,6 @@ def _find_cycle(deps: Dict[str, Set[str]]) -> Optional[List[str]]:
     return None
 
 
-def build(module: C.CoreModule, bag: DiagnosticBag) -> C.ExecutionGraph:
-    """Public entry point: derive and validate the execution graph."""
-    return GraphBuilder(module, bag).build()
+def build(syntax: CoreSyntax, bag: DiagnosticBag) -> M.SemanticModel:
+    """Public entry point: derive and validate the semantic model."""
+    return ModelBuilder(syntax, bag).build()
