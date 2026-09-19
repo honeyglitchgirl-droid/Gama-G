@@ -1041,13 +1041,33 @@ def _crypto_random_int(ctx, lo, hi):
 # ======================================================================
 # secrets  (spec section 8)
 # ======================================================================
-@reg("secrets.wrap", ("value", "label"), ret=T.ANY, variadic=True, min_args=1,
+def _infer_secret(argtypes):
+    """`secrets.wrap` yields a statically secret value.
+
+    Typing the result as ordinary Any would mean the only thing standing
+    between a secret and `print` is a runtime check, so the secret-ness is
+    carried in the type and enforced statically (spec section 8).
+    """
+    inner = argtypes[0] if argtypes else T.ANY
+    if isinstance(inner, T.SecretType):
+        return inner
+    return T.SecretType(inner)
+
+
+def _infer_exposed(argtypes):
+    inner = argtypes[0] if argtypes else T.ANY
+    return inner.inner if isinstance(inner, T.SecretType) else inner
+
+
+@reg("secrets.wrap", ("value", "label"), ret=T.SecretType(T.ANY),
+     infer=_infer_secret, variadic=True, min_args=1,
      effects=("crypto",), doc="Place a value under secret lifecycle control.")
 def _secrets_wrap(ctx, value, label="secret"):
     return GSecret(value, to_text(label))
 
 
-@reg("secrets.expose", ("secret", "reason"), ret=T.ANY, effects=("crypto", "audit"),
+@reg("secrets.expose", ("secret", "reason"), ret=T.ANY, infer=_infer_exposed,
+     effects=("crypto", "audit"),
      caps=("SecretExpose",), doc="Audited reveal of a secret. Requires SecretExpose.")
 def _secrets_expose(ctx, secret, reason=""):
     ctx.require_capability("SecretExpose", what="secrets.expose")

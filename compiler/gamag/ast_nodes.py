@@ -397,6 +397,8 @@ class Param(Node):
 class Contract(Node):
     kind: str = "requires"       # requires | ensures
     expr: Optional[Expr] = None
+    # The predicate exactly as written, so a violation can quote it.
+    text: str = ""
 
 
 @dataclass

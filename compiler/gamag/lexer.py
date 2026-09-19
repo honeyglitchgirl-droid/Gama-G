@@ -34,11 +34,16 @@ from .tokens import DURATION_UNITS, HARD_KEYWORDS, HARD_KEYWORD_SET, Token, Toke
 # Note that comparison operators are deliberately absent: `a > b` ends with
 # `b`, and `Map<K,V>` ends a type annotation, so a trailing `<`/`>`/`==` must
 # still terminate the logical line.
+#
+# `=>` is absent too.  A match arm may put its body on the following lines,
+# indented, and that body is a layout block: suppressing the newline after
+# `=>` would also suppress the INDENT that opens it, desynchronising the
+# indentation stack for the rest of the match.
 _TRAILING_CONTINUATION = {
     TokenKind.PLUS, TokenKind.MINUS, TokenKind.STAR, TokenKind.SLASH,
     TokenKind.PERCENT, TokenKind.POWER, TokenKind.ASSIGN,
     TokenKind.AND, TokenKind.OR, TokenKind.NOT, TokenKind.ARROW,
-    TokenKind.FATARROW, TokenKind.COMMA, TokenKind.DOT, TokenKind.COLON,
+    TokenKind.COMMA, TokenKind.DOT, TokenKind.COLON,
     TokenKind.LPAREN, TokenKind.LBRACKET, TokenKind.LBRACE,
     TokenKind.AMPAMP, TokenKind.PIPEPIPE, TokenKind.IN, TokenKind.AS,
     TokenKind.PLUSASSIGN, TokenKind.MINUSASSIGN, TokenKind.STARASSIGN,

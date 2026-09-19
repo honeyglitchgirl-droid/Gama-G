@@ -1,0 +1,79 @@
+// Contracts and the medical domain (spec sections 16 and 27).
+//
+// A contract is a predicate the compiler can hand to a static analyzer, a
+// runtime checker, or a test generator.  Here they are enforced at runtime:
+// `requires` on entry, `ensures` on exit.
+//
+//   ggc run examples/medical_dosing.gg
+
+record Patient
+    id: Text
+    weight_kg: F64
+    age: I64
+
+enum DosingError
+    OutOfRange(reason: Text)
+    Contraindicated(drug: Text)
+
+// The specification's own example, in section 27.
+fn dosage(weight: F64, factor: F64) -> F64
+    pure
+    requires weight > 0
+    requires factor >= 0
+    ensures result >= 0
+    return weight * factor
+
+fn pediatric_dose(patient: Patient, factor: F64) -> Result<F64, DosingError>
+    pure
+    requires patient.weight_kg > 0
+    if patient.age < 0 or patient.age > 130
+        return fail(OutOfRange("age outside plausible bounds"))
+    if patient.weight_kg > 300.0
+        return fail(OutOfRange("weight outside plausible bounds"))
+    return ok(dosage(patient.weight_kg, factor))
+
+fn prescribe(patient: Patient, drug: Text, factor: F64) -> Result<F64, DosingError>
+    audit
+    if drug == "warfarin" and patient.age > 75
+        return fail(Contraindicated(drug))
+    let dose = pediatric_dose(patient, factor)
+    match dose
+        ok(mg) =>
+            audit.record {
+                actor: "clinician"
+                action: "DOSE_PRESCRIBED"
+                object: patient.id
+                reason: "weight-based dosing"
+            }
+            return ok(mg)
+        fail(err) => return fail(err)
+
+fn describe(err: DosingError) -> Text
+    pure
+    match err
+        OutOfRange(reason) => return "out of range: " + reason
+        Contraindicated(drug) => return "contraindicated: " + drug
+
+fn main() -> Unit
+    io
+    audit
+    let ada = Patient { id: "P-1", weight_kg: 24.5, age: 8 }
+    let grace = Patient { id: "P-2", weight_kg: 61.0, age: 81 }
+
+    match prescribe(ada, "amoxicillin", 0.5)
+        ok(mg) => print(ada.id, "amoxicillin dose:", mg, "mg")
+        fail(err) => print(ada.id, "refused:", describe(err))
+
+    // Same patient, but a drug that is contraindicated for her neighbour.
+    match prescribe(grace, "warfarin", 0.05)
+        ok(mg) => print(grace.id, "warfarin dose:", mg, "mg")
+        fail(err) => print(grace.id, "refused:", describe(err))
+
+    // An implausible record is rejected rather than dosed.
+    let implausible = Patient { id: "P-3", weight_kg: 900.0, age: 40 }
+    match prescribe(implausible, "amoxicillin", 0.5)
+        ok(mg) => print(implausible.id, "dose:", mg, "mg")
+        fail(err) => print(implausible.id, "refused:", describe(err))
+
+    print("audit trail has", audit.count(), "record(s), chain valid:",
+          audit.verify())

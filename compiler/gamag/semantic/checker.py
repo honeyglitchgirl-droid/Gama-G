@@ -664,15 +664,24 @@ class Checker:
         if st.value is not None:
             value_type = self.infer(st.value, scope)
         if declared is not None and value_type is not None:
-            if not value_type.assignable_to(declared):
+            fits = _literal_fits(st.value, declared) if st.value is not None \
+                else None
+            final = declared
+            if fits is False:
+                low, high = declared.range \
+                    if isinstance(declared, T.IntType) else (0, 0)
+                self.error(
+                    f"the literal {st.value.value} does not fit in "
+                    f"{declared.render()}, which holds {low} to {high}",
+                    st.pos, code="E-type-mismatch",
+                    help_text="use a wider integer type, or check the value "
+                              "before narrowing")
+            elif fits is not True and not value_type.assignable_to(declared):
                 self.error(
                     f"cannot initialise `{st.name}` of type "
                     f"{declared.render()} with a value of type "
                     f"{value_type.render()}", st.pos, code="E-type-mismatch",
                     help_text=_conversion_hint(value_type, declared))
-                final = declared
-            else:
-                final = declared
         elif declared is not None:
             final = declared
         else:
@@ -1768,9 +1777,39 @@ def _iterable_element(ty: T.Type, pos: SourcePos, checker: Checker) -> T.Type:
     return T.ERROR
 
 
+def _literal_fits(node: A.Expr, ty: T.Type) -> Optional[bool]:
+    """Whether a numeric literal may initialise `ty`, or None if it is not a
+    numeric literal at all.
+
+    Spec section 6 forbids implicit *unsafe* conversion.  A literal such as
+    `200` written against a `U8` target is not unsafe: its value is known at
+    compile time and fits, so refusing it would only push programmers towards
+    casts that hide genuine mistakes.
+    """
+    if not isinstance(node, A.Literal):
+        return None
+    if node.lit_kind == "int":
+        if isinstance(ty, T.IntType):
+            low, high = ty.range
+            return low <= node.value <= high
+        if isinstance(ty, (T.FloatType, T.DecimalType)):
+            return True
+    if node.lit_kind == "float":
+        return isinstance(ty, (T.FloatType, T.DecimalType))
+    return None
+
+
 def _literal_numeric(ty: T.Type, node: A.Expr, other: T.Type) -> T.Type:
-    """Give an integer literal the numeric type of the operand it meets."""
+    """Give a numeric literal the type of the operand it meets.
+
+    `x + 1` where `x: U8` is U8 arithmetic, not a mixed U8/I64 expression;
+    the literal simply denotes a value of the type it is combined with.
+    Whether the result still fits is then enforced where it is stored.
+    """
     if isinstance(node, A.Literal) and node.lit_kind == "int" \
+            and isinstance(other, (T.FloatType, T.DecimalType, T.IntType)):
+        return other
+    if isinstance(node, A.Literal) and node.lit_kind == "float" \
             and isinstance(other, (T.FloatType, T.DecimalType)):
         return other
     return ty

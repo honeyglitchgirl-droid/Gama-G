@@ -260,11 +260,16 @@ class FunctionBuilder:
         b_end = self.new_block(f"{e.op}.end")
         left = self.expr(e.left)
         self.emit(Op.COPY, [left], dst=dst, type_=T.BOOL, pos=e.pos)
-        # `and` skips the RHS when the left side is false; `or` when true.
+        # `and` short-circuits when the left side is *false* (the result is
+        # already false, so the right side need not run); `or` short-circuits
+        # when the left side is *true*.  Whichever side does run, its value
+        # becomes the result.
+        if e.op == "and":
+            on_true, on_false = b_right.id, b_end.id
+        else:
+            on_true, on_false = b_end.id, b_right.id
         self.emit(Op.JUMP_IF, [self.slot_op(dst)],
-                  meta={"target": (b_end.id if e.op == "and" else b_right.id),
-                        "target_false": (b_right.id if e.op == "and"
-                                         else b_end.id)},
+                  meta={"target": on_true, "target_false": on_false},
                   pos=e.pos)
         self.set_block(b_right)
         right = self.expr(e.right)
@@ -1199,7 +1204,8 @@ class Builder:
             if contract.kind == "requires":
                 cond = fb.expr(contract.expr)
                 fb.emit(Op.CONTRACT, [cond], dst=-1,
-                        meta={"kind": "requires", "text": "requires"},
+                        meta={"kind": "requires",
+                              "text": contract.text or "requires"},
                         pos=contract.pos)
         if decl.body:
             for stmt in decl.body.stmts:

@@ -734,9 +734,15 @@ class Parser:
         if text in ("requires", "ensures", "ensure") and not called \
                 and not assigned and not member:
             self.adv()
+            start_offset = self.peek().pos.offset
             expr = self.parse_expr()
             ck = "requires" if text == "requires" else "ensures"
-            return A.Contract(pos=tok.pos, kind=ck, expr=expr)
+            text_written = ""
+            if self.source:
+                text_written = self.source[
+                    start_offset:self.peek().pos.offset].strip()
+            return A.Contract(pos=tok.pos, kind=ck, expr=expr,
+                              text=text_written)
 
         if text == "checkpoint" and self.kw_ahead(1, "every", "at") and not member:
             return self.parse_checkpoint_stmt()

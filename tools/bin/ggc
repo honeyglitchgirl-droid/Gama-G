@@ -1,0 +1,16 @@
+#!/usr/bin/env python3
+"""ggc -- the Gama-G compiler driver (spec section 2).
+
+Runs straight from a source checkout: no installation step is needed, which
+keeps `git clone && ./tools/bin/ggc run examples/hello.gg` working.
+"""
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(
+    os.path.dirname(os.path.abspath(__file__)))), "compiler"))
+
+from gamag.cli.main import main  # noqa: E402
+
+if __name__ == "__main__":
+    sys.exit(main())

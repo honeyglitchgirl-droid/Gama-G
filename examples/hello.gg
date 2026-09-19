@@ -1,0 +1,55 @@
+// Gama-G basics: immutable and mutable bindings, functions, control flow,
+// and the two types that replace exceptions and null -- Result and Option.
+//
+//   ggc run examples/hello.gg
+
+fn add(a: I64, b: I64) -> I64
+    return a + b
+
+fn divide(a: I64, b: I64) -> Result<I64, Text>
+    pure
+    if b == 0
+        return fail("division by zero")
+    return ok(a / b)
+
+fn first_even(numbers: List<I64>) -> Option<I64>
+    pure
+    for n in numbers
+        if n % 2 == 0
+            return some(n)
+    return none
+
+fn classify(score: I64) -> Text
+    pure
+    match score
+        s if s >= 90 => return "distinction"
+        s if s >= 75 => return "pass"
+        s if s >= 40 => return "resit"
+        _ => return "fail"
+
+fn main() -> Unit
+    io
+    let total = add(20, 22)          // `let` is immutable
+    var running = 0                  // `var` may be reassigned
+    for i in 1..6
+        running = running + i
+    print("total       :", total)
+    print("sum of 1..5 :", running)
+
+    // A Result must be handled; discarding one is an error in strict profiles.
+    match divide(84, 2)
+        ok(value) => print("84 / 2    :", value)
+        fail(err) => print("failed    :", err)
+
+    match divide(1, 0)
+        ok(value) => print("unexpected:", value)
+        fail(err) => print("1 / 0     :", err)
+
+    // An Option is the only null, and it cannot be used without unwrapping.
+    let numbers = [7, 9, 14, 21]
+    match first_even(numbers)
+        some(n) => print("first even:", n)
+        none => print("no even value in", numbers)
+
+    for score in [95, 80, 45, 12]
+        print("score", score, "->", classify(score))

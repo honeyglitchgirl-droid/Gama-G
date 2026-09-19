@@ -1,0 +1,60 @@
+// Self-healing and checkpointing (spec sections 10 and 11).
+//
+// A service declares what it protects and a *bounded* recovery policy.  The
+// runtime escalates through the six levels in the order written, audits every
+// action, and never invents state: `restore checkpoint` returns to genuinely
+// recorded state or fails.
+//
+//   ggc run examples/self_healing_service.gg
+
+var sensor_reads = 0
+var inject_failure = true
+
+fn readSensors() -> I64
+    io
+    sensor_reads = sensor_reads + 1
+    // The first two reads fail, so recovery has something to do.
+    if inject_failure and sensor_reads < 3
+        panic("sensor bus timeout")
+    return 100 + sensor_reads
+
+fn analyze(raw: I64) -> I64
+    pure
+    return raw * 2
+
+fn publish(value: I64) -> I64
+    io
+    print("  published reading:", value)
+    return value
+
+service PatientMonitor
+    checkpoint every 5s
+
+    protect
+        let raw = readSensors()
+        let analysed = analyze(raw)
+        publish(analysed)
+
+    recover
+        retry 3
+        restore checkpoint
+        restart
+        alert operator
+
+fn main() -> Unit
+    io
+    audit
+    print("running PatientMonitor (first two sensor reads fail)")
+    let outcome = PatientMonitor()
+
+    print("recovered      :", outcome.recovered)
+    print("recovery level :", outcome.level, "-", outcome.level_name)
+    print("attempts       :", outcome.attempts)
+    print("actions taken  :", outcome.actions)
+    print("escalated      :", outcome.escalated)
+    print("sensor reads   :", sensor_reads)
+
+    // Every recovery action is observable (spec section 10).
+    print("audit records  :", audit.count())
+    let valid = audit.verify()
+    print("chain valid    :", valid)
