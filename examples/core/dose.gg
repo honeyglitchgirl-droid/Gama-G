@@ -1,0 +1,32 @@
+// Gama-G v0.2 core: a program is a set of operations, not a sequence of
+// statements.  The compiler derives the execution order from the relationships
+// the operations declare.
+//
+//   ggc run examples/core/dose.gg
+
+gama core 0.2
+
+intent SafeDosing
+    purpose    compute one paediatric dose and be able to show why
+    authority  PatientRead, AuditWrite
+    trail      dose decision
+
+source weight : F64 from 34.5
+source factor : F64 from 15.0
+
+operation RawDose
+    uses     weight, factor
+    yields   rawDose : F64
+    effect   pure
+    holds    rawDose >= 0.0
+    computes weight * factor
+
+operation Dose
+    uses     rawDose
+    yields   dose : F64
+    effect   medical
+    holds    dose <= 500.0
+    computes math.clamp(rawDose, 0.0, 500.0)
+    trail    dose decision
+
+outcome dose

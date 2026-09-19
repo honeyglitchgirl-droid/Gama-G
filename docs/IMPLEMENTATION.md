@@ -9,9 +9,19 @@ optimizer, and a reference interpreter, with the safety systems that define the
 language — types, effects, capabilities, secrets, audit, recovery — enforced
 end to end.
 
+This repository now contains **two language surfaces and one machine**. The
+v0.1 surface described below is the research / vertical-slice reference
+implementation. On top of it sits the **v0.2 original language core**, the
+redesign that
+`Gama-G_Detailed_Audit_and_Verification_Report.txt` §16–18 asked for; it is
+covered in §10 here and in [`DESIGN_v0_2.md`](DESIGN_v0_2.md). The core
+elaborates into the v0.1 pipeline, so both surfaces are enforced by the same
+tested machinery.
+
 Everything claimed below is exercised by the test suite (`python3 -m unittest
-discover -s tests`, 185 tests) and demonstrated by a runnable example in
-`examples/`. Where a claim is partial, the missing part is named.
+discover -s tests`, 236 tests, also green under `pytest`) and demonstrated by a
+runnable example in `examples/` or `examples/core/`. Where a claim is partial,
+the missing part is named.
 
 ---
 
@@ -25,8 +35,10 @@ discover -s tests`, 185 tests) and demonstrated by a runnable example in
 | Language surface | 23 hard keywords, 84 contextual keywords, 9 effects |
 | AST node types | 70 |
 | GIR operations | 41 |
-| Tests | 185 (all passing) |
-| Examples | 8, each runnable with `ggc run` |
+| Tests | 236 (all passing, under `unittest` and `pytest`) |
+| Examples | 8 v0.1 + 6 v0.2 core, each runnable with `ggc run` |
+| v0.2 core | 4 modules in `compiler/gamag/core/`; see §10 |
+| Dialects | selected per file by the `gama core <version>` pragma |
 | Native backend | **not implemented** — see §5 |
 
 The compiler runs from a checkout with no installation step:
@@ -305,11 +317,19 @@ specification.
 
 ## 9. Roadmap
 
-Roughly in the order the spec's own phases imply, and ordered by how much of the
-language's promise each unlocks:
+The audit report re-sequenced this roadmap: *"Only after that redesign should
+native backends and production v1.0 be built."* Item 1 is therefore done at the
+language level, and the remaining items are ordered behind extending the core
+rather than behind the v0.1 surface.
 
-1. **Pipeline stage fusion and scheduling** (§3, §38) — completes the
-   operation-graph story, which is the language's central idea.
+1. ~~**Pipeline stage fusion and scheduling** (§3, §38)~~ — **done as the v0.2
+   core**: the operation-graph story is now the language's actual program model
+   rather than a feature of one syntactic form. See §10. What remains is
+   *acting* on the derived levels (parallel execution of a level), not deriving
+   them.
+1a. **Extend the core** — modules and composition between intents, more than two
+   guarded alternatives with a real exhaustiveness proof, recovery policy in core
+   syntax, and a container choice for `each` other than `List`.
 2. **A real backend** (§22 stages 11–12) — WASM first, because it gives
    portability and a sandbox boundary at once; native afterwards.
 3. **Borrow checking** (§8) — the largest remaining gap between what the spec
@@ -320,3 +340,99 @@ language's promise each unlocks:
 6. **FHIR and database modules** (§16, §17) — the two declared-unimplemented
    modules with the clearest demand.
 7. **Benchmarking** (§24) — only meaningful once (2) exists.
+
+---
+
+## 10. The v0.2 original language core
+
+The audit's verdict on v0.1 was that the implementation is real but the language
+surface is not original enough: `fn`, `let`, `var`, `if`, `else`, `for`,
+`while`, `return`, `match`, `enum`, `record` and conventional `Result`/`Option`
+syntax belong to other languages. §16 says to redesign around Intent, Operation,
+Relationship, Constraint, Capability, Effect, State, Recovery, Audit and the
+Execution Graph, and explicitly *not* to rename.
+
+That redesign is implemented, tested and runnable.
+
+### 10.1 The inversion
+
+A v0.1 program is a sequence of statements. A v0.2 core program is a **set of
+operations**, each declaring the bindings it consumes (`uses`) and the one
+binding it produces (`yields`). The compiler matches producers to consumers,
+derives the graph, validates it, and only then produces an order. **Order is an
+output of compilation, never an input.**
+
+`ggc graph` prints what was derived, and `tests/test_core_language.py` compiles
+the same program with its operations listed in the opposite order and asserts
+the derived levels are identical.
+
+### 10.2 What is implemented
+
+| Piece | Path | Status |
+|---|---|---|
+| Core syntax, execution graph, alternative proofs | `core/ast.py` | complete |
+| Declaration grammar, clause table, verbatim text capture | `core/parser.py` | complete |
+| Relationship validation, cycle detection, level derivation, guard proofs | `core/graph.py` | complete |
+| Graph → v0.1 AST elaboration | `core/elaborate.py` | complete |
+| Dialect detection, two-phase front end | `driver.py::is_core_dialect` | complete |
+| `ggc graph [--edges] [--json]` | `cli/main.py` | complete |
+| Six examples, one per construct family | `examples/core/` | complete |
+| 49 tests | `tests/test_core_language.py` | complete |
+
+Constructs: `intent` (with `purpose`, `authority`, `trail`), `source` (with
+`secret` and `from`), `state` (with `starts`, `authority`), `operation`,
+`refine` (bounded repetition), `each` (fan-out), `resolve` (exhaustive
+dispatch), `transition` (state change under authority), `outcome`. Clauses:
+`uses`, `yields`, `effect`, `needs`, `holds`, `when`, `computes`, `trail`,
+`starts`, `repeats`, `until`, `within`, `over … as …`, `choose`, `alters`.
+
+### 10.3 What the core refuses
+
+`E-graph-cycle` (naming the cycle), `E-undeclared-relationship`,
+`E-unresolved-relationship`, `W-unused-relationship`, `E-ambiguous-selection`,
+`E-duplicate-binding`, `E-unbounded-refinement`, `E-refine-incomplete`,
+`E-each-incomplete`, `E-resolve-incomplete`, `E-compute-after-commit`,
+`E-transition-target`, `E-state-uninitialised`, `E-no-outcome`,
+`E-no-yields`, `E-no-computes`, `E-unknown-effect`. At run time the core adds
+two classified faults: `NoActiveAlternative` and `RefinementDiverged`.
+
+### 10.4 What is proven versus only checked
+
+Proven at compile time: acyclicity; that declared relationships match real ones
+in both directions; one producer per binding unless every alternative is
+guarded; that every repetition has a bound of at least one round; mutual
+exclusivity and exhaustiveness for a two-guard selection whose guards are
+syntactically complementary; that compute never depends on a committed change;
+plus everything v0.1 already proves about the elaborated code.
+
+Checked only at run time: data-dependent constraints, selections whose guards
+were not provably complementary, and refinements that reach their bound.
+
+**Not checked at all:** exhaustiveness for more than two alternatives (the
+compiler records `proven_exhaustive = False` and relies on the runtime fault —
+proving it over arbitrary predicate sets is a decision problem, and claiming
+otherwise would be exactly the kind of claim §6 of this document forbids); and
+re-deriving an operation's declared `effect` from its own clauses rather than
+trusting the declaration.
+
+### 10.5 What the core does not do
+
+No native backend (it runs on the reference VM). No performance claim of any
+kind — nothing is benchmarked. No parallel execution: same-level operations are
+*known* to be independent, which is the precondition, but elaboration still
+emits them in sequence. `each` yields a `List`; there is no container choice. No
+modules, imports, generics or user-defined types in the core — a core program is
+one intent, and composition between intents is not designed. Recovery is bounded
+repetition plus classified faults; the specification's richer
+retry/compensate/escalate policy is implemented in the reference runtime but not
+yet expressible in core syntax. A `source` with no `from` makes the program a
+library: it compiles and checks, but no `main` is generated.
+
+### 10.6 Why v0.1 was kept
+
+Three reasons. It is the machine that runs v0.2. It is the tested evidence that
+the assets the audit lists in its §4 — effect system, capabilities, secret
+propagation, hash-chained audit, determinism, bounded recovery, tensors and
+autodiff, GIR, reference VM — actually work. And deleting a working
+implementation to make a report look tidier would be a worse engineering
+decision than the one the report criticises.

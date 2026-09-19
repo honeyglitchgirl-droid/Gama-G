@@ -77,6 +77,13 @@ def build_parser() -> argparse.ArgumentParser:
     add_common(p)
     p.add_argument("--fn", metavar="NAME", help="print only this function")
 
+    p = sub.add_parser(
+        "graph",
+        help="print the execution graph the core derived from relationships")
+    add_common(p)
+    p.add_argument("--edges", action="store_true",
+                   help="list every derived dependency edge")
+
     p = sub.add_parser("run", help="compile and execute")
     add_common(p)
     p.add_argument("--entry", metavar="NAME", default="main",
@@ -213,6 +220,91 @@ def cmd_gir(args: argparse.Namespace) -> int:
         if compilation.program is None:
             continue
         print(compilation.program.render(only=args.fn))
+    return EXIT_OK
+
+
+def cmd_graph(args: argparse.Namespace) -> int:
+    """Print the derived execution graph of a core program.
+
+    In a language where the programmer never writes an order, being able to see
+    the order the compiler derived is not a nicety -- it is how the programmer
+    checks that the relationships they declared mean what they intended.
+    """
+    compilations, status = _compile(args.files, args)
+    if status != EXIT_OK:
+        for compilation in compilations:
+            _report(compilation, not args.no_color, args.json)
+        return status
+    for compilation in compilations:
+        graph = compilation.core_graph
+        if graph is None:
+            print(f"{compilation.path}: not a core program.  Only a source "
+                  f"that opens with `gama core <version>` has a derived graph; "
+                  f"the v0.1 surface writes its own order.", file=sys.stderr)
+            return EXIT_USAGE
+        if getattr(args, "json", False):
+            payload = {
+                "path": compilation.path,
+                "dialect": compilation.dialect,
+                "intent": (compilation.core.intent.name
+                           if compilation.core and compilation.core.intent
+                           else None),
+                "outcome": graph.outcome,
+                "sources": graph.sources,
+                "states": graph.states,
+                "levels": graph.levels,
+                "edges": [{"from": producer, "to": consumer}
+                          for name, node in sorted(graph.nodes.items())
+                          for producer in node.upstream
+                          for consumer in [name]],
+                "selections": {
+                    binding: {
+                        "alternatives": [m.name for m in alt.members],
+                        "proven_exhaustive": alt.proven_exhaustive,
+                        "proven_exclusive": alt.proven_exclusive,
+                    } for binding, alt in sorted(graph.alternatives.items())},
+            }
+            print(json.dumps(payload, indent=2))
+            continue
+        core = compilation.core
+        intent = core.intent if core else None
+        if intent is not None:
+            print(f"intent {intent.name}")
+            if intent.purpose:
+                print(f"  purpose    {intent.purpose}")
+            if intent.authority:
+                print(f"  authority  {', '.join(intent.authority)}")
+        if graph.sources:
+            print(f"  sources    {', '.join(graph.sources)}")
+        if graph.states:
+            print(f"  states     {', '.join(graph.states)}")
+        print(f"  outcome    {graph.outcome}")
+        print()
+        print("derived execution order (never written in the source):")
+        for index, level in enumerate(graph.levels):
+            phase = ""
+            if any(graph.nodes[n].decl.kind == "transition" for n in level
+                   if n in graph.nodes):
+                phase = "   [commit]"
+            print(f"  level {index}: {', '.join(level)}{phase}")
+        if args.edges:
+            print()
+            print("derived dependency edges:")
+            for name in graph.order():
+                node = graph.nodes[name]
+                upstream = ", ".join(node.upstream) or "(inputs only)"
+                print(f"  {node.produces} <- {upstream}   [{name}]")
+        for binding, alt in sorted(graph.alternatives.items()):
+            proof = []
+            if alt.proven_exclusive:
+                proof.append("mutually exclusive")
+            if alt.proven_exhaustive:
+                proof.append("exhaustive")
+            verdict = ("proven " + " and ".join(proof)) if proof else \
+                "not provable statically; a NoActiveAlternative check runs"
+            names = ", ".join(m.name for m in alt.members)
+            print()
+            print(f"selection of `{binding}` from {names}: {verdict}")
     return EXIT_OK
 
 
@@ -437,6 +529,7 @@ COMMANDS = {
     "check": cmd_check,
     "build": cmd_build,
     "gir": cmd_gir,
+    "graph": cmd_graph,
     "run": cmd_run,
     "test": cmd_test,
     "explain": cmd_explain,

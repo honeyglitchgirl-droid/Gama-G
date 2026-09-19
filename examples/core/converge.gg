@@ -1,0 +1,29 @@
+// Gama-G v0.2 core: bounded refinement.
+//
+// There is no unbounded loop, and no way to write one.  `refine` repeats until
+// a constraint holds, and `within` is mandatory: a repetition with no limit
+// cannot be expressed, so a program that cannot be written as a hang cannot
+// hang.  Exceeding the bound is a classified fault (RefinementDiverged) that
+// names the constraint and the bound, not a silent spin.
+//
+//   ggc run examples/core/converge.gg
+
+gama core 0.2
+
+intent SquareRoot
+    purpose    converge on a square root by repeated refinement
+    authority  ComputeOnly
+
+source n : F64 from 2.0
+
+refine Guess
+    uses     n
+    yields   g : F64
+    effect   pure
+    holds    g > 0.0
+    starts   n / 2.0
+    repeats  (g + n / g) / 2.0
+    until    abs(g * g - n) < 0.000001
+    within   60 rounds
+
+outcome g

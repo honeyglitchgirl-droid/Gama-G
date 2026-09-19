@@ -17,6 +17,10 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from . import ast_nodes as A
+from .core import ast as CoreAST
+from .core import graph as core_graph
+from .core.elaborate import elaborate as core_elaborate
+from .core.parser import CoreParser
 from .diagnostics import (DiagnosticBag, GamaError, Phase, Severity, SourcePos)
 from .gir.builder import build_program
 from .gir.ir import GProgram
@@ -65,6 +69,14 @@ class Compilation:
     optimization: Optional[OptimizationReport] = None
     timings: PhaseTimings = field(default_factory=PhaseTimings)
     stopped_at: Optional[str] = None
+    # The v0.2 core front end (audit report sections 16-18).  `dialect` is
+    # "core" when the source opened with `gama core <version>`; `core` and
+    # `core_graph` then hold the program as written and the execution graph the
+    # compiler derived from it.  `module` is always the elaborated form that the
+    # rest of the pipeline consumes.
+    dialect: str = "v0.1"
+    core: Optional[CoreAST.CoreModule] = None
+    core_graph: Optional[CoreAST.ExecutionGraph] = None
 
     @property
     def ok(self) -> bool:
@@ -98,6 +110,30 @@ class Compilation:
         return sorted(effects)
 
 
+def is_core_dialect(tokens: Sequence[Any]) -> bool:
+    """True when the token stream opens with the `gama core <version>` pragma.
+
+    Detection happens on tokens rather than text so that comments and blank
+    lines before the pragma do not matter, and so a program cannot be mistaken
+    for core just because the word appears in a string.
+    """
+    from .tokens import TokenKind
+    seen = 0
+    for tok in tokens:
+        if tok.kind in (TokenKind.NEWLINE, TokenKind.SEPARATOR,
+                        TokenKind.INDENT, TokenKind.DEDENT):
+            continue
+        if seen == 0:
+            if not (tok.kind is TokenKind.IDENT and tok.text == "gama"):
+                return False
+        elif seen == 1:
+            return tok.kind is TokenKind.IDENT and tok.text == "core"
+        seen += 1
+        if seen > 1:
+            break
+    return False
+
+
 def compile_source(source: str, path: str = "<source>", *,
                    profile: str = "strict", opt_level: int = 1,
                    grants: Sequence[str] = (),
@@ -117,12 +153,43 @@ def compile_source(source: str, path: str = "<source>", *,
     c.timings.lex = time.perf_counter() - t0
 
     t0 = time.perf_counter()
-    try:
-        c.module = Parser(c.tokens, path, source).parse_module()
-    except GamaError as exc:
-        c.bag.add(exc.diagnostic)
-        c.stopped_at = "parse"
-        return c
+    if is_core_dialect(c.tokens):
+        c.dialect = "core"
+        try:
+            c.core = CoreParser(c.tokens, path, source).parse_core()
+        except GamaError as exc:
+            c.bag.add(exc.diagnostic)
+            c.stopped_at = "parse"
+            return c
+        # The graph *is* the meaning of a core program: relationships are
+        # inferred from `uses`/`yields`, then validated before anything is
+        # lowered.  Its diagnostics use their own bag so that a program with a
+        # broken graph never reaches the elaborator.
+        graph_bag = DiagnosticBag()
+        c.core_graph = core_graph.build(c.core, graph_bag)
+        for diag in graph_bag.diagnostics:
+            c.bag.add(diag)
+        if not graph_bag.ok:
+            c.stopped_at = "graph"
+            return c
+        try:
+            c.module = core_elaborate(c.core, c.core_graph)
+        except GamaError as exc:
+            c.bag.add(exc.diagnostic)
+            c.stopped_at = "elaborate"
+            return c
+        except Exception as exc:                    # noqa: BLE001
+            c.bag.error(f"internal compiler error while elaborating the core "
+                        f"program: {exc}", phase=Phase.PARSE, code="E-ice")
+            c.stopped_at = "elaborate"
+            return c
+    else:
+        try:
+            c.module = Parser(c.tokens, path, source).parse_module()
+        except GamaError as exc:
+            c.bag.add(exc.diagnostic)
+            c.stopped_at = "parse"
+            return c
     c.timings.parse = time.perf_counter() - t0
     if grants:
         c.module.grants = tuple(dict.fromkeys(

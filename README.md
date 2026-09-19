@@ -39,6 +39,88 @@ Four guarantees are visible in those lines, and none of them are conventions:
 
 ---
 
+## v0.2: the original language core
+
+The example above is the v0.1 surface. An
+[audit of this repository](Gama-G_Detailed_Audit_and_Verification_Report.txt)
+found the implementation real and working but the *language* insufficiently
+original: `fn`, `let`, `var`, `if`, `while`, `match` are other languages'
+constructs, and its recommendation was to redesign the core rather than rename
+them.
+
+That redesign is implemented. A **Gama-G v0.2 core** program is not a sequence
+of statements — it is a set of operations that declare what they consume and
+what they produce, and the compiler **derives** the execution order:
+
+```gamag
+gama core 0.2
+
+intent SafeDosing
+    purpose    compute one paediatric dose and be able to show why
+    authority  PatientRead, AuditWrite
+    trail      dose decision
+
+source weight : F64 from 34.5
+source factor : F64 from 15.0
+
+operation RawDose
+    uses     weight, factor
+    yields   rawDose : F64
+    effect   pure
+    holds    rawDose >= 0.0
+    computes weight * factor
+
+operation Dose
+    uses     rawDose
+    yields   dose : F64
+    effect   medical
+    holds    dose <= 500.0
+    computes math.clamp(rawDose, 0.0, 500.0)
+    trail    dose decision
+
+outcome dose
+```
+
+Nothing there says "first RawDose, then Dose". Ask the compiler what it derived:
+
+```sh
+$ ggc graph examples/core/dose.gg
+intent SafeDosing
+  purpose    compute one paediatric dose and be able to show why
+  authority  PatientRead, AuditWrite
+  outcome    dose
+
+derived execution order (never written in the source):
+  level 0: RawDose
+  level 1: Dose
+```
+
+What the core removes, and what replaces it:
+
+| Gone | Replaced by | The consequence |
+|---|---|---|
+| assignment | single-assignment bindings | a binding has one definition and one lifetime |
+| `if`/`else` | sibling operations yielding one binding under complementary `when` guards | the compiler **proves** the alternatives exclusive and exhaustive, and says so in `ggc graph` |
+| `while`, unbounded `for` | `refine … until … within N rounds` | the bound is mandatory, so a program that cannot be written as a hang cannot hang |
+| `return` | the `yields` binding, and the intent's `outcome` | an operation's value is a relationship, not a jump |
+| written control flow | `uses`/`yields` matched into a graph | a dependency that is not real cannot be written down, and one that is real cannot be forgotten |
+
+The relationships are checked in both directions: referring to a binding without
+declaring it in `uses` is `E-undeclared-relationship`, and declaring one you
+never use is a warning. Without that check the derived order would mean nothing.
+
+[`docs/DESIGN_v0_2.md`](docs/DESIGN_v0_2.md) is the design document. It maps the
+audit's proposed execution model onto the actual modules, answers its
+ten-question originality test feature by feature — including the three places
+where the honest answer is "partly yes", with the technical reason — and
+separates what is proven at compile time from what is only checked at runtime.
+
+v0.1 is not deleted. It is the reference implementation the core elaborates
+into, so its tested type, effect, capability, secret-propagation and audit
+machinery is what actually enforces v0.2's promises.
+
+---
+
 ## Status
 
 This repository is a **working vertical slice** of
@@ -46,14 +128,22 @@ This repository is a **working vertical slice** of
 not a finished implementation of it. The specification describes a multi-year,
 multi-team production language across Phases 0–7.
 
-What is here: a complete compiler front end (lexer, parser, name resolution,
+What is here: two language surfaces and one machine. The **v0.2 core**
+(`compiler/gamag/core/`) is the original language described above. The **v0.1
+surface** is the research / vertical-slice reference implementation: a complete
+compiler front end (lexer, parser, name resolution,
 type/effect/capability/ownership checking), the Gama IR, an optimizer, and a
-reference interpreter — with the safety systems enforced end to end and
-185 passing tests.
+reference interpreter, with the safety systems enforced end to end. The core
+elaborates into it, so both run on the same tested machinery — 236 passing
+tests.
 
 What is not: **there is no native backend, no package manager and no borrow
 checker.** Programs run on an interpreter. Performance is interpreter-grade and
 **no benchmark against native code has been run or is claimed.**
+
+The current milestone is **v0.2, the original language core**, because the
+audit sequences native backends and production v1.0 *after* that redesign. That
+is the order being followed.
 
 [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md) goes through the
 specification section by section and says what is done, what is partial and what
@@ -71,13 +161,20 @@ present and there is a pure-Python fallback when it is not.
 git clone https://github.com/honeyglitchgirl-droid/Gama-G
 cd Gama-G
 
-./tools/bin/ggc run examples/hello.gg          # run a program
+./tools/bin/ggc run examples/core/dose.gg      # run a v0.2 core program
+./tools/bin/ggc graph examples/core/dose.gg --edges  # the derived order
+./tools/bin/ggc run examples/hello.gg          # run a v0.1 program
 ./tools/bin/ggc check examples/hello.gg        # diagnostics only
 ./tools/bin/ggc test examples/property_tests.gg # run its tests
 ./tools/bin/ggc gir --fn main examples/hello.gg # inspect the IR
 
 python3 -m unittest discover -s tests           # the compiler's own suite
+.venv/bin/python -m pytest tests/ -q            # the same suite under pytest
 ```
+
+A file is core when its first tokens are `gama core <version>`; otherwise it is
+v0.1. Detection is on tokens, so a comment or a string cannot change a
+program's dialect.
 
 `ggc` exit codes: `0` success, `1` compile error, `2` runtime fault, `3` usage
 error, `4` test failure.
@@ -86,8 +183,23 @@ error, `4` test failure.
 
 ## The examples
 
-Eight programs, each runnable and each covered by tests that assert on their
+Fourteen programs, each runnable and each covered by tests that assert on their
 output rather than merely on their exit code.
+
+### The v0.2 core — `examples/core/`
+
+Six programs, one per construct family.
+
+| Example | What it demonstrates |
+|---|---|
+| [`dose.gg`](examples/core/dose.gg) | Two operations, a derived order, constraints, an audited trail |
+| [`selection.gg`](examples/core/selection.gg) | Guarded sibling operations replacing `if`; the guards are proven exclusive and exhaustive |
+| [`converge.gg`](examples/core/converge.gg) | `refine … until … within 60 rounds`: bounded repetition, converging on √2 |
+| [`traverse.gg`](examples/core/traverse.gg) | `each … over X as x`: fan-out as a graph node |
+| [`classify.gg`](examples/core/classify.gg) | `resolve … choose`: exhaustive dispatch |
+| [`ledger.gg`](examples/core/ledger.gg) | `state` + `transition`: the only mutable resource, under authority, in the commit phase |
+
+### The v0.1 reference surface — `examples/`
 
 | Example | What it demonstrates | Spec |
 |---|---|---|
@@ -135,15 +247,60 @@ f(1)                           // E-arg-type: no implicit Int -> Float
                                //   help: write `float(x)` explicitly
 ```
 
+The v0.2 core refuses a different set, because a different set is expressible:
+
+```gamag
+refine G
+    starts  a
+    repeats g + 1
+    until   g > 100            // E-unbounded-refinement: `within` is mandatory
+                               //   help: write `within 50 rounds`
+
+operation C
+    yields   c : I64
+    computes b + 1             // E-undeclared-relationship: refers to `b`
+                               //   without declaring it in `uses`
+
+operation X
+    uses     a, yv             // E-graph-cycle: X -> Y -> X, named in full
+    yields   xv : I64
+    computes a + yv
+
+operation Q
+    yields   s : I64           // E-ambiguous-selection: two producers of `s`,
+    computes 2                 //   and this one has no `when` guard
+
+operation B
+    uses     st                // E-compute-after-commit: `st` is altered by a
+    yields   b : I64           //   transition; compute may depend only on data
+    computes st
+
+transition T
+    alters   b                 // E-transition-target: only `state` changes;
+    computes 1                 //   bindings are single-assignment
+
+operation Z
+    effect   telepathy         // E-unknown-effect: the algebra is the spec's
+
+let x = 1                      // not a declaration: "there are no statements"
+```
+
 At run time, faults are classified with source positions rather than surfacing
 as host-language tracebacks: `DivideByZero`, `ContractViolation`,
-`CapabilityViolation`, `RecoveryExhausted`, `AssertionFailed`.
+`CapabilityViolation`, `RecoveryExhausted`, `AssertionFailed`, and from the core
+`NoActiveAlternative` and `RefinementDiverged`.
 
-Contracts quote themselves when they fail:
+Contracts quote themselves when they fail, in both dialects — the core keeps
+the verbatim text of every `holds`, `when` and `until` clause precisely so that
+it can:
 
 ```
 runtime fault [ContractViolation] at dosing.gg:12:5:
   requires contract violated: weight > 0
+
+Panic: holds `dose <= 500.0`
+Panic: RefinementDiverged: `Guess` did not satisfy `g > 1000000` within 4 rounds
+Panic: NoActiveAlternative: nothing yields `s` — 2 guarded alternatives, none active
 ```
 
 ---
@@ -222,7 +379,9 @@ the forbidden phrases so they cannot creep in:
 
 ```
 Gama-G_v1.0_Production_Specification.txt   the blueprint
+Gama-G_Detailed_Audit_and_Verification_Report.txt   the audit this milestone answers
 compiler/gamag/
+  core/{ast,parser,graph,elaborate}.py     the v0.2 language core
   lexer.py parser.py ast_nodes.py          front end
   semantic/{types,checker}.py              type lattice and checking
   gir/{ir,builder,optimizer}.py            the IR, lowering, optimization
@@ -232,8 +391,11 @@ compiler/gamag/
   methods.py                               one method table, shared by checker and VM
   cli/main.py driver.py                    ggc
 tools/bin/{ggc,ggtest}                     entry points
-examples/                                  eight runnable programs
-tests/                                     185 tests
+examples/core/                             six v0.2 core programs
+examples/                                  eight v0.1 programs
+tests/                                     236 tests
+docs/DESIGN_v0_2.md                        the v0.2 design, and the audit's
+                                           ten originality questions answered
 docs/IMPLEMENTATION.md                     honest status, section by section
 ```
 
@@ -245,11 +407,14 @@ tests/support.py             harness; reads examples and word lists out of the
 tests/test_spec_vocabulary.py  the enumerations the spec lists (types, effects,
                              recovery levels, capabilities, modules, commands)
 tests/test_spec_examples.py  the spec's own code examples, lifted by line number
+tests/test_core_language.py  the v0.2 core: derived order, relationship
+                             checking, selection proofs, bounded repetition,
+                             constraints, state and authority
 tests/test_language.py       positive semantics
 tests/test_enforcement.py    what must be refused
 tests/test_runtime.py        autodiff, the audit chain, recovery, secrets,
                              determinism
-tests/test_examples.py       all eight examples, end to end
+tests/test_examples.py       all fourteen examples, end to end
 ```
 
 The vocabulary and example suites read the blueprint out of the repository at

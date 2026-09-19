@@ -183,7 +183,31 @@ def example(name: str) -> str:
 
 
 def example_names() -> List[str]:
+    """The v0.1 reference-surface examples, at the top of `examples/`."""
     return sorted(f for f in os.listdir(EXAMPLES_DIR) if f.endswith(".gg"))
+
+
+def core_example_names() -> List[str]:
+    """The v0.2 core examples, under `examples/core/`.
+
+    Returned with their subdirectory attached so that :func:`example` resolves
+    them the same way it resolves the top-level ones.
+    """
+    directory = os.path.join(EXAMPLES_DIR, "core")
+    if not os.path.isdir(directory):
+        return []
+    return sorted("core/" + f for f in os.listdir(directory)
+                  if f.endswith(".gg"))
+
+
+def all_example_names() -> List[str]:
+    """Every shipped example, in both dialects.
+
+    The generic example checks -- comment syntax, "does it say how to run it",
+    "does it compile under strict" -- are properties of *being an example*, not
+    of either language surface, so they are run across both.
+    """
+    return example_names() + core_example_names()
 
 
 def spec_lines() -> List[str]:

@@ -1,0 +1,26 @@
+// Gama-G v0.2 core: exhaustive dispatch.
+//
+// `resolve` maps a value through alternatives.  It elaborates into the
+// reference slice's `match`, so the exhaustiveness rule that already applies
+// there applies here: a dispatch with a hole in it is rejected at compile time
+// rather than failing at runtime.
+//
+//   ggc run examples/core/classify.gg
+
+gama core 0.2
+
+intent Classify
+    purpose    map a signal to an instruction
+
+source code : Text from "red"
+
+resolve Label
+    over     code
+    yields   label : Text
+    effect   pure
+    choose
+        "red" => "stop"
+        "green" => "go"
+        _ => "wait"
+
+outcome label

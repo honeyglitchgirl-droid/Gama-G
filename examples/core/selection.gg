@@ -1,0 +1,39 @@
+// Gama-G v0.2 core: selection.
+//
+// There is no `if`.  A choice is several operations that yield the *same*
+// binding, each saying when it applies.  Because the alternatives are
+// declarations rather than nested blocks, the compiler can compare them: these
+// two guards are syntactically complementary, so it records the selection as
+// proven mutually exclusive and exhaustive.  Where it cannot prove that, the
+// generated code keeps a runtime check that faults with NoActiveAlternative
+// instead of quietly producing nothing.
+//
+//   ggc run examples/core/selection.gg
+
+gama core 0.2
+
+intent Triage
+    purpose    separate urgent presentations from routine ones
+    authority  PatientRead
+    trail      triage band
+
+source score : I64 from 82
+
+operation Urgent
+    uses     score
+    yields   band : Text
+    effect   medical
+    holds    band != ""
+    when     score >= 75
+    computes "urgent"
+    trail    triage band
+
+operation Routine
+    uses     score
+    yields   band : Text
+    effect   medical
+    when     not (score >= 75)
+    computes "routine"
+    trail    triage band
+
+outcome band

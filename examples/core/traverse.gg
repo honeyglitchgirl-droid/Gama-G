@@ -1,0 +1,23 @@
+// Gama-G v0.2 core: fan-out.
+//
+// `each` produces a collection from a collection.  The `over` clause *is* the
+// declaration of the relationship to the collection, so it needs no `uses` as
+// well -- and the item name is local to the operation, so referring to the
+// collection inside `computes` without declaring it would still be an error.
+//
+//   ggc run examples/core/traverse.gg
+
+gama core 0.2
+
+intent Doubler
+    purpose    show a fan-out over a collection
+
+source readings : List<I64> from [3, 5, 8]
+
+each Doubled
+    over     readings as reading
+    yields   doubled : I64
+    effect   pure
+    computes reading * 2
+
+outcome doubled

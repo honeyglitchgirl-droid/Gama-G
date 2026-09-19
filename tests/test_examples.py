@@ -26,9 +26,18 @@ class ExampleInventory(unittest.TestCase):
                          "the example set changed; update this test and the "
                          "README's tour of the examples")
 
+    def test_the_six_core_examples_are_present(self):
+        expected = {
+            "core/classify.gg", "core/converge.gg", "core/dose.gg",
+            "core/ledger.gg", "core/selection.gg", "core/traverse.gg",
+        }
+        self.assertEqual(set(S.core_example_names()), expected,
+                         "the core example set changed; update this test, the "
+                         "README's tour and docs/DESIGN_v0_2.md")
+
     def test_every_example_uses_only_supported_comment_syntax(self):
         """Comments are `//` and `/* */`; a `#` comment is a lex error."""
-        for name in S.example_names():
+        for name in S.all_example_names():
             with self.subTest(example=name):
                 path = S.example(name)
                 with open(path, "r", encoding="utf-8") as handle:
@@ -40,7 +49,7 @@ class ExampleInventory(unittest.TestCase):
                             f"does not have")
 
     def test_every_example_is_documented_with_how_to_run_it(self):
-        for name in S.example_names():
+        for name in S.all_example_names():
             with self.subTest(example=name):
                 with open(S.example(name), "r", encoding="utf-8") as handle:
                     head = "".join(
@@ -50,7 +59,7 @@ class ExampleInventory(unittest.TestCase):
 
     def test_every_example_compiles_under_the_strict_profile(self):
         """The examples are the reference for what strict accepts."""
-        for name in S.example_names():
+        for name in S.all_example_names():
             with self.subTest(example=name):
                 path = S.example(name)
                 with open(path, "r", encoding="utf-8") as handle:

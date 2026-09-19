@@ -1,0 +1,45 @@
+// Gama-G v0.2 core: state and authority.
+//
+//   ggc run examples/core/ledger.gg
+//   ggc graph examples/core/ledger.gg
+//
+// Bindings produced by operations are single-assignment; nothing reassigns
+// them, because there is no assignment.  The only things that change are
+// `state` resources, and they change only through a declared `transition` that
+// says what authority it needs and what must hold afterwards.
+//
+// The graph has two phases.  Compute operations produce bindings and are
+// ordered purely by data.  Transitions commit changes afterwards.  A compute
+// operation may not depend on a transition -- that would make the derived order
+// depend on an effect rather than on data, which is the one thing this language
+// refuses to allow.
+
+gama core 0.2
+
+intent Ledger
+    purpose    record one deposit against a balance
+    authority  AuditWrite
+    trail      ledger movement
+
+source amount : I64 from 100
+
+state balance : I64
+    starts     0
+    authority  AuditWrite
+
+operation Seen
+    uses     amount
+    yields   seen : I64
+    effect   pure
+    computes amount
+
+transition Deposit
+    alters   balance
+    uses     seen
+    effect   storage
+    needs    AuditWrite
+    holds    balance >= 0
+    computes balance + seen
+    trail    deposit
+
+outcome balance
