@@ -9,6 +9,7 @@ without a fix-it just moves the work onto the programmer.
 
 from __future__ import annotations
 
+import os
 import unittest
 
 import support as S
@@ -318,31 +319,84 @@ class RuntimeFaults(unittest.TestCase):
 class ForbiddenClaims(unittest.TestCase):
     """Spec section 43: what the language must never promise."""
 
+    # Documents whose subject *is* the prohibition, so they must quote the
+    # forbidden phrases in order to state them.  Each entry needs a reason:
+    # adding one is a deliberate act, not a way to make a failure go away.
+    ABOUT_THE_PROHIBITION = {
+        "Gama-G_v1.0_Production_Specification.txt":
+            "section 43 defines the prohibition itself",
+        "Gama-G_Detailed_Audit_and_Verification_Report.txt":
+            "sections 9 and 10 audit the 99%/98% claims and reject them",
+        "docs/IMPLEMENTATION.md":
+            "section 6 records the claims this implementation does not make",
+        "README.md":
+            "the 'What this does not claim' section states them to disclaim them",
+        "tests/test_enforcement.py":
+            "this test names the phrases in order to ban them",
+    }
+
+    FORBIDDEN = ("99% speed", "98% accuracy", "guarantees 99",
+                 "guarantees 98", "automatically compliant",
+                 "automatically hipaa", "automatically fda",
+                 "processor free", "runs without hardware")
+
     def test_no_universal_accuracy_or_speed_guarantee(self):
-        """The blueprint forbids claiming 99% speed or 98% accuracy."""
+        """Spec section 43: what the language must never claim."""
         import os
         offenders = []
+        exempt_missing = set(self.ABOUT_THE_PROHIBITION)
         for root, dirs, files in os.walk(S.REPO_ROOT):
             dirs[:] = [d for d in dirs
-                       if d not in (".git", "__pycache__", ".venv", "node_modules")]
+                       if d not in (".git", "__pycache__", ".venv",
+                                    "node_modules", ".cache")]
             for name in files:
-                if not name.endswith((".md", ".py", ".gg", ".txt")):
+                if not name.endswith((".md", ".py", ".gg", ".txt", ".rst")):
                     continue
                 path = os.path.join(root, name)
-                if os.path.abspath(path) == os.path.abspath(S.SPEC_PATH):
-                    continue          # the blueprint states the prohibition
-                if os.path.abspath(path) == os.path.abspath(__file__):
-                    continue          # this test quotes them in order to ban them
+                relative = os.path.relpath(path, S.REPO_ROOT)
+                if relative in self.ABOUT_THE_PROHIBITION:
+                    exempt_missing.discard(relative)
+                    continue
                 with open(path, "r", encoding="utf-8", errors="ignore") as handle:
                     text = handle.read().lower()
-                for phrase in ("99% speed", "98% accuracy",
-                               "guarantees 99", "guarantees 98",
-                               "automatically compliant",
-                               "automatically hipaa", "automatically fda"):
+                for phrase in self.FORBIDDEN:
                     if phrase in text:
-                        offenders.append(f"{path}: {phrase!r}")
+                        offenders.append(f"{relative}: {phrase!r}")
         self.assertEqual(offenders, [],
                          "forbidden universal claims found: " + "; ".join(offenders))
+        self.assertEqual(exempt_missing, set(),
+                         "the exemption list names documents that are not in "
+                         "the repository; prune it: " + ", ".join(exempt_missing))
+
+    # What an exempted document must still contain, lower-cased.  The
+    # exemption is earned by disclaiming, so if the disclaimer is deleted the
+    # exemption must be withdrawn too.
+    REQUIRED_DISCLAIMERS = {
+        "docs/IMPLEMENTATION.md": (
+            "does not make",          # "Claims this implementation does not make"
+            "no native backend",
+            "no benchmark against native code",
+            "no automatic medical, legal or regulatory compliance",
+        ),
+        "README.md": (
+            "does not claim",         # "What this does not claim"
+            "no native backend",
+            "no benchmark against native code",
+            "no automatic medical, legal or regulatory compliance",
+        ),
+    }
+
+    def test_the_disclaimers_are_actually_present(self):
+        """An exemption is only honest if the document really does disclaim."""
+        for relative, phrases in self.REQUIRED_DISCLAIMERS.items():
+            path = os.path.join(S.REPO_ROOT, relative)
+            with open(path, "r", encoding="utf-8") as handle:
+                text = handle.read().lower()
+            for needed in phrases:
+                self.assertIn(needed, text,
+                              f"{relative} is exempted from the forbidden-claims "
+                              f"scan but no longer says {needed!r}; either "
+                              f"restore the disclaimer or drop the exemption")
 
 
 if __name__ == "__main__":
