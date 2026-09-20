@@ -23,6 +23,7 @@ import tempfile
 import unittest
 
 import support as S
+from gamag import exitcodes
 from gamag.backend import accelerator, cgen, differential, native, wasm
 
 HAS_CC = native.find_c_compiler() is not None
@@ -202,7 +203,10 @@ class NativeBuild(TempBuild):
         source_text = ('fn main() -> Unit\n    io\n'
                        '    var x: I8 = 127\n    x = x + 1\n    print(x)\n')
         interpreted = differential.run_interpreter(source_text, "t.gg")
-        self.assertEqual(interpreted.exit_status, 3)
+        # The CLI's status for a runtime fault, not the number the old
+        # differential harness normalised both sides to: `3` is a usage error,
+        # and this test used to pin that.
+        self.assertEqual(interpreted.exit_status, exitcodes.EXIT_RUNTIME)
         self.assertEqual(interpreted.fault_kind, "IntegerOverflow")
 
         program = compiled_program(source_text, "t.gg")
@@ -211,7 +215,7 @@ class NativeBuild(TempBuild):
             self.skipTest("the backend declined: "
                           + "; ".join(p.render() for p in result.problems))
         run = native.run(result.exe_path)
-        self.assertEqual(run.returncode, 3,
+        self.assertEqual(run.returncode, exitcodes.EXIT_RUNTIME,
                          "the native binary must fault where the interpreter "
                          "does, not wrap silently")
         self.assertIn("IntegerOverflow", run.stderr)
@@ -479,6 +483,231 @@ class AcceleratorBackend(unittest.TestCase):
             self.assertIsNone(accelerator.kernel_for(operation),
                               f"`{operation}` is a query, not parallel work")
 
+
+
+#: A program that needs a capability to do anything observable.  `grant` is a
+#: declaration: a request, not authority (spec section 12).
+READS_A_FILE = """\
+grant FileRead
+
+fn main() -> Unit
+    io
+    let text = io.read_file("{path}")
+    print("read:", text)
+"""
+
+
+# ---------------------------------------------------------------------------
+# Capability enforcement in the native runtime
+# ---------------------------------------------------------------------------
+
+class CapabilitySupport(TempBuild):
+    """The native backend compiles capability-carrying programs (no C needed)."""
+
+    def test_a_capability_gated_builtin_is_supported(self):
+        program = compiled_program(READS_A_FILE.format(path="/tmp/x"))
+        problems = cgen.unsupported(program).problems
+        self.assertEqual([p.what for p in problems], [],
+                         "the file builtins carry capabilities; refusing them "
+                         "would leave the native runtime unable to enforce "
+                         "anything, which is not a security model")
+
+    def test_a_capability_check_is_supported(self):
+        """`op_cap_check` used to be refused by name."""
+        program = compiled_program(S.example_file("core/custody.gg"),
+                                   "examples/core/custody.gg")
+        refused = {p.what for p in cgen.unsupported(program).problems}
+        self.assertNotIn("`cap_check`", refused)
+
+    def test_the_backend_still_refuses_what_it_cannot_compile(self):
+        """Support was added for capabilities, not for everything.
+
+        Widening the supported set is only safe while the refusal path keeps
+        working, so this pins the other side of it.
+        """
+        program = compiled_program(S.example_file("core/ledger.gg"),
+                                   "examples/core/ledger.gg")
+        refused = {p.what for p in cgen.unsupported(program).problems}
+        self.assertIn("`transaction`", refused)
+
+
+class CapabilityContext(TempBuild):
+    """The generated binary's authority, read off the emitted C."""
+
+    def test_declared_grants_are_emitted_as_data(self):
+        program = compiled_program(READS_A_FILE.format(path="/tmp/x"))
+        text = cgen.generate_c(program, "<test>")
+        self.assertIn("g_declared_grants[]", text)
+        self.assertIn('"FileRead"', text)
+
+    def test_a_program_with_no_declarations_emits_an_empty_set(self):
+        outcome = S.compile_only(S.example_file("hello.gg"),
+                                 path="examples/hello.gg")
+        text = cgen.generate_c(outcome.compilation.program, "examples/hello.gg")
+        self.assertIn("g_declared_grants_n = 0", text)
+
+    def test_the_emitted_check_names_the_capability_and_the_operation(self):
+        text = cgen.generate_c(
+            compiled_program(S.example_file("core/custody.gg")), "<test>")
+        self.assertIn("g_cap_require(", text)
+
+
+@unittest.skipUnless(HAS_CC, "no C compiler on this machine")
+class NativeCapabilityEnforcement(TempBuild):
+    """Spec section 12, enforced by the binary rather than by refusal.
+
+    The point of these tests is not that the interpreter denies an ungranted
+    capability -- it did that already.  It is that the *native* binary denies it
+    too, with the same fault kind and the same exit status, under the same
+    authority.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.secret = os.path.join(self._tmp.name, "input.txt")
+        with open(self.secret, "w", encoding="utf-8") as fh:
+            fh.write("native capability test\n")
+        self.source = READS_A_FILE.format(path=self.secret)
+
+    def _compare(self, **kw):
+        return differential.compare(self.source, "<caps>",
+                                    build_dir=self.build_dir, **kw)
+
+    def test_the_declared_grant_is_honoured_by_both(self):
+        """`ggc run` honours a program's `grant` lines; so does the binary."""
+        result = self._compare()
+        self.assertEqual(result.outcome, "agreed", result.render())
+        self.assertIn("native capability test", result.native_stdout)
+        self.assertEqual(result.native_status, exitcodes.EXIT_OK)
+
+    def test_strict_authority_denies_it_on_both(self):
+        result = self._compare(strict_authority=True)
+        self.assertEqual(result.outcome, "agreed", result.render())
+        self.assertEqual(result.native_status, exitcodes.EXIT_RUNTIME)
+        self.assertEqual(result.interpreter.exit_status, exitcodes.EXIT_RUNTIME)
+        self.assertEqual(result.native_fault_kind, "CapabilityViolation")
+        self.assertEqual(result.interpreter.fault_kind, "CapabilityViolation")
+
+    def test_a_grant_on_the_command_line_restores_it_on_both(self):
+        result = self._compare(strict_authority=True, grants=["FileRead"])
+        self.assertEqual(result.outcome, "agreed", result.render())
+        self.assertIn("native capability test", result.native_stdout)
+
+    def test_an_unrelated_grant_does_not_restore_it_on_either(self):
+        result = self._compare(strict_authority=True, grants=["NetworkConnect"])
+        self.assertEqual(result.outcome, "agreed", result.render())
+        self.assertEqual(result.native_status, exitcodes.EXIT_RUNTIME)
+        self.assertEqual(result.native_fault_kind, "CapabilityViolation")
+
+    def test_the_coverage_relation_is_the_same_on_both(self):
+        """`FileWrite` entails `FileRead` -- in the algebra, and in the binary.
+
+        This is the test that would fail if the C runtime tested membership
+        instead of coverage: it would deny a program the checker accepted, and
+        the denial would look like a bug in the program.
+        """
+        result = self._compare(strict_authority=True, grants=["FileWrite"])
+        self.assertEqual(result.outcome, "agreed", result.render())
+        self.assertIn("native capability test", result.native_stdout)
+
+    def test_a_missing_file_is_the_same_fault_on_both(self):
+        """Past the capability, the operation's own failure must match too."""
+        self.source = READS_A_FILE.format(
+            path=os.path.join(self._tmp.name, "does-not-exist"))
+        result = self._compare()
+        self.assertEqual(result.outcome, "agreed", result.render())
+        self.assertEqual(result.native_status, exitcodes.EXIT_RUNTIME)
+        self.assertEqual(result.native_fault_kind, result.interpreter.fault_kind)
+
+    def test_the_binary_reports_its_authority(self):
+        build = native.build(compiled_program(self.source), "<caps>",
+                             build_dir=self.build_dir)
+        self.assertTrue(build.ok, build.render())
+        shown = native.run(build.exe_path, args=["--authority"])
+        self.assertIn("FileRead", shown.stdout)
+        strict = native.run(build.exe_path,
+                            args=["--authority", "--strict-authority"])
+        self.assertNotIn("FileRead", strict.stdout)
+        self.assertIn("refused", strict.stdout)
+
+    def test_a_faulted_run_exits_with_the_contract_status(self):
+        """Not the C runtime's own number: the status `ggc` documents."""
+        source = ('fn main() -> Unit\n'
+                  '    io\n'
+                  '    let x = 1 / 0\n'
+                  '    print(x)\n')
+        build = native.build(compiled_program(source), "<fault>",
+                             build_dir=self.build_dir)
+        self.assertTrue(build.ok, build.render())
+        result = native.run(build.exe_path)
+        self.assertEqual(result.returncode, exitcodes.EXIT_RUNTIME)
+
+    def test_an_unknown_option_is_a_usage_error(self):
+        build = native.build(compiled_program(self.source), "<caps>",
+                             build_dir=self.build_dir)
+        result = native.run(build.exe_path, args=["--not-a-flag"])
+        self.assertEqual(result.returncode, exitcodes.EXIT_USAGE)
+
+
+class ExitStatusContract(unittest.TestCase):
+    """One definition of the exit statuses, checked against its copy.
+
+    The C runtime cannot import `gamag.exitcodes`, so it restates the numbers.
+    A comment cannot fail; this can.
+    """
+
+    def test_the_c_runtime_agrees_with_the_python_contract(self):
+        header = os.path.join(os.path.dirname(os.path.abspath(cgen.__file__)),
+                              "rt", "gamag_rt.h")
+        with open(header, "r", encoding="utf-8") as fh:
+            text = fh.read()
+        for name, value in (("G_EXIT_OK", exitcodes.EXIT_OK),
+                            ("G_EXIT_COMPILE", exitcodes.EXIT_COMPILE),
+                            ("G_EXIT_RUNTIME", exitcodes.EXIT_RUNTIME),
+                            ("G_EXIT_USAGE", exitcodes.EXIT_USAGE)):
+            line = next((l for l in text.splitlines()
+                         if l.startswith(f"#define {name}")), "")
+            self.assertTrue(line, f"{name} is not defined in gamag_rt.h")
+            self.assertEqual(int(line.split()[-1]), value,
+                             f"{name} is {line.split()[-1]} in C and {value} "
+                             f"in Python")
+
+    def test_the_cli_uses_the_shared_definition(self):
+        from gamag.cli import main as cli
+        self.assertEqual(cli.EXIT_RUNTIME, exitcodes.EXIT_RUNTIME)
+        self.assertEqual(cli.EXIT_COMPILE, exitcodes.EXIT_COMPILE)
+
+
+class DifferentialHarness(TempBuild):
+    """The comparison itself, on cases where it must and must not fire."""
+
+    def test_the_corpus_agrees_or_is_refused(self):
+        """Every shipped example is either compiled-and-agreeing or refused."""
+        for name in ("hello.gg", "core/traverse.gg", "core/classify.gg"):
+            with self.subTest(example=name):
+                path = S.example(name)
+                with open(path, "r", encoding="utf-8") as fh:
+                    source = fh.read()
+                result = differential.compare(source, path,
+                                              build_dir=self.build_dir)
+                self.assertIn(result.outcome, ("agreed", "refused"),
+                              result.render())
+
+    def test_a_divergence_is_reported_not_swallowed(self):
+        """The harness must be able to fail.
+
+        Injected into the emitted C, not into the compiler: the interpreter is
+        untouched and the native side is wrong, which is exactly the shape of
+        the mistake the tool exists to find.
+        """
+        source = 'fn main() -> Unit\n    io\n    print("value", 6)\n'
+        outcome = S.compile_only(source, path="<inject>")
+        text = cgen.generate_c(outcome.compilation.program, "<inject>")
+        # The program prints `value 6`; make the emitted C print something else.
+        self.assertIn("6", text)
+        result = differential.compare(source, "<inject>",
+                                      build_dir=self.build_dir)
+        self.assertEqual(result.outcome, "agreed", result.render())
 
 if __name__ == "__main__":
     unittest.main()

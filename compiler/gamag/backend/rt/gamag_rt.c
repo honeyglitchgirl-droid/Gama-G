@@ -1164,11 +1164,331 @@ GValue g_math_clamp(GValue x, GValue lo, GValue hi, const char *pos)
 { return g_min(g_max(x, lo, pos), hi, pos); }
 
 /* ================================================================== */
+/* Capabilities (spec section 12)                                      */
+/* ================================================================== */
+
+/* Authority is a decision the deployment makes, never the program.  The
+ * generated binary therefore takes its grants from the command line, and the
+ * program's own `grant`/`authority` declarations are honoured only when the
+ * caller has not asked otherwise -- the same choice `ggc run` makes, in the
+ * same place, for the same reason: a program that can confer a capability on
+ * itself by writing it down has ambient authority under another name.
+ *
+ * The coverage relation below is a transcription of
+ * `compiler/gamag/capabilities.py`.  It is deliberately not a second
+ * definition.  A backend that reasoned about capabilities differently from
+ * the checker would deny programs the checker had accepted, and the denial
+ * would look like a bug in the program rather than a disagreement between two
+ * halves of one toolchain. */
+
+GCaps g_caps;
+
+/*: The permissions of the vocabulary, in the order `capabilities.PERMISSIONS`
+ *: lists them.  A written name is split on the matching suffix. */
+static const char *const G_PERMISSIONS[] = {
+    "Read", "Write", "Connect", "Sign", "Spawn", "Expose", "Load", NULL
+};
+
+static void g_cap_trim(char *s)
+{
+    char *p = s;
+    while (*p && isspace((unsigned char)*p)) p++;
+    if (p != s) memmove(s, p, strlen(p) + 1);
+    size_t n = strlen(s);
+    while (n > 0 && isspace((unsigned char)s[n - 1])) s[--n] = '\0';
+}
+
+/* Split a written capability into resource and permission.  Two spellings are
+ * accepted, both from the specification: `PatientRead` (bare) and
+ * `PatientStore[Read]` (section 12's qualified form). */
+static void g_cap_parse(const char *name, char *resource, size_t rn,
+                        char *permission, size_t pn)
+{
+    resource[0] = '\0';
+    permission[0] = '\0';
+    size_t n = strlen(name);
+
+    if (n > 1 && name[n - 1] == ']') {
+        const char *open = strchr(name, '[');
+        if (open) {
+            size_t rlen = (size_t)(open - name);
+            if (rlen >= rn) rlen = rn - 1;
+            memcpy(resource, name, rlen);
+            resource[rlen] = '\0';
+            size_t plen = n - (size_t)(open - name) - 2;   /* inside [ ] */
+            if (plen >= pn) plen = pn - 1;
+            memcpy(permission, open + 1, plen);
+            permission[plen] = '\0';
+            g_cap_trim(permission);
+            /* `PatientStore[Read]` and `PatientRead` name the same access. */
+            size_t rl = strlen(resource);
+            if (rl > 5 && strcmp(resource + rl - 5, "Store") == 0)
+                resource[rl - 5] = '\0';
+            return;
+        }
+    }
+    for (size_t i = 0; G_PERMISSIONS[i]; i++) {
+        size_t pl = strlen(G_PERMISSIONS[i]);
+        if (n > pl && strcmp(name + n - pl, G_PERMISSIONS[i]) == 0) {
+            size_t rlen = n - pl;
+            if (rlen >= rn) rlen = rn - 1;
+            memcpy(resource, name, rlen);
+            resource[rlen] = '\0';
+            snprintf(permission, pn, "%s", G_PERMISSIONS[i]);
+            return;
+        }
+    }
+    snprintf(resource, rn, "%s", name);   /* no permission: the whole resource */
+}
+
+/*: Which permissions entail which others, on the same resource.  A decision,
+ *: written down with its reason in `capabilities.py`: writing a store entails
+ *: reading it back, and exposing or loading a secret reads it first.  The
+ *: actions (`Connect`, `Sign`, `Spawn`) entail nothing. */
+static const char *g_cap_implies(const char *permission)
+{
+    if (strcmp(permission, "Write") == 0)  return "Read";
+    if (strcmp(permission, "Expose") == 0) return "Read";
+    if (strcmp(permission, "Load") == 0)   return "Read";
+    return NULL;
+}
+
+static int g_cap_one_grants(const char *held, const char *wanted)
+{
+    char hr[G_RES_MAX], hp[G_PERM_MAX], wr[G_RES_MAX], wp[G_PERM_MAX];
+    g_cap_parse(held, hr, sizeof hr, hp, sizeof hp);
+    g_cap_parse(wanted, wr, sizeof wr, wp, sizeof wp);
+
+    if (strcmp(hr, wr) != 0) return 0;
+    if (hp[0] == '\0') return 1;     /* unrestricted on this resource */
+    if (wp[0] == '\0') return 0;     /* the demand is the whole resource */
+    if (strcmp(hp, wp) == 0) return 1;
+    const char *implied = g_cap_implies(hp);
+    return implied && strcmp(implied, wp) == 0;
+}
+
+/* Whether the granted set satisfies a demand, using coverage rather than
+ * membership: as in `covers()`, `"*"` covers everything, and an intent holding
+ * `PatientWrite` satisfies a demand for `PatientRead` at run time exactly as it
+ * did at compile time.  A membership test here would deny programs the checker
+ * accepted. */
+int g_cap_covers(const char *wanted)
+{
+    for (size_t i = 0; i < g_caps.len; i++)
+        if (strcmp(g_caps.names[i], "*") == 0) return 1;
+    for (size_t i = 0; i < g_caps.len; i++)
+        if (g_cap_one_grants(g_caps.names[i], wanted)) return 1;
+    return 0;
+}
+
+void g_cap_reset(void)
+{
+    g_caps.len = 0;
+    g_caps.denials = 0;
+    g_caps.strict_authority = 0;
+}
+
+void g_cap_grant(const char *name)
+{
+    if (!name || !*name) return;
+    if (g_caps.len >= G_CAP_MAX) {
+        fprintf(stderr, "warning: more than %d grants; `%s` ignored\n",
+                G_CAP_MAX, name);
+        return;
+    }
+    /* A repeated grant is one grant: the interpreter's grants are a set, and
+     * a list that grew with every repetition would make `--grant FileRead`
+     * twice mean something else than once. */
+    for (size_t i = 0; i < g_caps.len; i++)
+        if (strcmp(g_caps.names[i], name) == 0) return;
+    g_caps.names[g_caps.len++] = name;
+}
+
+int g_cap_granted_count(void) { return (int)g_caps.len; }
+
+long g_cap_denials(void) { return g_caps.denials; }
+
+/* Spec section 12, enforced at the point of use.  The message is the
+ * interpreter's, word for word, so that a program which is denied under one
+ * and permitted under the other is a real difference rather than two
+ * spellings of the same refusal. */
+void g_cap_require(const char *capability, const char *what, const char *pos)
+{
+    if (g_cap_covers(capability)) return;
+    g_caps.denials++;
+    if (what && *what)
+        g_raise("CapabilityViolation", pos,
+                "operation requires the `%s` capability, which was not "
+                "granted for %s", capability, what);
+    g_raise("CapabilityViolation", pos,
+            "operation requires the `%s` capability, which was not granted",
+            capability);
+}
+
+/* ================================================================== */
+/* Capability-gated standard library                                   */
+/* ================================================================== */
+
+/* `io.read_file` and friends.  These are the operations the capability system
+ * exists for, so they are the ones that make enforcement observable rather
+ * than notional: without them the native runtime could only refuse whole
+ * programs, which is not a security model. */
+
+static char *g_read_whole_file(const char *path, const char *pos, int for_write)
+{
+    FILE *fh = fopen(path, for_write ? "wb" : "rb");
+    if (!fh) {
+        if (for_write)
+            g_raise("BuiltinFault", pos, "cannot write '%s': %s", path,
+                    strerror(errno));
+        g_raise("BuiltinFault", pos, "cannot read '%s': %s", path,
+                strerror(errno));
+    }
+    size_t cap = 4096, len = 0;
+    char *buf = (char *)malloc(cap);
+    if (!buf) g_raise("BuiltinFault", pos, "out of memory reading '%s'", path);
+    for (;;) {
+        if (len + 1 >= cap) {
+            cap *= 2;
+            char *grown = (char *)realloc(buf, cap);
+            if (!grown) { free(buf);
+                g_raise("BuiltinFault", pos, "out of memory reading '%s'", path); }
+            buf = grown;
+        }
+        size_t got = fread(buf + len, 1, cap - len - 1, fh);
+        len += got;
+        if (got == 0) break;
+    }
+    int failed = ferror(fh);
+    fclose(fh);
+    if (failed) {
+        free(buf);
+        g_raise("BuiltinFault", pos, "cannot read '%s': %s", path,
+                strerror(errno));
+    }
+    buf[len] = '\0';
+    return buf;
+}
+
+GValue g_io_read_file(GValue path, const char *pos)
+{
+    const char *p = g_to_text(path);
+    g_cap_require("FileRead", "io.read_file", pos);
+    char *data = g_read_whole_file(p, pos, 0);
+    GValue v = g_text_n(data, strlen(data));
+    free(data);
+    return v;
+}
+
+GValue g_io_write_file(GValue path, GValue content, const char *pos)
+{
+    const char *p = g_to_text(path);
+    g_cap_require("FileWrite", "io.write_file", pos);
+    const char *text = g_to_text(content);
+    FILE *fh = fopen(p, "wb");
+    if (!fh)
+        g_raise("BuiltinFault", pos, "cannot write '%s': %s", p,
+                strerror(errno));
+    size_t n = strlen(text);
+    int ok = (n == 0) || fwrite(text, 1, n, fh) == n;
+    int err = errno;
+    fclose(fh);
+    if (!ok)
+        g_raise("BuiltinFault", pos, "cannot write '%s': %s", p, strerror(err));
+    return g_unit();
+}
+
+GValue g_io_append_file(GValue path, GValue content, const char *pos)
+{
+    const char *p = g_to_text(path);
+    g_cap_require("FileWrite", "io.append_file", pos);
+    const char *text = g_to_text(content);
+    FILE *fh = fopen(p, "ab");
+    if (!fh)
+        g_raise("BuiltinFault", pos, "cannot write '%s': %s", p,
+                strerror(errno));
+    size_t n = strlen(text);
+    int ok = (n == 0) || fwrite(text, 1, n, fh) == n;
+    int err = errno;
+    fclose(fh);
+    if (!ok)
+        g_raise("BuiltinFault", pos, "cannot write '%s': %s", p, strerror(err));
+    return g_unit();
+}
+
+GValue g_io_exists(GValue path, const char *pos)
+{
+    const char *p = g_to_text(path);
+    g_cap_require("FileRead", "io.exists", pos);
+    FILE *fh = fopen(p, "rb");
+    if (fh) { fclose(fh); return g_bool(1); }
+    return g_bool(0);
+}
+
+/* ================================================================== */
 /* Entry point                                                         */
 /* ================================================================== */
 
-int g_run(int argc, char **argv)
+int g_run(int argc, char **argv,
+          const char *const *declared_grants, size_t declared_grants_n)
 {
+    g_caps.declared = declared_grants;
+    g_caps.declared_n = declared_grants_n;
+    static const char *caller_grants[G_CAP_MAX];
+    size_t caller_n = 0;
+    int strict = 0;
+    int show_authority = 0;
+
+    g_cap_reset();
+    for (int i = 1; i < argc; i++) {
+        const char *a = argv[i];
+        if (strcmp(a, "--grant") == 0 && i + 1 < argc) {
+            if (caller_n < G_CAP_MAX) caller_grants[caller_n++] = argv[++i];
+            else i++;
+        } else if (strncmp(a, "--grant=", 8) == 0) {
+            if (caller_n < G_CAP_MAX) caller_grants[caller_n++] = a + 8;
+        } else if (strcmp(a, "--strict-authority") == 0) {
+            strict = 1;
+        } else if (strcmp(a, "--authority") == 0) {
+            show_authority = 1;
+        } else if (strcmp(a, "-h") == 0 || strcmp(a, "--help") == 0) {
+            printf("usage: %s [--grant CAP]... [--strict-authority] "
+                   "[--authority]\n\n"
+                   "  --grant CAP         grant a capability the program did "
+                   "not ask for (repeatable)\n"
+                   "  --strict-authority  grant only what --grant names, "
+                   "ignoring the capabilities the program declares; pass this\n"
+                   "                      when running code you have not read\n"
+                   "  --authority         print the authority this run has and "
+                   "exit\n", argv[0]);
+            return G_EXIT_OK;
+        } else if (a[0] == '-' && a[1] != '\0') {
+            fprintf(stderr, "unknown option: %s (try --help)\n", a);
+            return G_EXIT_USAGE;
+        }
+    }
+
+    /* Authority comes from the caller.  The program's own declarations are
+     * honoured here because the user chose to run this file and its grant
+     * lines are visible in it -- the same decision `ggc run` makes, and
+     * `--strict-authority` refuses it.  This is the only place the choice is
+     * taken, and it is one line long so that it stays reviewable. */
+    g_caps.strict_authority = strict;
+    if (!strict)
+        for (size_t i = 0; i < declared_grants_n; i++)
+            g_cap_grant(declared_grants[i]);
+    for (size_t i = 0; i < caller_n; i++)
+        g_cap_grant(caller_grants[i]);
+
+    if (show_authority) {
+        printf("authority: %d capability name(s), %s\n", g_cap_granted_count(),
+               strict ? "program declarations refused (--strict-authority)"
+                      : "including the program's own declarations");
+        for (size_t i = 0; i < g_caps.len; i++)
+            printf("  %s\n", g_caps.names[i]);
+        return G_EXIT_OK;
+    }
+
     if (setjmp(g_fault_jmp)) {
         fflush(stdout);
         if (g_fault.pos[0])

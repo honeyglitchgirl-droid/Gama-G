@@ -91,9 +91,43 @@ typedef struct GFault {
 extern GFault   g_fault;
 extern jmp_buf  g_fault_jmp;
 
-/* Exit statuses, matching `compiler/gamag/cli/main.py`. */
-#define G_EXIT_OK      0
-#define G_EXIT_RUNTIME 3
+/* Exit statuses, matching `compiler/gamag/cli/main.py` exactly.  They did not:
+ * a runtime fault exited 3 here and 2 under `ggc run`, and the differential
+ * harness hid the difference by normalising the interpreter's status to the
+ * native one -- so the comparison could never have caught it.  `3` is a usage
+ * error, and a fault is not a usage error. */
+#define G_EXIT_OK        0
+#define G_EXIT_COMPILE   1
+#define G_EXIT_RUNTIME   2
+#define G_EXIT_USAGE     3
+
+/* ------------------------------------------------------------------ */
+/* Capabilities (spec section 12)                                      */
+/* ------------------------------------------------------------------ */
+
+#define G_CAP_MAX  64
+#define G_RES_MAX  96
+#define G_PERM_MAX 24
+
+typedef struct GCaps {
+    const char *names[G_CAP_MAX];
+    size_t      len;
+    int         strict_authority;
+    long        denials;
+    /*: What the program declared, supplied by the generated `main`. */
+    const char *const *declared;
+    size_t      declared_n;
+} GCaps;
+
+extern GCaps g_caps;
+
+
+int  g_cap_covers(const char *wanted);
+void g_cap_grant(const char *name);
+void g_cap_reset(void);
+void g_cap_require(const char *capability, const char *what, const char *pos);
+int  g_cap_granted_count(void);
+long g_cap_denials(void);
 
 void g_raise(const char *kind, const char *pos, const char *fmt, ...)
 #if defined(__GNUC__)
@@ -183,6 +217,11 @@ GValue g_field(GValue obj, const char *name, const char *pos);
 void g_println_n(size_t n, const GValue *args);
 void g_print_raw_n(size_t n, const GValue *args);
 void g_eprint_n(size_t n, const GValue *args);
+GValue g_io_read_file(GValue path, const char *pos);
+GValue g_io_write_file(GValue path, GValue content, const char *pos);
+GValue g_io_append_file(GValue path, GValue content, const char *pos);
+GValue g_io_exists(GValue path, const char *pos);
+
 void g_print(GValue v);
 void g_println(GValue v);
 void g_print_raw(GValue v);
@@ -222,6 +261,12 @@ GValue g_math_clamp(GValue x, GValue lo, GValue hi, const char *pos);
 /* Emitted by the backend. */
 GValue g_main(int argc, char **argv);
 
-int g_run(int argc, char **argv);
+/* `declared_grants` is what the *program* asks for, which the code
+ * generator passes in rather than the runtime reaching for: a runtime that
+ * referenced a symbol only generated programs define could not be linked on
+ * its own, and it is linked on its own by the tests that check its value
+ * formatting against the interpreter. */
+int g_run(int argc, char **argv,
+          const char *const *declared_grants, size_t declared_grants_n);
 
 #endif /* GAMAG_RT_H */

@@ -45,6 +45,11 @@ SUPPORTED_BUILTINS = frozenset({
     "__iter_list", "__iter_range", "__list_get",
     "math.abs", "math.round", "math.floor", "math.ceil", "math.sqrt",
     "math.pow", "math.clamp", "math.min", "math.max", "math.log", "math.exp",
+    # Capability-gated.  These are the operations the capability system exists
+    # for, so they are the ones that make native enforcement observable rather
+    # than notional: without them this backend could only refuse whole
+    # programs, which is not a security model.
+    "io.read_file", "io.write_file", "io.append_file", "io.exists",
 })
 
 #: Ops this backend emits.  Anything outside this set is reported by name.
@@ -53,7 +58,7 @@ SUPPORTED_OPS = frozenset({
     Op.MAKE_LIST, Op.MAKE_TUPLE, Op.MAKE_MAP, Op.MAKE_RECORD, Op.MAKE_VARIANT,
     Op.CONSTRUCT, Op.FIELD, Op.INDEX, Op.SET_INDEX, Op.JUMP, Op.JUMP_IF,
     Op.RETURN, Op.FAULT, Op.MATCH_FAIL, Op.REQUIRE, Op.ASSERT,
-    Op.LOAD_GLOBAL, Op.STORE_GLOBAL, Op.SECRET_GUARD,
+    Op.LOAD_GLOBAL, Op.STORE_GLOBAL, Op.SECRET_GUARD, Op.CAP_CHECK,
 })
 
 #: Ops that are refused with a reason, because translating them would produce a
@@ -61,7 +66,6 @@ SUPPORTED_OPS = frozenset({
 UNSUPPORTED_REASONS = {
     Op.AUDIT: "the audit chain (hash-chained, signed records) has no C "
               "implementation yet",
-    Op.CAP_CHECK: "capability state is not carried by the native runtime",
     Op.CHECKPOINT: "checkpoint capture and restore are not implemented natively",
     Op.TRANSACTION: "transaction begin/commit are not implemented natively",
     Op.PROTECTED: "recovery regions are not implemented natively",
@@ -243,6 +247,26 @@ class CGenerator:
         self.globals: Dict[str, Any] = {}
         self.entry = entry or pick_entry(program)
 
+    def _declare_authority(self) -> None:
+        """The capabilities the program *asks* for, as data.
+
+        A request, not authority: `g_run` decides whether to honour it, and
+        `--strict-authority` refuses it, because a program that could confer a
+        capability on itself by writing it down has ambient authority under
+        another name (spec section 12).
+        """
+        grants = list(getattr(self.program, "grants", ()) or ())
+        self.emit("/* The capabilities this program declares it needs.  They are")
+        self.emit("   a request: `g_run` decides whether to honour them. */")
+        if grants:
+            items = ", ".join(_c_string(g) for g in grants)
+            self.emit(f"static const char *const g_declared_grants[] = {{{items}}};")
+            self.emit(f"static const size_t g_declared_grants_n = {len(grants)};")
+        else:
+            self.emit("static const char *const g_declared_grants[] = {NULL};")
+            self.emit("static const size_t g_declared_grants_n = 0;")
+        self.emit()
+
     # ---- scaffolding ---------------------------------------------
 
     def emit(self, line: str = "") -> None:
@@ -257,13 +281,15 @@ class CGenerator:
         self.emit('#include "gamag_rt.h"')
         self.emit()
 
+        self._declare_authority()
         self._declare_globals()
         for name, fn in self.program.functions.items():
             self.emit(self._signature(name, fn) + ";")
         self.emit()
         self.emit("int main(int argc, char **argv)")
         self.emit("{")
-        self.emit("    return g_run(argc, argv);")
+        self.emit("    return g_run(argc, argv, g_declared_grants,")
+        self.emit("                 g_declared_grants_n);")
         self.emit("}")
         self.emit()
         self.emit("static int g_initialized = 0;")
@@ -571,6 +597,16 @@ class CGenerator:
         elif op == Op.STORE_GLOBAL:
             name = _c_ident(str(instr.meta.get("name", "")))
             self.emit(f"    g_global_{name} = {self._operand(instr.args[0])};")
+        elif op == Op.CAP_CHECK:
+            # The compile-time check already proved this demand is covered by
+            # the program's authority.  The run-time check is emitted anyway,
+            # for the reason the core lowerer gives when it emits the opcode: a
+            # proof is a reason to trust the program, not a reason to remove
+            # the boundary.  A capability checked only at compile time is not
+            # enforced against a hand-edited IR or a reordered backend.
+            capability = _c_string(str(instr.meta.get("capability", "")))
+            what = _c_string(str(instr.meta.get("what", "")))
+            self.emit(f"    g_cap_require({capability}, {what}, {pos});")
         elif op == Op.SECRET_GUARD:
             # The guard is a compile-time property that survives into the IR so
             # that it is visible; the runtime refusal lives in g_display.
@@ -649,6 +685,14 @@ class CGenerator:
             return f"g_to_int({args[0]}, {pos})"
         if name == "bool":
             return f"g_bool(g_truthy({args[0]}, {pos}))"
+        if name == "io.read_file":
+            return f"g_io_read_file({args[0]}, {pos})"
+        if name == "io.write_file":
+            return f"g_io_write_file({args[0]}, {args[1]}, {pos})"
+        if name == "io.append_file":
+            return f"g_io_append_file({args[0]}, {args[1]}, {pos})"
+        if name == "io.exists":
+            return f"g_io_exists({args[0]}, {pos})"
         if name == "abs" or name == "math.abs":
             return f"g_abs({args[0]}, {pos})"
         if name == "contains":

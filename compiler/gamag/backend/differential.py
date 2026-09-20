@@ -33,7 +33,9 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from ..driver import compile_source, execute, find_entry, program_grants
+from ..driver import (compile_source, declared_grants, execute, find_entry,
+                      program_grants)
+from ..exitcodes import EXIT_OK, EXIT_RUNTIME
 from ..runtime.context import Context
 from . import cgen, native
 
@@ -58,6 +60,7 @@ class InterpreterResult:
 def run_interpreter(source: str, path: str = "<program>",
                     grants: Sequence[str] = (),
                     entry: Optional[str] = None,
+                    strict_authority: bool = False,
                     timeout: float = 30.0) -> InterpreterResult:
     """Run a program on the reference interpreter and record what it did."""
     started = time.perf_counter()
@@ -72,7 +75,17 @@ def run_interpreter(source: str, path: str = "<program>",
             elapsed_ms=(time.perf_counter() - started) * 1000.0)
 
     buffer = io.StringIO()
-    context = Context(grants=program_grants(compilation, tuple(grants)),
+    # The authority has to be the same on both sides of the comparison, and
+    # which authority that is has to be stated.  This used to give the
+    # interpreter caller-only grants while the binary honoured the program's
+    # own declarations, so a capability-using program was compared under two
+    # different security models and the difference showed up as a divergence.
+    # Both now mirror `ggc run`: caller grants plus the program's declarations,
+    # and `strict_authority` refuses the latter, everywhere.
+    authority = set(program_grants(compilation, tuple(grants)))
+    if not strict_authority:
+        authority |= declared_grants(compilation)
+    context = Context(grants=authority,
                       stdout=buffer, deterministic=True, seed=0)
     name = entry or find_entry(compilation) or "main"
     execution = execute(compilation, entry=name, context=context, grants=())
@@ -82,9 +95,12 @@ def run_interpreter(source: str, path: str = "<program>",
                                elapsed_ms=elapsed)
     fault = execution.fault
     if fault is None:
-        result.exit_status = 0
+        result.exit_status = EXIT_OK
         return result
-    result.exit_status = 3
+    # The CLI's own status for a fault, not a number chosen here.  This used to
+    # be 3, matching a C runtime that had it wrong, which meant the comparison
+    # below could never fail.
+    result.exit_status = EXIT_RUNTIME
     text = str(fault)
     result.fault_text = text
     kind = type(fault).__name__
@@ -145,11 +161,18 @@ def compare(source: str, path: str = "<program>",
             grants: Sequence[str] = (),
             build_dir: str = native.DEFAULT_BUILD_DIR,
             keep_c: bool = True,
-            entry: Optional[str] = None) -> Comparison:
-    """Build a program natively, run both, and report whether they agree."""
+            entry: Optional[str] = None,
+            strict_authority: bool = False) -> Comparison:
+    """Build a program natively, run both, and report whether they agree.
+
+    ``grants`` and ``strict_authority`` are the *caller's* authority, applied to
+    both machines.  They have to be applied to both: a comparison that gave the
+    interpreter one set of grants and the binary another would be comparing two
+    different programs, which is exactly what a capability denial looks like.
+    """
     result = Comparison(path=path)
 
-    interp = run_interpreter(source, path, grants, entry)
+    interp = run_interpreter(source, path, grants, entry, strict_authority)
     result.interpreter = interp
     result.interpreter_elapsed_ms = interp.elapsed_ms
     if not interp.comparable:
@@ -170,7 +193,16 @@ def compare(source: str, path: str = "<program>",
         result.reasons = build.render()
         return result
 
-    run_result = native.run(build.exe_path)
+    # The binary takes its authority from its command line, the interpreter
+    # takes it from `Context(grants=...)`; those are the two spellings of the
+    # same decision, so both are given the same one here.
+    native_args: List[str] = []
+    for g in grants:
+        native_args += ["--grant", g]
+    if strict_authority:
+        native_args.append("--strict-authority")
+
+    run_result = native.run(build.exe_path, args=native_args)
     result.native_stdout = run_result.stdout
     result.native_status = run_result.returncode
     result.native_stderr = run_result.stderr

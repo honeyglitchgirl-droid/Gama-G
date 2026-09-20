@@ -27,11 +27,10 @@ from ..driver import (Compilation, compile_file, declared_grants, execute,
                        find_entry)
 from ..std import library as L
 
-EXIT_OK = 0
-EXIT_COMPILE = 1
-EXIT_RUNTIME = 2
-EXIT_USAGE = 3
-EXIT_TEST = 4
+# The exit statuses live in one place so the native runtime, the CLI and the
+# differential harness cannot drift apart again; see `gamag/exitcodes.py`.
+from ..exitcodes import (EXIT_COMPILE, EXIT_OK, EXIT_RUNTIME, EXIT_TEST,
+                         EXIT_USAGE)  # noqa: E402
 
 PROFILES = ("strict", "standard", "lenient")
 
