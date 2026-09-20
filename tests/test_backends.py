@@ -927,5 +927,259 @@ class DifferentialHarness(TempBuild):
                                       build_dir=self.build_dir)
         self.assertEqual(result.outcome, "agreed", result.render())
 
+# ---------------------------------------------------------------------------
+# Scalar specialization -- the unboxed emitter
+# ---------------------------------------------------------------------------
+
+#: One program per property the unboxed emitter has to reproduce.  These are
+#: not timed and nothing here claims a speed; they exist because the emitter
+#: rewrites a function's *representation*, and the only way to show that the
+#: representation did not leak into the meaning is to run both emitters on the
+#: same program and compare.
+SCALAR_CORPUS = {
+    "arithmetic": 'fn f(a: I64, b: I64) -> I64 { return a * b + a - b }\n'
+                  'print(f(7, 9))',
+    "division_truncates_toward_zero":
+        'fn f(a: I64, b: I64) -> I64 { return a / b }\n'
+        'fn g(a: I64, b: I64) -> I64 { return a % b }\n'
+        'print(f(-7, 2), g(-7, 2), f(7, -2), g(7, -2))',
+    "comparison": 'fn f(a: I64, b: I64) -> Bool { return a < b }\n'
+                  'fn g(a: I64, b: I64) -> Bool { return a == b }\n'
+                  'print(f(1, 2), g(2, 2), g(3, 2))',
+    "floats": 'fn f(a: F64, b: F64) -> F64 { return a / b + a * b }\n'
+              'print(f(1.5, 2.0))',
+    # An integer *literal* adapts to a float context (`x > 0` with `x: F64`),
+    # while an I64 slot against a float literal is refused by the checker.  It
+    # is the only mixed shape that reaches the emitter, and it does reach it.
+    "float_slot_against_int_literal":
+        'fn f(x: F64) -> Bool { return x > 0 }\n'
+        'print(f(1.5), f(-1.0))',
+    "int_literal_against_float_slot":
+        'fn f(x: F64) -> Bool { return 0 < x }\n'
+        'print(f(1.5), f(-1.0))',
+    # `not true` was `true` before the differential harness ran: the emitter
+    # returned the constant 1 whenever the operand was a Bool.
+    "negation_and_not": 'fn f(a: I64) -> I64 { return -a }\n'
+                        'fn g(a: Bool) -> Bool { return not a }\n'
+                        'fn h(a: Bool) -> Bool { return !a }\n'
+                        'print(f(5), g(true), g(false), h(true), h(false))',
+    "recursion": 'fn fib(n: I64) -> I64 {'
+                 ' if n < 2 { return n } return fib(n - 1) + fib(n - 2) }\n'
+                 'print(fib(20))',
+    "mutual_recursion": 'fn even(n: I64) -> Bool { if n == 0 { return true }'
+                        ' return odd(n - 1) }\n'
+                        'fn odd(n: I64) -> Bool { if n == 0 { return false }'
+                        ' return even(n - 1) }\n'
+                        'print(even(10), odd(10))',
+    # A function that returns nothing, called by one that returns something:
+    # the call must not be expected to produce a value.
+    "unit_returning_callee": 'fn f(n: I64) { print("n", n) }\n'
+                             'fn g(n: I64) -> I64 { f(n)  return n * 2 }\n'
+                             'print(g(4))',
+    # The ABI boundary: `main` uses a Text, so it cannot be specialized, and it
+    # still has to get the right answer out of the function that is.
+    "plain_caller_of_a_specialized_function":
+        'fn helper(n: I64) -> I64 { var t = 0  var i = 0'
+        ' while i < n { t = t + i  i = i + 1 } return t }\n'
+        'var s = "x"\nprint(s, helper(10))',
+    "int_overflow": 'fn f(a: I64, b: I64) -> I64 { return a + b }\n'
+                    'print(f(9223372036854775807, 1))',
+    "int64_min_negated":
+        'fn f(a: I64) -> I64 { return -a }\n'
+        'print(f(-9223372036854775807 - 1))',
+    "int64_min_divided_by_minus_one":
+        'fn f(a: I64, b: I64) -> I64 { return a / b }\n'
+        'print(f(-9223372036854775807 - 1, -1))',
+    "int64_min_modulo_minus_one":
+        'fn f(a: I64, b: I64) -> I64 { return a % b }\n'
+        'print(f(-9223372036854775807 - 1, -1))',
+    # A fault message is output, and a division names its operands: an I64 1
+    # renders as "1" and an F64 1.0 renders as "1.0", so a mixed division
+    # cannot be reported by a helper that only sees two doubles.
+    "division_by_zero": 'fn f(a: I64, b: I64) -> I64 { return a / b }\n'
+                        'print(f(1, 0))',
+    "float_division_by_zero":
+        'fn f(a: F64, b: F64) -> F64 { return a / b }\nprint(f(1.0, 0.0))',
+    "float_modulo_by_zero":
+        'fn f(a: F64, b: F64) -> F64 { return a % b }\nprint(f(1.0, 0.0))',
+    # The three divisions name their operands differently on failure --
+    # "1.5 / 0", "0 / 0.0" and "1.0 / 0.0" -- so a helper that only ever sees
+    # two doubles cannot report two of them.
+    "mixed_division_by_zero_float_over_int":
+        'fn f(x: F64) -> F64 { return x / 0 }\nprint(f(1.5))',
+    "mixed_division_by_zero_int_over_float":
+        'fn f(x: F64) -> F64 { return 0 / x }\nprint(f(0.0))',
+    "modulo_by_zero": 'fn f(a: I64, b: I64) -> I64 { return a % b }\n'
+                      'print(f(1, 0))',
+    # A global *read* is allowed inside a specialized function as long as it
+    # is handed straight to a boxed call -- `print(label, x)`.  It never enters
+    # the arithmetic, so it stays a `GValue` on both paths.
+    "global_read_as_a_print_argument":
+        'var label = "n"\n'
+        'fn f(n: I64) -> I64 { var t = n * 2  print(label, t)  return t }\n'
+        'print(f(4))',
+    "text_printed_from_a_specialized_function":
+        'fn f(i: I64, x: F64, b: Bool) { print(i, x, b, "text") }\nf(1, 2.5, true)',
+}
+
+
+class ScalarSpecialisation(TempBuild):
+    """The unboxed emitter must not change what a program does.
+
+    Every candidate is built twice -- once with the plan and once with
+    `scalar_plan` forced to return nothing, which is the boxed emitter exactly
+    -- and the two binaries have to agree on the output, the status and the
+    fault text.  The differential tester compares native against the
+    interpreter, but only over the example corpus, and it says nothing about
+    the functions this plan rewrites.
+    """
+
+    def build_and_run(self, program, build_dir, specialize: bool):
+        real = cgen.scalar_plan
+        if not specialize:
+            cgen.scalar_plan = lambda program: {}
+        try:
+            result = native.build(program, "scalar.gg", build_dir=build_dir)
+        finally:
+            cgen.scalar_plan = real
+        if not result.ok:
+            self.skipTest("the backend declined: "
+                          + "; ".join(p.render() for p in result.problems))
+        run = native.run(result.exe_path)
+        return (run.returncode, run.stdout, run.stderr)
+
+    def test_both_emitters_agree_on_every_property(self):
+        for name, source in sorted(SCALAR_CORPUS.items()):
+            with self.subTest(program=name):
+                program = compiled_program(source, f"<{name}>")
+                plan = cgen.scalar_plan(program)
+                self.assertTrue(
+                    plan,
+                    "the program specialized nothing, so this comparison "
+                    "would pass without testing the unboxed emitter at all")
+                unboxed = self.build_and_run(
+                    program, os.path.join(self.build_dir, "unboxed"), True)
+                boxed = self.build_and_run(
+                    program, os.path.join(self.build_dir, "boxed"), False)
+                self.assertEqual(unboxed, boxed)
+
+    def test_a_division_by_zero_names_its_operands_as_the_boxed_path_does(self):
+        """The message is output, and it is type-sensitive.
+
+        `g_binop` reports a failed division as "division by zero: %s / %s" with
+        the operands rendered at their own types, so an F64 1.0 prints as "1.0"
+        while an I64 1 prints as "1".  A single helper taking two doubles would
+        get two of these three cases wrong, in a way no exit status shows.
+        """
+        cases = {
+            'fn f(a: F64, b: F64) -> F64 { return a / b }\nprint(f(1.0, 0.0))':
+                "division by zero: 1.0 / 0.0",
+            'fn f(x: F64) -> F64 { return x / 0 }\nprint(f(1.5))':
+                "division by zero: 1.5 / 0",
+            'fn f(x: F64) -> F64 { return 0 / x }\nprint(f(0.0))':
+                "division by zero: 0 / 0.0",
+        }
+        for source, expected in cases.items():
+            with self.subTest(expected=expected):
+                program = compiled_program(source, "<zero>")
+                self.assertTrue(cgen.scalar_plan(program),
+                                "this case only tests anything if the "
+                                "function was specialized")
+                status, out, err = self.build_and_run(
+                    program, os.path.join(self.build_dir, "zero"), True)
+                self.assertEqual(status, exitcodes.EXIT_RUNTIME)
+                self.assertIn(expected, err)
+
+    def test_a_specialized_function_keeps_a_boxed_entry_point(self):
+        """The two names are the whole reason the two emitters can coexist.
+
+        A caller that was not specialized passes and receives `GValue`s, so the
+        unboxed body must not be the symbol the generic path calls.
+        """
+        program = compiled_program(
+            'fn double(n: I64) -> I64 { return n * 2 }\n'
+            'var label = "n"\n'
+            'fn main() -> Unit\n    io\n    print(label, double(4))\n', "d.gg")
+        self.assertIn("double", cgen.scalar_plan(program))
+        text = cgen.generate_c(program, "d.gg")
+        self.assertIn("static int64_t gf_double_s(int64_t n);", text)
+        self.assertIn("GValue gf_double(GValue n);", text)
+        self.assertIn("g_unbox_i64(n, \"double\", \"n\")", text)
+        self.assertIn("return g_int(gf_double_s(", text)
+        # Nothing plain calls `double` here -- `main` was specialized too -- so
+        # the wrapper is a definition nothing references, and it says so rather
+        # than making `-Wall -Wextra` report the emitted program as defective.
+        self.assertIn("G_MAYBE_UNUSED GValue gf_double(GValue n);", text)
+
+    def test_the_boxed_wrapper_is_not_marked_unused_when_plain_code_calls_it(self):
+        """The other half of the same rule: a `G_MAYBE_UNUSED` that was always
+        there would hide the case it exists for."""
+        # `plain` uses Text, so it is not specialized, and it calls `double`,
+        # which is.  That call is the whole reason the wrapper exists.
+        program = compiled_program(
+            'fn double(n: I64) -> I64 { return n * 2 }\n'
+            'fn plain(n: I64) -> I64\n'
+            '    let s = "x" + str(n)\n'
+            '    return double(n) + len(s)\n'
+            'print(plain(4))\n', "d2.gg")
+        plan = cgen.scalar_plan(program)
+        self.assertIn("double", plan)
+        self.assertNotIn("plain", plan)
+        text = cgen.generate_c(program, "d2.gg")
+        self.assertIn("static GValue gf_double(GValue n);", text)
+        self.assertNotIn("G_MAYBE_UNUSED GValue gf_double", text,
+                         "`plain` is not specialized and calls it")
+        result = self.build_and_run(program, self.build_dir, True)
+        self.assertEqual(result[0], 0, result[2])
+        self.assertEqual(result[1].strip(), "10")
+
+    def test_a_derived_name_that_would_collide_is_refused(self):
+        """`add_s` is a legal name, and it is also the body's derived name.
+
+        Dropping the function costs speed and nothing else; emitting both would
+        be a duplicate symbol.
+        """
+        program = compiled_program(
+            'fn add(a: I64, b: I64) -> I64 { return a + b }\n'
+            'fn add_s(a: I64, b: I64) -> I64 { return a - b }\n'
+            'print(add(2, 3), add_s(9, 4))\n', "c.gg")
+        plan = cgen.scalar_plan(program)
+        self.assertNotIn("add", plan,
+                         "`add`'s unboxed body would be called `gf_add_s`, "
+                         "which is `add_s`'s own boxed name")
+        # `add_s` may stay: with `add` out of the plan nothing else claims
+        # `gf_add_s`, and its body is `gf_add_s_s`.
+        text = cgen.generate_c(program, "c.gg")
+        self.assertIn("static int64_t gf_add_s_s(", text,
+                      "`add_s` keeps the unboxed emitter under a free name")
+        for symbol in ("gf_add", "gf_add_s", "gf_add_s_s"):
+            definitions = [line for line in text.splitlines()
+                           if f" {symbol}(" in line and line.startswith("static ")
+                           and not line.rstrip().endswith(";")]
+            self.assertLessEqual(
+                len(definitions), 1,
+                f"{symbol} must be defined at most once, not once per emitter;"
+                f" found {definitions}")
+        result = self.build_and_run(program, self.build_dir, True)
+        self.assertEqual(result[0], 0, result[2])
+        self.assertEqual(result[1].strip(), "5 5")
+
+    def test_a_function_whose_builtin_returns_nothing_is_still_specialized(self):
+        """`print` writes a Unit slot; refusing the function over it would
+        exclude nearly every program that computes anything."""
+        program = compiled_program(
+            'fn total(n: I64) -> I64 { var t = 0  var i = 0'
+            ' while i < n { t = t + i  i = i + 1 } print(t)  return t }\n'
+            'print(total(5))\n', "p.gg")
+        self.assertIn("total", cgen.scalar_plan(program))
+
+    def test_a_builtin_whose_result_is_used_is_not_specialized(self):
+        """The other side of the same rule: `len` hands back a `GValue`, and
+        the unboxed path cannot unwrap one it did not box itself."""
+        program = compiled_program(
+            'fn f(s: Text) -> I64 { return len(s) }\nprint(f("abc"))\n', "l.gg")
+        self.assertNotIn("f", cgen.scalar_plan(program))
+
+
 if __name__ == "__main__":
     unittest.main()

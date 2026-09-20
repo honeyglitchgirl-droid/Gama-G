@@ -293,7 +293,7 @@ GIR the same machine serves the reference interpreter, a native CPU backend that
 emits C and compiles it to machine code, a WebAssembly encoder, and an
 accelerator layer.
 
-**548 tests pass**, and CI runs them on every push and pull request across
+**591 tests pass**, and CI runs them on every push and pull request across
 Python 3.9 - 3.13 (`.github/workflows/ci.yml`).  The native backend is
 validated by *differential testing*:
 the same program is run on the interpreter and on the compiled binary, and their
@@ -330,9 +330,25 @@ runtime's own counters: 368 bytes peak at both 2 000 and 200 000 iterations,
 against 7.3 MB at 20 000 through a function that stores a global and is
 therefore not released.  `ggc native` prints how many functions are covered.
 
+**The native backend emits machine types for the functions it can.**  A
+function whose values are all scalars, that names no container and calls no
+method, is emitted with `int64_t`/`double` slots and the arithmetic inline,
+instead of as a 16-byte tagged union whose operator is selected by comparing the
+operator's name with `strcmp` at run time.  Both emitters stay in the binary --
+`ggc native` prints how many functions get the unboxed one and names the rest --
+and a test builds every program in a corpus both ways and requires the two
+binaries to print the same thing, which is how `not true` returning `true` was
+caught.  Measured on one x86-64 machine, minimum of 5 runs, in one session, and
+recorded with its conditions in [`docs/COMPARISON.md`](docs/COMPARISON.md): a
+30-million-iteration integer loop went from 1046.97 ms to 20.75 ms (C with
+`gcc -O2`: 1.63 ms), a call-heavy workload from 2462.08 ms to 78.65 ms (C:
+61.12 ms), and an allocation-heavy one did not change, because the function
+holding the loop uses `Text` and is not eligible.
+
 **No performance claim** is made anywhere.  `ggc bench` measures and reports the
 conditions of the measurement, and refuses to compare two runs whose conditions
-differ.
+differ, and every number above is a measurement of three programs on one machine
+rather than a property of the compiler.
 
 For the honest list of what this toolchain is *not* -- the defects found by
 auditing it, the specification surface that is still missing, and the process
@@ -591,7 +607,7 @@ compiler/gamag/
 tools/bin/{ggc,ggtest}                     entry points
 examples/core/                             eight core programs
 examples/                                  eight v0.1 programs
-tests/                                     548 tests
+tests/                                     591 tests
 docs/DESIGN_v0_4.md                        the memory, capability and recovery
                                            models, and what each one proves
 docs/DESIGN_v0_3.md                        the native IR, the five graphs, and
@@ -601,6 +617,8 @@ docs/DESIGN_v0_2.md                        the language design, and the first
 docs/IMPLEMENTATION.md                     honest status, section by section
 docs/SPEC_DECISIONS.md                     what the specification left
                                            open, and what was decided
+docs/COMPARISON.md                         what compiling to native code
+                                           bought, measured, before and after
 ```
 
 ## Layout of the tests

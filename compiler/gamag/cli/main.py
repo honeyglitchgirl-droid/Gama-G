@@ -856,6 +856,20 @@ def cmd_native(args: argparse.Namespace) -> int:
                 print("    not released (may hand a value on): "
                       + ", ".join(f"`{n}`" for n in held[:6])
                       + ("..." if len(held) > 6 else ""))
+            # And how much of it keeps its values in registers rather than in
+            # tagged unions.  Same reasoning: it is a property of the program
+            # that a reader should see rather than infer, and it is measured,
+            # not claimed.
+            plan = cgen.scalar_plan(compilation.program)
+            print(f"  unboxed: {len(plan)} of {total} function(s) are emitted "
+                  f"with machine types")
+            if len(plan) < total:
+                boxed = [n for n in compilation.program.functions
+                         if n not in plan]
+                print("    boxed (uses a value this emitter cannot keep in a "
+                      "register): "
+                      + ", ".join(f"`{n}`" for n in boxed[:6])
+                      + ("..." if len(boxed) > 6 else ""))
         if not result.ok:
             failed = True
     return EXIT_COMPILE if failed else EXIT_OK

@@ -269,6 +269,194 @@ def release_coverage(program: GProgram) -> Tuple[List[str], int]:
 
 
 # ---------------------------------------------------------------------------
+# Scalar specialization
+# ---------------------------------------------------------------------------
+
+#: C type for each scalar Gama-G type the specialized path can carry.  `Unit`
+#: is here because a calling builtin writes one: `print` produces no value, but
+#: the instruction still has a destination slot, and refusing the whole
+#: function over an empty placeholder would exclude almost every program.
+#: Nothing reads such a slot, so its C type is a placeholder.
+_SCALAR_C = {T.IntType: "int64_t", T.FloatType: "double", T.BoolType: "int",
+             T.UnitType: "int"}
+
+#: Return types that may come back unboxed.  `UnitType` maps to C `void`.
+_SCALAR_RET = {T.IntType: "int64_t", T.FloatType: "double", T.BoolType: "int",
+               T.UnitType: None}
+
+#: Operators the specialized path emits directly.  `**` is absent on purpose:
+#: its integer form can produce a *float* for a negative exponent, so a result
+#: whose C type is `int64_t` would be a lie.  Excluding it costs one operation
+#: and removes a whole class of mismatch.
+_SCALAR_BINOPS = frozenset({"+", "-", "*", "/", "%",
+                            "==", "!=", "<", ">", "<=", ">="})
+_SCALAR_UNOPS = frozenset({"-", "+", "!", "not"})
+
+#: Operations the specialized path knows how to emit.  Anything else -- a
+#: builtin, a container, a field access -- makes the function ineligible.
+_SCALAR_OPS = frozenset({Op.CONST, Op.COPY, Op.BINOP, Op.UNOP, Op.JUMP,
+                         Op.JUMP_IF, Op.RETURN, Op.CALL, Op.BUILTIN})
+
+#: Builtins the specialized path emits by boxing their arguments at the call.
+#: All four return `Unit`, so nothing has to be unboxed on the way back --
+#: which is the point: `print` at the end of a function must not cost that
+#: function its unboxed loop, and a function that could not contain a builtin
+#: at all would exclude almost every real program.
+_SCALAR_BUILTINS = {
+    "print": "g_println_n", "println": "g_println_n",
+    "print_raw": "g_print_raw_n", "eprint": "g_eprint_n",
+}
+
+
+def _scalar_kind(type_: Any) -> Optional[str]:
+    """``"int"``, ``"float"``, ``"bool"`` or None when not a scalar."""
+    if isinstance(type_, T.IntType):
+        return "int"
+    if isinstance(type_, T.FloatType):
+        return "float"
+    if isinstance(type_, T.BoolType):
+        return "bool"
+    return None
+
+
+def _const_kind(value: Any) -> Optional[str]:
+    if isinstance(value, bool):
+        return "bool"
+    if isinstance(value, int):
+        return "int"
+    if isinstance(value, float):
+        return "float"
+    return None
+
+
+def scalar_plan(program: GProgram) -> Dict[str, Dict[str, Any]]:
+    """Which functions can be emitted unboxed, and with what C types.
+
+    A function qualifies when every value it keeps in a slot is a scalar
+    (`I64`, `F64`, `Bool`, or a `Unit` placeholder), every operation in it is
+    one the specialized path can emit, and every non-builtin operand is a slot
+    or a scalar constant.  A function that calls another function is eligible
+    only when *that* function is, which is why this is a fixpoint: a direct C
+    call is what makes the specialization pay, and passing a boxed value
+    through it would not compile.
+
+    Two things that read as exceptions and are not.  A `Unit` slot is a
+    placeholder a calling builtin writes and nothing reads, so it is carried
+    rather than refused -- refusing it would exclude every function that prints
+    anything.  And a global may be *read* as an argument to a builtin, which is
+    what `print(label, x)` does: the global stays a boxed `GValue` and is handed
+    to a boxed call, so it never enters an unboxed computation.  What is refused
+    is a global anywhere else -- as an operand of arithmetic, or in `STORE_GLOBAL`,
+    which is not an operation this emitter has at all.
+
+    Nothing here changes which programs compile.  It decides how their
+    functions are written, and every program keeps working -- the functions
+    that do not qualify are emitted exactly as before.
+    """
+    # A derived name must not collide with a real one: a program is free to
+    # define `add_s` next to `add`, and `_c_ident` maps separators and
+    # underscores alike to `_`, so the body of one can be named after the
+    # other.  Blocked functions are excluded *before* the fixpoint rather than
+    # dropped after it, because a function that stayed specialized while its
+    # callee was removed would emit a call to a C function that does not exist.
+    generic = {CGenerator._fn(n) for n in program.functions}
+    seen: Dict[str, int] = {}
+    for fn_name in program.functions:
+        symbol = CGenerator._scalar_fn(fn_name)
+        seen[symbol] = seen.get(symbol, 0) + 1
+    blocked = {n for n in program.functions
+               if CGenerator._scalar_fn(n) in generic or seen[CGenerator._scalar_fn(n)] > 1}
+
+    plan: Dict[str, Dict[str, Any]] = {}
+    for name, fn in program.functions.items():
+        if name in blocked:
+            continue
+        if not isinstance(fn.ret, tuple(_SCALAR_RET)):
+            continue
+        slots: Dict[int, str] = {}
+        ok = True
+        for index, slot in enumerate(fn.slots):
+            if isinstance(slot.type, T.UnitType):
+                slots[index] = "unit"        # a placeholder, never read
+                continue
+            kind = _scalar_kind(slot.type)
+            if kind is None:
+                ok = False
+                break
+            slots[index] = kind
+        if not ok:
+            continue
+        calls: List[str] = []
+        for block in fn.blocks:
+            for instr in block.instrs:
+                if instr.op not in _SCALAR_OPS:
+                    ok = False
+                    break
+                if instr.op == Op.BINOP and \
+                        str(instr.meta.get("operator", "")) not in _SCALAR_BINOPS:
+                    ok = False
+                    break
+                if instr.op == Op.UNOP and \
+                        str(instr.meta.get("operator", "")) not in _SCALAR_UNOPS:
+                    ok = False
+                    break
+                if instr.op != Op.BUILTIN and not (
+                        instr.op == Op.RETURN and isinstance(fn.ret, T.UnitType)):
+                    # A constant the scalar path has no C form for -- a text
+                    # literal is the one that actually occurs, in `print("x")`
+                    # -- can only be handed to a builtin, which boxes its
+                    # arguments.  Anywhere else it would have no expression.
+                    # A global or builtin operand has no native form either.
+                    #
+                    # A `return` in a function that returns nothing carries a
+                    # unit placeholder instead of a value; the return branch
+                    # never looks at it, so it is exempt.  Exempting it is the
+                    # difference between this rule accepting a `while` loop
+                    # that ends in a bare `return` and refusing every function
+                    # that has one.
+                    for operand in instr.args:
+                        if operand.kind == "const":
+                            if _const_kind(operand.value) is None:
+                                ok = False
+                                break
+                        elif operand.kind != "slot":
+                            ok = False
+                            break
+                    if not ok:
+                        break
+                if instr.op == Op.CALL:
+                    calls.append(str(instr.meta.get("callee", "")))
+                if instr.op == Op.BUILTIN:
+                    # Only the calls that return nothing qualify: a builtin
+                    # whose result is a `GValue` would have to be unboxed, and
+                    # unboxing cannot be assumed to succeed.
+                    bname = str(instr.meta.get("name", ""))
+                    if bname not in _SCALAR_BUILTINS \
+                            or not isinstance(instr.type, T.UnitType):
+                        ok = False
+                        break
+            if not ok:
+                break
+        if not ok:
+            continue
+        plan[name] = {"slots": slots, "calls": calls,
+                      "ret": _SCALAR_RET[type(fn.ret)]}
+
+    # Fixpoint: a specialized function may only call specialized functions,
+    # because the call is emitted as a direct C call with native arguments.
+    changed = True
+    while changed:
+        changed = False
+        for name in list(plan):
+            for callee in plan[name]["calls"]:
+                if callee not in plan:
+                    del plan[name]
+                    changed = True
+                    break
+    return plan
+
+
+# ---------------------------------------------------------------------------
 # Emission
 # ---------------------------------------------------------------------------
 
@@ -311,6 +499,17 @@ class CGenerator:
         self.lines: List[str] = []
         self.globals: Dict[str, Any] = {}
         self.entry = entry or pick_entry(program)
+        #: Functions emitted unboxed, with the C kind of each of their slots.
+        #: Decided once, before anything is emitted, so the prototype and the
+        #: body can never disagree about a signature.
+        self.plan = scalar_plan(program)
+        #: Specialized functions whose boxed wrapper something plain calls.
+        #: Everything else gets `G_MAYBE_UNUSED`: the wrapper has to exist so
+        #: the two emitters can always talk to each other, but a leaf helper
+        #: called only from specialized code leaves it unreferenced, and
+        #: `-Wall -Wextra` reports that as a defect in the emitted program.
+        self._wrapper_referenced = self._called_from_plain_code()
+        self._releasing = False
 
     def _declare_authority(self) -> None:
         """The capabilities the program *asks* for, as data.
@@ -349,7 +548,10 @@ class CGenerator:
         self._declare_authority()
         self._declare_globals()
         for name, fn in self.program.functions.items():
-            self.emit(self._signature(name, fn) + ";")
+            # A specialized function needs two prototypes, so a signature may
+            # be more than one line; each one is terminated on its own.
+            for line in self._signature(name, fn).splitlines():
+                self.emit(line + ";")
         self.emit()
         self.emit("int main(int argc, char **argv)")
         self.emit("{")
@@ -417,6 +619,18 @@ class CGenerator:
             self.emit()
 
     @staticmethod
+    def _scalar_fn(name: str) -> str:
+        """A C name for the *unboxed body* of a specialized function.
+
+        The generic name belongs to the boxed wrapper, because that is the name
+        every non-specialized call site already uses and the name `g_main` calls
+        the entry point by.  Specialized callers use this one, which keeps the
+        two ABIs from ever being confused for each other.  `scalar_plan` drops
+        any function whose derived name would collide with a real one.
+        """
+        return "gf_" + _c_ident(name) + "_s"
+
+    @staticmethod
     def _fn(name: str) -> str:
         """A C name for a Gama-G function.
 
@@ -439,13 +653,59 @@ class CGenerator:
         return out
 
     def _signature(self, name: str, fn: GFunction) -> str:
+        plan = self.plan.get(name)
+        if plan is not None:
+            # Two declarations, deliberately: the wrapper under the generic name
+            # so unspecialized callers keep working, then the body.
+            return "\n".join([self._generic_signature(name, fn),
+                              self._scalar_signature(name, fn, plan)])
         params = fn.param_names or []
         args = ", ".join(f"GValue {_c_ident(p)}" for p in params) or "void"
         return f"static GValue {self._fn(name)}({args})"
 
+    def _called_from_plain_code(self) -> set:
+        """Names a function that a *non*-specialized function calls.
+
+        Plus the two the entry stub calls, which is a call site like any other
+        except that it exists for every program.
+        """
+        needed = {self.entry}
+        initializer = self.program.entry or "<main>"
+        if initializer in self.program.functions and initializer != self.entry:
+            needed.add(initializer)
+        for name, fn in self.program.functions.items():
+            if name in self.plan:
+                continue
+            for block in fn.blocks:
+                for instr in block.instrs:
+                    if instr.op == Op.CALL:
+                        needed.add(str(instr.meta.get("callee", "")))
+        return needed
+
+    def _generic_signature(self, name: str, fn: GFunction) -> str:
+        """The boxed prototype: `GValue` in, `GValue` out."""
+        params = fn.param_names or []
+        args = ", ".join(f"GValue {_c_ident(p)}" for p in params) or "void"
+        marker = "" if name in self._wrapper_referenced else "G_MAYBE_UNUSED "
+        return f"static {marker}GValue {self._fn(name)}({args})"
+
+    def _scalar_signature(self, name: str, fn: GFunction,
+                          plan: Dict[str, Any]) -> str:
+        """The unboxed signature: scalars in, a scalar (or `void`) out."""
+        params = fn.param_names or []
+        args = ", ".join(
+            f"{_SCALAR_C[type(fn.slots[i].type)]} {_c_ident(p)}"
+            for i, p in enumerate(params)) or "void"
+        ret = plan["ret"] or "void"
+        return f"static {ret} {self._scalar_fn(name)}({args})"
+
     # ---- one function --------------------------------------------
 
     def _function(self, name: str, fn: GFunction) -> None:
+        if name in self.plan:
+            self._scalar_wrapper(name, fn, self.plan[name])
+            self._function_scalar(name, fn, self.plan[name])
+            return
         self.emit(self._signature(name, fn))
         self.emit("{")
         slots = fn.slots
@@ -482,6 +742,326 @@ class CGenerator:
                   f"\"control fell off the end of `{name}`\");")
         self.emit("}")
         self.emit()
+
+    # ---- one function, unboxed -------------------------------------
+
+    def _scalar_wrapper(self, name: str, fn: GFunction,
+                        plan: Dict[str, Any]) -> None:
+        """The boxed entry point of a specialized function.
+
+        A specialized body speaks in machine types; a caller that was not
+        specialized -- `main`, or any function the plan had to refuse -- speaks
+        in `GValue`.  This is the one place the two meet: arguments are
+        unboxed going in, the result is boxed coming out, and everything
+        between stays unboxed.  Skipping the wrapper is what made a specialized
+        callee receive and return `GValue`s at a `int64_t` prototype, which the
+        C compiler rejected outright; the alternative of refusing to
+        specialize anything a plain function calls would have given up the
+        optimization for every program with a helper in it.
+        """
+        params = list(fn.param_names or [])
+        box = {T.IntType: ("g_unbox_i64", "g_int"),
+               T.FloatType: ("g_unbox_f64", "g_float"),
+               T.BoolType: ("g_unbox_bool", "g_bool")}
+        self.emit(self._generic_signature(name, fn))
+        self.emit("{")
+        args = []
+        for index, param in enumerate(params):
+            open_fn, _ = box[type(fn.slots[index].type)]
+            ident = _c_ident(param)
+            args.append(f"{open_fn}({ident}, {_c_string(name)}, "
+                        f"{_c_string(param)})")
+        call = f"{self._scalar_fn(name)}({', '.join(args)})"
+        ret = plan["ret"]
+        if ret is None:
+            self.emit(f"    {call};")
+            self.emit("    return g_unit();")
+        else:
+            closer = {"int64_t": "g_int", "double": "g_float",
+                      "int": "g_bool"}[ret]
+            self.emit(f"    return {closer}({call});")
+        self.emit("}")
+        self.emit()
+
+    def _function_scalar(self, name: str, fn: GFunction,
+                         plan: Dict[str, Any]) -> None:
+        """Emit a function whose values stay in machine registers.
+
+        The C type of every slot is known before emission, so no value is
+        boxed, no operator is looked up by name at run time, and no temporary
+        is copied through a tagged union.  Semantics are unchanged: the
+        overflow, division and range faults come from the same helpers the
+        generic path uses.
+        """
+        self.emit(self._scalar_signature(name, fn, plan))
+        self.emit("{")
+        slots: Dict[int, str] = plan["slots"]
+        params = list(fn.param_names or [])
+        decls: List[str] = []
+        for index in range(len(fn.slots)):
+            ctype = _SCALAR_C[type(fn.slots[index].type)]
+            if index < len(params):
+                decls.append(f"    {ctype} s{index} = "
+                             f"({ctype}){_c_ident(params[index])};")
+            else:
+                decls.append(f"    {ctype} s{index} = 0; (void)s{index};")
+        self.emit("\n".join(decls))
+        self.emit()
+
+        # The release path works on the boxed arena, which a specialized body
+        # does not have, so it is off here.  `_function` sets this flag for
+        # every function it emits, so leaving it set is not a state leak.
+        self._releasing = False
+        targets = self._jump_targets(fn)
+        for block in fn.blocks:
+            if block.id in targets:
+                self.emit(f"  {block.id}: ;")
+            for instr in block.instrs:
+                self._instr_scalar(instr, fn, plan)
+        if plan["ret"] is None:
+            self.emit("    return;")
+        else:
+            self.emit(f"    return ({plan['ret']})0;"
+                      " /* unreachable: every path returned */")
+        self.emit("}")
+        self.emit()
+
+    # ---- the unboxed instruction set -------------------------------
+    #
+    # Nothing in this section calls `_instr`, `_store`, `_operand` or
+    # `_builtin`, and nothing in the generic emitter calls anything here: the
+    # two emitters are kept apart by the branch in `_function`, not by a flag.
+    # The one crossing is `_box`, which hands a constant it has no native form
+    # for back to `_operand` -- a constant is the same expression either way.
+
+    def _slot_kind(self, op: Operand, plan: Dict[str, Any]) -> Optional[str]:
+        if op.kind == "slot":
+            return plan["slots"].get(op.index)
+        if op.kind == "const":
+            return _const_kind(op.value)
+        return None
+
+    def _scalar_operand(self, op: Operand, plan: Dict[str, Any]) -> str:
+        """The C expression for an operand, in its native type."""
+        kind = self._slot_kind(op, plan)
+        if op.kind == "slot":
+            return f"s{op.index}"
+        if op.kind == "const":
+            return self._scalar_const(op.value, kind)
+        return "0"
+
+    def _scalar_const(self, value: Any, kind: Optional[str]) -> str:
+        if kind == "bool":
+            return "1" if value else "0"
+        if kind == "int":
+            if value >= 2 ** 63 or value < -(2 ** 63):
+                return "0 /* constant does not fit in I64 */"
+            if value == -(2 ** 63):
+                return "(-9223372036854775807LL - 1)"
+            return f"({value}LL)"
+        if kind == "float":
+            return f"({_c_float(value)})"
+        return "0"
+
+    def _box(self, operands: Sequence[Operand], plan: Dict[str, Any]) -> str:
+        """Box a native scalar into a `GValue`, once, at a call boundary."""
+        out = []
+        for operand in operands:
+            kind = self._slot_kind(operand, plan)
+            if kind is None:
+                # Only reachable for a constant handed to a builtin -- a text
+                # literal.  `_operand` already produces it as a `GValue`, and a
+                # constant costs nothing at run time either way.
+                out.append(self._operand(operand))
+                continue
+            box = {"int": "g_int", "float": "g_float", "bool": "g_bool"}[kind]
+            out.append(f"{box}({self._scalar_operand(operand, plan)})")
+        return ", ".join(out)
+
+    def _as_double(self, expr: str, kind: Optional[str]) -> str:
+        """Python's arithmetic promotes an int to float against a float."""
+        return expr if kind == "float" else f"(double)({expr})"
+
+    def _scalar_expr(self, instr: Instr, plan: Dict[str, Any],
+                     pos: str) -> str:
+        """The C expression for a BINOP or UNOP, with the same semantics."""
+        operator = str(instr.meta.get("operator", ""))
+        if instr.op == Op.UNOP:
+            operand = instr.args[0]
+            expr = self._scalar_operand(operand, plan)
+            kind = self._slot_kind(operand, plan)
+            if operator in ("!", "not"):
+                # `g_unop` defines `not` by truthiness, and every kind the plan
+                # admits (`I64`, `F64`, `Bool`) has C's own truthiness: zero is
+                # false, and a NaN is *not* zero, so `!NaN` is false -- which is
+                # what `g_truthy` says too.  This used to return the constant 1
+                # whenever the operand was a Bool, which made `not true` true;
+                # the differential harness caught it, the test suite did not.
+                return f"(!({expr}))"
+            if operator == "+":
+                return expr
+            if kind == "int":
+                return f"g_ineg({expr}, {pos})"
+            return f"(-({expr}))"
+
+        a, b = instr.args[0], instr.args[1]
+        ea = self._scalar_operand(a, plan)
+        eb = self._scalar_operand(b, plan)
+        ka = self._slot_kind(a, plan)
+        kb = self._slot_kind(b, plan)
+        both_int = ka == "int" and kb == "int"
+        both_same_scalar = ka == kb and ka in ("int", "float", "bool")
+
+        if operator in ("==", "!="):
+            # `g_equal`: ints compare exactly, a float against an int compares
+            # by value after conversion, and two Bools compare as Bools.
+            if both_int or both_same_scalar:
+                return f"(({ea}) {operator} ({eb}))"
+            da, db = self._as_double(ea, ka), self._as_double(eb, kb)
+            return f"(({da}) {operator} ({db}))"
+
+        if operator in ("<", ">", "<=", ">="):
+            # `g_compare` compares int against int as integers, precisely
+            # because going through double would lose precision above 2^53.
+            if both_int:
+                return f"(({ea}) {operator} ({eb}))"
+            da, db = self._as_double(ea, ka), self._as_double(eb, kb)
+            return f"(({da}) {operator} ({db}))"
+
+        if operator in ("+", "-", "*"):
+            if both_int:
+                helper = {"+": "g_iadd", "-": "g_isub", "*": "g_imul"}[operator]
+                return f"{helper}({ea}, {eb}, {pos})"
+            da, db = self._as_double(ea, ka), self._as_double(eb, kb)
+            return f"(({da}) {operator} ({db}))"
+
+        if operator == "/":
+            if both_int:
+                return f"g_idiv({ea}, {eb}, {pos})"
+            # A mixed division still computes in double, but which helper is
+            # called decides how a division by zero *names its operands*:
+            # `1 / 0.0` and `1.0 / 0` are not the same message.
+            if ka == "int":
+                return f"g_fdiv_i_f({ea}, {eb}, {pos})"
+            if kb == "int":
+                return f"g_fdiv_f_i({ea}, {eb}, {pos})"
+            return f"g_fdiv_f_f({ea}, {eb}, {pos})"
+
+        if operator == "%":
+            if both_int:
+                return f"g_imod({ea}, {eb}, {pos})"
+            da, db = self._as_double(ea, ka), self._as_double(eb, kb)
+            return f"g_fmod({da}, {db}, {pos})"
+
+        # `scalar_plan` admits only the operators handled above.
+        raise AssertionError(f"no scalar emission for operator {operator!r}")
+
+    def _scalar_store(self, instr: Instr, fn: GFunction, expr: str,
+                      plan: Dict[str, Any], pos: str) -> None:
+        """Assign to a slot, with the range check the boxed path applies."""
+        if instr.dst < 0:
+            self.emit(f"    (void)({expr});")
+            return
+        slot = fn.slots[instr.dst]
+        ctype = _SCALAR_C[type(slot.type)]
+        if isinstance(slot.type, T.IntType):
+            lo, hi = slot.type.range
+            if lo != -(2 ** 63) or hi != 2 ** 63 - 1:
+                # `g_store_int` raises IntegerOverflow outside the declared
+                # range; a narrower type still has to, even unboxed.
+                self.emit(f"    {{ int64_t v_ = (int64_t)({expr});")
+                self.emit(f"      if (v_ < {lo}LL || v_ > {hi}LL) "
+                          f"g_raise(\"IntegerOverflow\", {pos}, "
+                          f"\"value %lld does not fit in %s (range %lld to "
+                          f"%lld)\", (long long)v_, "
+                          f"{_c_string(slot.type.render())}, {lo}LL, {hi}LL);")
+                self.emit(f"      {('s' + str(instr.dst))} = v_; }}")
+                return
+        self.emit(f"    s{instr.dst} = ({ctype})({expr});")
+
+    def _instr_scalar(self, instr: Instr, fn: GFunction,
+                      plan: Dict[str, Any]) -> None:
+        pos = _c_string(_pos_of(instr))
+        op = instr.op
+        if op == Op.CONST:
+            value = instr.args[0].value
+            if instr.dst >= 0:
+                kind = _scalar_kind(fn.slots[instr.dst].type)
+                self._scalar_store(instr, fn,
+                                   self._scalar_const(value, kind), plan, pos)
+            return
+        if op == Op.COPY:
+            self._scalar_store(instr, fn,
+                               self._scalar_operand(instr.args[0], plan),
+                               plan, pos)
+            return
+        if op in (Op.BINOP, Op.UNOP):
+            self._scalar_store(instr, fn, self._scalar_expr(instr, plan, pos),
+                               plan, pos)
+            return
+        if op == Op.JUMP:
+            self.emit(f"    goto {instr.meta.get('target', '')};")
+            return
+        if op == Op.JUMP_IF:
+            condition = instr.args[0]
+            expr = self._scalar_operand(condition, plan)
+            kind = self._slot_kind(condition, plan)
+            # `g_truthy` for the three scalar tags: a Bool is itself, an Int is
+            # non-zero, a Float is non-zero (NaN is truthy, as in the runtime).
+            test = expr if kind == "bool" else f"({expr}) != 0"
+            self.emit(f"    if ({test}) goto {instr.meta.get('target', '')};")
+            self.emit(f"    goto {instr.meta.get('target_false', '')};")
+            return
+        if op == Op.CALL:
+            label = str(instr.meta.get("callee", ""))
+            callee = self._scalar_fn(label)
+            args = ", ".join(self._scalar_operand(a, plan) for a in instr.args)
+            call = f"{callee}({args})"
+            # Whether the result has to be kept is a property of the *callee*,
+            # not of the function making the call: `main` returns nothing and
+            # still has to add up what `steps` hands back.  Testing the
+            # caller's own return type here dropped every such result and left
+            # the destination slot at its zero initializer -- which is exactly
+            # what a wrong answer of 0 looks like.
+            callee_plan = self.plan.get(label)
+            returns_value = callee_plan is None or callee_plan["ret"] is not None
+            if returns_value:
+                self._scalar_store(instr, fn, call, plan, pos)
+            else:
+                self.emit(f"    {call};")
+            return
+        if op == Op.BUILTIN:
+            name = str(instr.meta.get("name", ""))
+            target = _SCALAR_BUILTINS[name]
+            args = self._box(instr.args, plan)
+            if args:
+                self.emit(f"    {target}({len(instr.args)}, "
+                          f"(const GValue[]){{{args}}});")
+            else:
+                self.emit(f"    {target}(0, NULL);")
+            return
+        if op == Op.RETURN:
+            if plan["ret"] is None:
+                self.emit("    return;")
+                return
+            expr = (self._scalar_operand(instr.args[0], plan)
+                    if instr.args else "0")
+            ctype = plan["ret"]
+            if isinstance(fn.ret, T.IntType):
+                lo, hi = fn.ret.range
+                if lo != -(2 ** 63) or hi != 2 ** 63 - 1:
+                    self.emit(f"    {{ int64_t v_ = (int64_t)({expr});")
+                    self.emit(f"      if (v_ < {lo}LL || v_ > {hi}LL) "
+                              f"g_raise(\"IntegerOverflow\", {pos}, "
+                              f"\"`%s` returned %lld, which does not fit in "
+                              f"%s\", {_c_string(fn.name)}, "
+                              f"(long long)v_, "
+                              f"{_c_string(fn.ret.render())});")
+                    self.emit("      return v_; }")
+                    return
+            self.emit(f"    return ({ctype})({expr});")
+            return
+        raise AssertionError(f"no scalar emission for op {op}")
 
     # ---- operands -------------------------------------------------
 

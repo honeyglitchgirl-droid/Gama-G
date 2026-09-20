@@ -93,7 +93,7 @@ Every row names the evidence, because a feature list without one is a wish.
 
 | Area | Where | How it is checked |
 |---|---|---|
-| Language surface | `parser.py`, `core/parser.py` | 548 tests; the spec vocabulary tests read the specification's own enumerations at run time |
+| Language surface | `parser.py`, `core/parser.py` | 591 tests; the spec vocabulary tests read the specification's own enumerations at run time |
 | Types | `semantic/checker.py` | spec types 208-236, each inhabited by a compiling program |
 | Effects | `semantic/checker.py` | declared-versus-inferred comparison; `unsafe` is a declared effect |
 | Capabilities | `capabilities.py` | one algebra shared by compiler and runtime; attenuation only |
@@ -302,7 +302,7 @@ something.
 ./tools/bin/ggc difftest examples/hello.gg     # interpreter vs native
 ./tools/bin/ggc fuzz --rounds 500              # try to break it
 python3 tools/fuzz_selfcheck.py                # prove the fuzzer can fail
-python3 -m unittest discover -s tests -t tests # 548 tests
+python3 -m unittest discover -s tests -t tests # 591 tests
 ./tools/bin/ggc manifest examples/hello.gg --check-reproducible 3
 ./tools/bin/ggc bench examples/hello.gg --repeats 20
 ./tools/bin/ggc device                         # is there an accelerator? no

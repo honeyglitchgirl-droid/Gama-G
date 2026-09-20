@@ -674,6 +674,22 @@ static void too_big(const char *pos)
             "does not fit; the reference interpreter computes it exactly");
 }
 
+/* The scalar-specialized path calls these rather than repeating the messages,
+ * so the two paths raise the same fault with the same text by construction
+ * instead of by inspection. */
+void g_int_overflow(const char *pos) { too_big(pos); }
+
+void g_zero_division(const char *pos, const char *what)
+{
+    g_raise("DivideByZero", pos, "%s", what);
+}
+
+void g_div_zero_values(const char *pos, GValue a, GValue b)
+{
+    g_raise("DivideByZero", pos, "division by zero: %s / %s",
+            g_display(a, 0), g_display(b, 0));
+}
+
 static GValue num_binop(const char *op, GValue a, GValue b, const char *pos)
 {
     int both_int = (a.tag == GV_INT && b.tag == GV_INT);
@@ -696,8 +712,7 @@ static GValue num_binop(const char *op, GValue a, GValue b, const char *pos)
 
     if (!strcmp(op, "/")) {
         if ((both_int && b.u.i == 0) || (!both_int && (b.tag == GV_INT ? b.u.i : b.u.f) == 0))
-            g_raise("DivideByZero", pos, "division by zero: %s / %s",
-                    g_display(a, 0), g_display(b, 0));
+            g_div_zero_values(pos, a, b);
         if (both_int) {
             if (b.u.i == 0) g_raise("DivideByZero", pos, "division by zero");
             /* INT64_MIN / -1 overflows; Python would give 9223372036854775808. */
