@@ -150,13 +150,17 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           tag="${{ inputs.tag || github.ref_name }}"
+          # The conformance report goes on the release, not just into the
+          # workflow's artifacts: an artifact expires, and the whole point of
+          # the report is that the answer travels with the files it is about.
+          assets="downloaded/distributions/* downloaded/conformance/*"
           if gh release view "$tag" >/dev/null 2>&1; then
             # A re-run of an existing tag replaces the files rather than
             # failing, so a release can be corrected without deleting it.
-            gh release upload "$tag" downloaded/distributions/* --clobber
+            gh release upload "$tag" $assets --clobber
           else
             gh release create "$tag" \
               --title "Gama-G $(cat VERSION)" \
               --notes-file release-notes.md \
-              downloaded/distributions/*
+              $assets
           fi

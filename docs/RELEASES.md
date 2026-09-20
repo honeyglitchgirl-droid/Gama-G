@@ -100,7 +100,12 @@ that list, so a user can see the distance rather than infer it.
   moves to Beta, this section changes to say what the cycle is.
 * **Binaries are not reproducible bit-for-bit.**  The *manifests* are
   reproducible and are checked to be; a rebuild on another machine with another
-  C compiler is not claimed to produce an identical binary.
+  C compiler is not claimed to produce an identical binary.  The digest covers
+  the compiler's version, its own interpreter version and the platform, so the
+  same source built by a different Python has a different digest -- the claim
+  is that one build reproduces, not that different builds agree.  That is why
+  the digest in the release notes and the digest of a local build of the same
+  file do not match, and why neither is the file's hash: `program_sha256` is.
 
 ## 5. Cutting a release
 

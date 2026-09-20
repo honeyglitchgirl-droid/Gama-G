@@ -16,7 +16,7 @@ nowhere outside this file.  What follows is where it lacks.
 ## 1. What is built
 
 All eleven remaining audit priorities (P3 - P16) plus the version merge: one
-language, one pipeline, four ways to run it, 641 tests and a conformance suite
+language, one pipeline, four ways to run it, 642 tests and a conformance suite
 that checks the toolchain against the specification document rather than
 against itself.  The native CPU backend
 emits C and compiles it; the WebAssembly encoder emits a module; the
@@ -188,15 +188,17 @@ one is already stated in `docs/DESIGN_v1_0.md` section 5.
   a checked-in benchmark set that runs the same way on another machine, so
   section 33 item 14 is answered `partial` and `ggc conform --strict` lists it.
   A number in a document is not a baseline.
-- **Releases exist; versioned artifacts still do not.**  `VERSION`,
-  `pyproject.toml` and the package agree on 1.2.0, and
-  `.github/workflows/release.yml` builds a wheel, checks it installs and
-  compiles a native program, attaches a reproducible signed manifest and
-  checksums, and refuses to publish if the tag disagrees with `VERSION` or if a
-  conformance claim fails.  What has not happened is a tag: no `v1.2.0` exists,
-  so nothing has been through that path.  The metadata bar for leaving Alpha is
-  stated in `docs/RELEASES.md` and is the same command as everything else --
-  `ggc conform --strict` -- which currently lists 13 things.
+- **There is a release, and it is Alpha.**  `v1.2.0` is tagged and published
+  from `78e8a51`, with the wheel, source distribution, a reproducible build
+  manifest, checksums, and the conformance report and `--strict` list attached.
+  The digest of the manifest was `ecd0e756b5097f80b95d825c946368d039a02814de372c591d7a48b6ed40ab40`
+  on the runner and the manifest is `signed: no`, because the repository has no
+  `RELEASE_SIGNING_KEY`; the release notes say exactly that rather than
+  implying provenance.  The metadata bar for leaving Alpha is stated in
+  `docs/RELEASES.md` and is the same command as everything else --
+  `ggc conform --strict` -- which currently lists 13 things.  So the release
+  exists, and it says it is not production grade, which is the arrangement
+  spec section 43 asks for.
 
 ---
 
@@ -219,10 +221,11 @@ In rough order of return on effort:
    someone who did not write it.
 5. Constant-time crypto, or removal of crypto from the shipped surface.
 6. A published benchmark suite, not just published measurements.
-7. ~~Releases, and the metadata to match~~ -- **the path is built and the
-   metadata agrees** (`VERSION` = 1.2.0 everywhere, `docs/RELEASES.md` states
-   the bar).  Nothing has been tagged yet, so the path has never run for real;
-   the first tag is what converts it from a promise into a mechanism.
+7. ~~Releases, and the metadata to match~~ -- **done**: `v1.2.0` is published
+   with its conformance report attached, and a release now has to pass the
+   suite, the tag check and the conformance suite before it can exist.  What
+   remains is signing: the manifest is reproducible but `signed: no` until a
+   `RELEASE_SIGNING_KEY` secret is added, and `docs/RELEASES.md` says how.
 
 None of that is a weekend.  Naming it is the point: the toolchain is honest
 about its edges, and this file is how that honesty is kept checkable.
@@ -232,7 +235,7 @@ about its edges, and this file is how that honesty is kept checkable.
 ## 6. How to check any of this yourself
 
 ```
-python -m unittest discover -s tests -t tests -q      # 641 tests
+python -m unittest discover -s tests -t tests -q      # 642 tests
 python tools/fuzz_selfcheck.py                        # the checks can fail
 ./tools/bin/ggc difftest examples/*.gg examples/core/*.gg
 

@@ -269,6 +269,20 @@ class TheWorkflowRunsWhatTheDocumentsSaid(unittest.TestCase):
             self.assertIn(required, used,
                           f"the release notes should be built with {required}")
 
+    def test_the_conformance_report_is_attached_to_the_release(self):
+        """Not only uploaded as a workflow artifact.
+
+        The first version of this workflow left `conformance.json` and
+        `strict.txt` in the run's artifacts, which expire -- while
+        docs/RELEASES.md said they were part of the release.  The release that
+        was published from it had four assets and neither of those, so the
+        point of the suite, that the answer travels with the files it is
+        about, was the one thing it did not do.
+        """
+        self.assertIn("downloaded/conformance/*", self.workflow)
+        publish = self.workflow.split("Create the release")[-1]
+        self.assertIn("downloaded/conformance/*", publish)
+
     def test_a_signing_key_comes_from_a_secret_and_has_no_stand_in(self):
         """No fallback key: an unsigned manifest must be able to stay unsigned."""
         self.assertIn("RELEASE_SIGNING_KEY", self.workflow)
