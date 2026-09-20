@@ -132,6 +132,12 @@ HARD_KEYWORDS = {
 HARD_KEYWORDS["true"] = TokenKind.IDENT
 HARD_KEYWORDS["false"] = TokenKind.IDENT
 HARD_KEYWORDS["none"] = TokenKind.IDENT
+#: The token kinds that only ever appear for a hard keyword.  Used where a
+#: *name* is wanted rather than a keyword: after a `.`, and as a record field.
+#: `consent.grant(...)` is a member access, and a member may be called anything
+#: the module author chose -- including a word that is reserved elsewhere.
+KEYWORD_TOKEN_KINDS = frozenset(HARD_KEYWORDS.values())
+
 HARD_KEYWORD_SET = {"fn", "let", "var", "secret", "if", "else", "match", "for",
                     "in", "while", "return", "break", "continue", "parallel",
                     "and", "or", "not", "import", "grant", "as"}

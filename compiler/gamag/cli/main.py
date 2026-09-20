@@ -224,6 +224,20 @@ def build_parser() -> argparse.ArgumentParser:
                    choices=("interpreter", "native"))
     p.add_argument("-o", "--output", metavar="PATH")
 
+    p = sub.add_parser(
+        "bench",
+        help="measure a program; reports numbers, makes no performance claim")
+    add_common(p)
+    p.add_argument("--repeats", type=int, default=7, metavar="N",
+                   help="how many measured runs after warmup (default: 7)")
+    p.add_argument("--warmup", type=int, default=1, metavar="N",
+                   help="runs to discard first (default: 1); the first run of "
+                        "anything pays costs later runs do not")
+    p.add_argument("--native", action="store_true",
+                   help="measure the native backend instead of the interpreter")
+    p.add_argument("--timeout", type=float, default=300.0, metavar="SECONDS",
+                   help="stop after this long (default: 300)")
+
     p = sub.add_parser("run", help="compile and execute")
     add_common(p)
     p.add_argument("--entry", metavar="NAME", default="main",
@@ -1259,7 +1273,40 @@ def cmd_manifest(args: argparse.Namespace) -> int:
     return exit_code
 
 
+def cmd_bench(args: argparse.Namespace) -> int:
+    """Measure programs and report the numbers with their conditions.
+
+    Spec section 43 forbids performance claims and spec section 22 asks the
+    supervisor to report throughput, latency and tail latency.  This reports;
+    it does not conclude.  The ratio printer refuses to divide two runs whose
+    conditions differ, because that ratio would be a made-up number.
+    """
+    from ..bench import harness
+
+    if not args.files:
+        print("name at least one FILE.gg", file=sys.stderr)
+        return EXIT_USAGE
+
+    options = dict(repeats=max(1, args.repeats), warmup=max(0, args.warmup),
+                   profile=args.profile, opt_level=args.opt,
+                   grants=tuple(args.grant), timeout=args.timeout)
+    if args.native:
+        report = harness.bench_native(args.files, **options)
+    else:
+        report = harness.bench_paths(args.files, **options)
+
+    if args.json:
+        print(json.dumps(report.to_dict(), indent=2))
+    else:
+        for line in report.render():
+            print(line)
+
+    failed = [r for r in report.results if not r.compiled]
+    return EXIT_COMPILE if failed else EXIT_OK
+
+
 COMMANDS = {
+    "bench": cmd_bench,
     "gpm": cmd_gpm,
     "manifest": cmd_manifest,
     "check": cmd_check,

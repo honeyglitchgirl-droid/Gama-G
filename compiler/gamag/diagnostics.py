@@ -255,11 +255,19 @@ class GamaRuntimeFault(Exception):
         message: str,
         pos: Optional[SourcePos] = None,
         context: Optional[dict] = None,
+        hint: Optional[str] = None,
     ):
         self.kind = kind
         self.message = message
         self.pos = pos
-        self.context = context or {}
+        self.context = dict(context or {})
+        # A hint is the fix-it, and it was being written by many builtins and
+        # then dropped on the floor: they pass `hint=` into `**ctx`, which lands
+        # in `context`, and nothing read it back out.  It is lifted here so both
+        # call styles work and the user actually sees it.
+        self.hint = hint or self.context.get("hint") or None
+        if self.hint:
+            self.context.setdefault("hint", self.hint)
         super().__init__(f"{kind}: {message}")
 
     def structured(self) -> dict:

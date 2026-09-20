@@ -9,6 +9,8 @@ it.
 
 from . import library  # noqa: F401  -- owns the builtin registry
 from . import ffi      # noqa: F401  -- spec section 29, audit priority 12
+from . import interop  # noqa: F401  -- spec section 24, audit priority 15
+from . import enterprise  # noqa: F401  -- spec section 25, audit priority 16
 
 # Everything is registered; make the checker's view of module names agree with
 # the registry the builtins actually went into.

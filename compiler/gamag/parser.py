@@ -23,7 +23,8 @@ from . import ast_nodes as A
 from .diagnostics import (Diagnostic, ParseError, Phase, Severity, SourcePos,
                           front_end_code)
 from .lexer import Lexer
-from .tokens import EFFECT_NAMES, Token, TokenKind
+from .tokens import (EFFECT_NAMES, KEYWORD_TOKEN_KINDS, Token,
+                     TokenKind)
 
 DECL_KEYWORDS = {
     "pipeline", "service", "agent", "policy", "transaction", "model",
@@ -1204,7 +1205,12 @@ class Parser:
             if self.at(TokenKind.DOT):
                 self.adv()
                 attr = self.peek()
-                if attr.kind is TokenKind.IDENT:
+                # A member name may be any word, including one reserved
+                # elsewhere: `consent.grant(...)` is a call to a member named
+                # `grant`, and requiring an identifier there made every builtin
+                # whose name collided with a keyword impossible to call.
+                if attr.kind is TokenKind.IDENT \
+                        or attr.kind in KEYWORD_TOKEN_KINDS:
                     self.adv()
                     expr = A.Member(pos=expr.pos, obj=expr, attr=attr.text)
                 elif attr.kind is TokenKind.INT:
@@ -1386,7 +1392,8 @@ class Parser:
         self.end_of_line()
         while not self.at(TokenKind.RBRACE, TokenKind.EOF):
             key_tok = self.peek()
-            if key_tok.kind is not TokenKind.IDENT:
+            if key_tok.kind is not TokenKind.IDENT \
+                    and key_tok.kind not in KEYWORD_TOKEN_KINDS:
                 raise self.error(
                     f"expected a field name but found {key_tok.descr}", key_tok)
             key = self.adv().text

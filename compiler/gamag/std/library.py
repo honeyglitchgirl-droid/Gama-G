@@ -94,16 +94,13 @@ PRELUDE: set = set()
 
 # Modules the specification names but v0.1 does not implement.
 UNIMPLEMENTED_MODULES: Dict[str, str] = {
-    "fhir": "FHIR-compatible serialisation is a library/profile layer (spec 16)",
-    "terminology": "terminology validation requires an external code system",
-    "provenance": "planned for Phase 3 (spec 34)",
-    "consent": "planned for Phase 3 (spec 34)",
-    "database": "requires a native backend and driver model (Phase 3)",
+    # fhir, terminology, provenance and consent were here until audit priority
+    # 15 implemented them in `std/interop.py`, and database, identity, workflow,
+    # messaging and observability until priority 16 implemented them in
+    # `std/enterprise.py`.  A module must not be listed as roadmap once it is
+    # registered, which is what tests/test_spec_vocabulary.py checks.
     "http": "requires NetworkConnect capability plumbing (Phase 3)",
-    "messaging": "planned for Phase 3",
-    "workflow": "planned for Phase 3",
     "transaction": "the `transaction` block form is implemented in-language",
-    "observability": "planned for Phase 3",
     "accelerator": "requires a GPU/accelerator backend (Phase 2/3)",
     "process": "requires ProcessSpawn capability plumbing",
     "concurrency": "structured `parallel` regions are implemented in-language",
