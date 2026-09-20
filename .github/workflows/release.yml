@@ -12,7 +12,8 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "tag to release (must match VERSION)"
+        description: "tag to release (must match VERSION); the tag is checked
+          out and built, so this is also the way to correct a release"
         required: true
 
 permissions:
@@ -23,7 +24,14 @@ jobs:
     name: what this version does and does not evidence
     runs-on: ubuntu-latest
     steps:
+      # `ref` is the tag, not the ref that triggered the run.  On a tag push
+      # the two are the same; on a dispatch for an older tag -- the way a
+      # release is corrected -- they are not, and without this the jobs would
+      # check the branch out, run the suite on it, and attach the result to a
+      # release containing something else.
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
 
       - uses: actions/setup-python@v5
         with:
@@ -31,13 +39,15 @@ jobs:
 
       # The tag is the one thing a person can get wrong by hand, and a release
       # whose tag disagrees with the version inside it is a lie that outlives
-      # everyone who could correct it.
+      # everyone who could correct it.  This was conditional on the event --
+      # which meant the dispatch path, the one a person uses by hand, was the
+      # path without the check.
       - name: The tag matches VERSION
-        if: github.event_name == 'push'
         run: |
+          tag="${{ inputs.tag || github.ref_name }}"
           version="$(cat VERSION)"
-          if [ "v${version}" != "${GITHUB_REF_NAME}" ]; then
-            echo "tag ${GITHUB_REF_NAME} does not match VERSION ${version}" >&2
+          if [ "v${version}" != "${tag}" ]; then
+            echo "tag ${tag} does not match VERSION ${version}" >&2
             exit 1
           fi
           echo "releasing ${version}"
@@ -69,6 +79,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
 
       - uses: actions/setup-python@v5
         with:
@@ -130,6 +142,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
 
       - uses: actions/download-artifact@v4
         with:
@@ -142,7 +156,7 @@ jobs:
             --strict downloaded/conformance/strict.txt \
             --checksums downloaded/distributions/SHA256SUMS \
             --manifest downloaded/distributions/build-manifest.json \
-            --sha "${GITHUB_SHA}" \
+            --sha "$(git rev-parse HEAD)" \
             -o release-notes.md
 
       - name: Create the release

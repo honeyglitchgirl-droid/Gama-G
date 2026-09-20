@@ -304,7 +304,7 @@ reports those three plus the ten requirements that are `partial` or
 deviation that is not recorded is a failure, so the gap can only get smaller by
 being closed or larger by being written down -- never by being forgotten.
 
-**642 tests pass**, and CI runs them on every push and pull request across
+**644 tests pass**, and CI runs them on every push and pull request across
 Python 3.9 - 3.13 (`.github/workflows/ci.yml`).  The native backend is
 validated by *differential testing*:
 the same program is run on the interpreter and on the compiled binary, and their
@@ -642,7 +642,7 @@ tools/release_notes.py                     release notes, generated from the
                                            conformance run they describe
 examples/core/                             eight core programs
 examples/                                  eight v0.1 programs
-tests/                                     642 tests
+tests/                                     644 tests
 docs/DESIGN_v0_4.md                        the memory, capability and recovery
                                            models, and what each one proves
 docs/DESIGN_v0_3.md                        the native IR, the five graphs, and

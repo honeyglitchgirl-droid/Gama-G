@@ -245,6 +245,33 @@ class TheWorkflowRunsWhatTheDocumentsSaid(unittest.TestCase):
     def test_the_tag_has_to_match_the_version(self):
         self.assertIn("does not match VERSION", self.workflow)
 
+    def test_the_tag_check_is_not_skipped_on_the_by_hand_path(self):
+        """The gate lived behind `if: github.event_name == 'push'` at first.
+
+        That is the rarer path.  The dispatch path -- the one a person uses to
+        correct an existing release -- was the path where a tag could disagree
+        with the version inside it.
+        """
+        self.assertNotIn("if: github.event_name == 'push'", self.workflow)
+
+    def test_every_job_builds_the_tag_it_names(self):
+        """Otherwise a dispatch for an older tag publishes the branch.
+
+        The jobs are checked out at `inputs.tag || github.ref_name`; on a tag
+        push those agree, and on a dispatch they do not.  Three checkouts, and
+        each of them is either this or a deliberate absence.
+        """
+        checkouts = self.workflow.count("uses: actions/checkout@v4")
+        tagged = self.workflow.count("ref: ${{ inputs.tag || github.ref_name }}")
+        self.assertEqual(
+            checkouts, tagged,
+            f"{checkouts} checkout(s) but {tagged} of them name the tag; the "
+            f"others would build whatever ref triggered the run")
+        # And the commit reported in the notes is the commit built, not the
+        # dispatch ref's head, which for a dispatch is the branch.
+        self.assertIn('--sha "$(git rev-parse HEAD)"', self.workflow)
+        self.assertNotIn('--sha "${GITHUB_SHA}"', self.workflow)
+
     def test_the_workflow_passes_the_script_the_flags_it_accepts(self):
         # Line continuations first: the invocation is four lines long, and a
         # pattern that stops at the first newline checks almost nothing.  It

@@ -16,7 +16,7 @@ nowhere outside this file.  What follows is where it lacks.
 ## 1. What is built
 
 All eleven remaining audit priorities (P3 - P16) plus the version merge: one
-language, one pipeline, four ways to run it, 642 tests and a conformance suite
+language, one pipeline, four ways to run it, 644 tests and a conformance suite
 that checks the toolchain against the specification document rather than
 against itself.  The native CPU backend
 emits C and compiles it; the WebAssembly encoder emits a module; the
@@ -235,7 +235,7 @@ about its edges, and this file is how that honesty is kept checkable.
 ## 6. How to check any of this yourself
 
 ```
-python -m unittest discover -s tests -t tests -q      # 642 tests
+python -m unittest discover -s tests -t tests -q      # 644 tests
 python tools/fuzz_selfcheck.py                        # the checks can fail
 ./tools/bin/ggc difftest examples/*.gg examples/core/*.gg
 
