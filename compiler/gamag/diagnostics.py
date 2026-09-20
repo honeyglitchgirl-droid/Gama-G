@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import List, Optional
+from typing import Tuple, List, Optional
 
 
 class Severity(Enum):
@@ -49,6 +49,66 @@ class SourcePos:
 
     def __str__(self) -> str:  # pragma: no cover - trivial
         return f"{self.file}:{self.line}:{self.col}"
+
+
+#: Every diagnostic carries a code, so that it can be filtered, counted and
+#: looked up.  The checker and the models have always done this; the lexer and
+#: the two parsers did not, which the fuzzer found by asking every diagnostic it
+#: met whether it had one (audit priority 9).
+#:
+#: The code is chosen from the message the front end already writes rather than
+#: being repeated at forty call sites, so there is one place where the two are
+#: kept in step and no site can forget.  Order matters: the first match wins, so
+#: the specific families are listed before the general ``expected ...`` one.
+FRONT_END_CODES: Tuple[Tuple[str, str], ...] = (
+    ("unterminated", "E-unterminated"),
+    ("unexpected character", "E-unexpected-character"),
+    ("invalid literal", "E-invalid-literal"),
+    ("has no digits", "E-invalid-literal"),
+    ("unmatched closing bracket", "E-unbalanced"),
+    ("unknown escape", "E-unknown-escape"),
+    ("unexpected end of file", "E-unexpected-eof"),
+    ("unexpected indentation", "E-bad-indentation"),
+    ("must start at the first column", "E-bad-indentation"),
+    ("expected an indented block", "E-expected-block"),
+    ("expected indented", "E-expected-block"),
+    ("expected match arms", "E-expected-block"),
+    ("requires at least one arm", "E-empty-match"),
+    ("declares one intent", "E-multiple-intents"),
+    ("has one outcome", "E-multiple-outcomes"),
+    ("needs a type or an initial value", "E-untyped-declaration"),
+    ("is not a clause of", "E-unknown-clause"),
+    ("is not allowed in a declaration", "E-unknown-clause"),
+    ("capability qualifiers look like", "E-bad-capability-syntax"),
+    ("shapes are written like", "E-bad-shape-syntax"),
+    ("types are written like", "E-bad-type-syntax"),
+    ("expressions include literals", "E-expected-expression"),
+    ("expected an expression", "E-expected-expression"),
+    ("is already declared", "E-transition-retype"),
+    ("expected a core version", "E-bad-pragma"),
+    ("expected `gama core", "E-bad-pragma"),
+    ("expected", "E-expected"),
+)
+
+#: The fallbacks, one per phase, so that a message no rule matches still gets a
+#: code saying which stage produced it.
+LEX_CODE = "E-lex"
+PARSE_CODE = "E-parse"
+
+
+def front_end_code(message: str, phase: "Phase" = None) -> str:
+    """The code for a lexer or parser message.
+
+    Total by construction: every message gets a code, either from the table or
+    from the phase fallback.  A diagnostic without a code cannot be filtered or
+    looked up, and there is no input for which that is the right answer.
+    """
+    for needle, code in FRONT_END_CODES:
+        if needle in message:
+            return code
+    if phase is not None and phase == Phase.LEX:
+        return LEX_CODE
+    return PARSE_CODE
 
 
 @dataclass

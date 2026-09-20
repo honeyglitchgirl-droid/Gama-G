@@ -20,7 +20,8 @@ from __future__ import annotations
 from typing import List, Optional
 
 from . import ast_nodes as A
-from .diagnostics import Diagnostic, ParseError, Phase, Severity, SourcePos
+from .diagnostics import (Diagnostic, ParseError, Phase, Severity, SourcePos,
+                          front_end_code)
 from .lexer import Lexer
 from .tokens import EFFECT_NAMES, Token, TokenKind
 
@@ -153,11 +154,13 @@ class Parser:
         }.get(kind, kind.name.lower())
 
     def error(self, message: str, tok: Optional[Token] = None,
-              help_text: Optional[str] = None) -> ParseError:
+              help_text: Optional[str] = None,
+              code: Optional[str] = None) -> ParseError:
         t = tok or self.peek()
         return ParseError(Diagnostic(
             Severity.ERROR, Phase.PARSE, message, pos=t.pos, end=t.end,
             help_text=help_text,
+            code=code or front_end_code(message, Phase.PARSE),
         ))
 
     def end_of_line(self) -> None:

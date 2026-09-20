@@ -27,7 +27,8 @@ from __future__ import annotations
 
 from typing import List, Optional
 
-from .diagnostics import LexError, Diagnostic, Phase, Severity, SourcePos
+from .diagnostics import (LexError, Diagnostic, Phase, Severity, SourcePos,
+                            front_end_code)
 from .tokens import DURATION_UNITS, HARD_KEYWORDS, HARD_KEYWORD_SET, Token, TokenKind
 
 # A newline directly after one of these never ends a logical line.
@@ -116,10 +117,14 @@ class Lexer:
         return SourcePos(self.file, self.line, off - self.line_start + 1, off)
 
     def _fail(self, message: str, pos: Optional[SourcePos] = None,
-              help_text: Optional[str] = None, end: Optional[SourcePos] = None) -> "LexError":
+              help_text: Optional[str] = None, end: Optional[SourcePos] = None,
+              code: Optional[str] = None) -> "LexError":
+        # Every diagnostic gets a code so it can be filtered, counted and looked
+        # up.  The front end had been emitting none; see front_end_code.
         return LexError(Diagnostic(
             Severity.ERROR, Phase.LEX, message, pos=pos or self._pos(),
             end=end, help_text=help_text,
+            code=code or front_end_code(message, Phase.LEX),
         ))
 
     def _emit(self, kind: TokenKind, text: str, pos: SourcePos,

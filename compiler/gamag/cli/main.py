@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import random
 import sys
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -140,6 +141,35 @@ def build_parser() -> argparse.ArgumentParser:
                    help="list the offloadable operations and stop")
     p.add_argument("--json", action="store_true")
 
+    p = sub.add_parser(
+        "fuzz",
+        help="generate and corrupt programs to try to break the toolchain")
+    p.add_argument("--rounds", type=int, default=500, metavar="N",
+                   help="how many inputs to try (default: 500)")
+    p.add_argument("--seed", type=int, default=None, metavar="N",
+                   help="reproduce a campaign exactly; without it a seed is "
+                        "chosen and printed")
+    p.add_argument("--corpus", metavar="DIR", default=None,
+                   help="programs to corrupt (default: the shipped examples)")
+    p.add_argument("--save", metavar="DIR", default=None,
+                   help="write one reproducer per distinct failure here")
+    p.add_argument("--deep", action="store_true", default=True,
+                   help="also execute what compiles and compare runs "
+                        "(default)")
+    p.add_argument("--no-deep", dest="deep", action="store_false",
+                   help="only compile; do not execute")
+    p.add_argument("--max-steps", type=int, default=None, metavar="N",
+                   help="instruction budget per execution (default: %d)"
+                        % 200000)
+    p.add_argument("--timeout", type=float, default=10.0, metavar="SECONDS",
+                   help="wall-clock backstop per execution (default: 10)")
+    p.add_argument("--mutation-bias", type=float, default=0.5, metavar="F",
+                   help="fraction of rounds that corrupt a known-good program "
+                        "rather than generating one (default: 0.5)")
+    p.add_argument("--limit", type=int, default=12, metavar="N",
+                   help="how many distinct failures to print (default: 12)")
+    p.add_argument("--json", action="store_true")
+
     p = sub.add_parser("run", help="compile and execute")
     add_common(p)
     p.add_argument("--entry", metavar="NAME", default="main",
@@ -169,6 +199,29 @@ def build_parser() -> argparse.ArgumentParser:
 # ----------------------------------------------------------------------
 # helpers
 # ----------------------------------------------------------------------
+def _examples_dir() -> str:
+    """Where the shipped examples live, for commands that default to them.
+
+    Looked for relative to this package first (so it works from a source
+    checkout), then relative to the current directory (so it works when the
+    package is installed somewhere else).  The caller reports an empty corpus
+    rather than guessing.
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    # .../compiler/gamag/cli/main.py -> repo root is three levels up
+    candidates = [
+        os.path.join(here, os.pardir, os.pardir, os.pardir, "examples"),
+        os.path.join(os.getcwd(), "examples"),
+        os.getcwd(),
+    ]
+    for candidate in candidates:
+        resolved = os.path.normpath(candidate)
+        if os.path.isdir(resolved):
+            return resolved
+    return candidates[-1]
+
+
+
 def _report(compilation: Compilation, color: bool, as_json: bool) -> None:
     if as_json:
         payload = [{
@@ -855,12 +908,74 @@ def cmd_device(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def cmd_fuzz(args: argparse.Namespace) -> int:
+    """Try to break the compiler with programs nobody wrote.
+
+    This is a permanent tool rather than a one-off audit (audit priority 9).
+    The exit code is nonzero when an invariant was broken, so a campaign can
+    gate a build.
+    """
+    from ..fuzz import engine, oracle
+
+    corpus_root = args.corpus or _examples_dir()
+    corpus = engine.default_corpus(corpus_root)
+    if not corpus:
+        print(f"no corpus to work from under {corpus_root!r}", file=sys.stderr)
+        return EXIT_USAGE
+
+    seed = args.seed
+    if seed is None:
+        seed = random.randrange(1 << 31)
+        print(f"seed {seed} (pass --seed {seed} to reproduce this campaign)")
+
+    max_steps = args.max_steps or oracle.FUZZ_MAX_STEPS
+    campaign = engine.run(
+        args.rounds, seed=seed, corpus_paths=corpus, deep=args.deep,
+        save_dir=args.save or "", timeout=args.timeout,
+        max_steps=max_steps, mutation_bias=args.mutation_bias)
+
+    if args.json:
+        print(json.dumps({
+            "rounds": campaign.rounds,
+            "seed": seed,
+            "elapsed_ms": round(campaign.elapsed_ms, 1),
+            "compiled": campaign.compiled_count,
+            "rejected": campaign.rejected_count,
+            "clean": campaign.clean_count,
+            "crashed": campaign.crashed_count,
+            "corpus_size": len(corpus),
+            "max_steps": max_steps,
+            "violations": len(campaign.violations),
+            "distinct": [{
+                "invariant": v.invariant,
+                "severity": v.severity,
+                "detail": v.detail,
+                "origin": v.origin,
+                "kind": v.kind,
+                "signature": v.signature,
+            } for v in sorted(campaign.distinct.values(),
+                              key=lambda v: v.signature)],
+            "save_dir": campaign.save_dir,
+        }, indent=2))
+    else:
+        for line in campaign.render(limit=args.limit):
+            print(line)
+
+    # Only claim files were written when they were: --save produces one
+    # reproducer per distinct failure, and a clean campaign has none.
+    if campaign.save_dir and campaign.distinct:
+        print(f"  {len(campaign.distinct)} reproducer(s) written to "
+              f"{campaign.save_dir}")
+    return EXIT_OK if not campaign.distinct else EXIT_TEST
+
+
 COMMANDS = {
     "check": cmd_check,
     "native": cmd_native,
     "difftest": cmd_difftest,
     "wasm": cmd_wasm,
     "device": cmd_device,
+    "fuzz": cmd_fuzz,
     "build": cmd_build,
     "gir": cmd_gir,
     "graph": cmd_graph,
