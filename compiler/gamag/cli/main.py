@@ -841,6 +841,21 @@ def cmd_native(args: argparse.Namespace) -> int:
             continue
         for line in result.render():
             print(line)
+        if result.ok:
+            # Say how much of the program gets the arena release path.  The
+            # rule that decides is conservative, so the number is a statement
+            # about what is provably safe rather than a measure of effort, and
+            # a reader should be able to see it rather than infer it.
+            from ..backend import cgen
+            eligible, total = cgen.release_coverage(compilation.program)
+            print(f"  arena release: {len(eligible)} of {total} function(s) "
+                  f"release what they allocate")
+            if len(eligible) < total:
+                held = [n for n in compilation.program.functions
+                        if n not in set(eligible)]
+                print("    not released (may hand a value on): "
+                      + ", ".join(f"`{n}`" for n in held[:6])
+                      + ("..." if len(held) > 6 else ""))
         if not result.ok:
             failed = True
     return EXIT_COMPILE if failed else EXIT_OK

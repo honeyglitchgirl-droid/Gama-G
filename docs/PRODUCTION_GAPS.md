@@ -137,9 +137,15 @@ one is already stated in `docs/DESIGN_v1_0.md` section 5.
   logic in `gamag_rt.c` at all; those programs are refused, so nothing is
   miscompiled, but there is no second line of defence either.  The interpreter
   is where the security model lives.
-- **Memory is an arena that never frees.**  `ggc memory` reports the
-  deterministic-destruction extents the memory model derives, but the native
-  runtime does not act on them.  A long-running service leaks.
+- **Memory is released at function return, not per extent.**  The arena used
+  to never free; it now marks and releases around every function that provably
+  cannot hand an allocated value on (see `docs/DESIGN_v1_0.md` section 5).
+  A loop through such a function is bounded -- 368 bytes peak at 2 000 and at
+  200 000 iterations -- while one that stores a global, calls another function,
+  mutates a container or returns text still grows without bound.  `ggc native`
+  prints the coverage, so how much of a program is covered is visible rather
+  than assumed.  The memory model's per-level extents are still not what the
+  runtime acts on.
 - **Ed25519 is not constant-time.**  Documented, and disqualifying for any use
   against an attacker who can measure timing.  Use an audited library.
 - **No WebAssembly module has ever been executed** and **no accelerator kernel
@@ -182,8 +188,10 @@ In rough order of return on effort:
    stated rather than assumed.
 2. Capability enforcement in the native runtime, so the security model does not
    depend on refusal alone.
-3. A free/release path in the arena, so the memory model's extents mean
-   something at run time.
+3. ~~A free/release path in the arena~~ -- done for the functions where
+   releasing is provably safe; still open is driving it from the memory
+   model's per-level extents rather than from the codegen's own conservative
+   rule, which would cover the functions that rule currently declines.
 4. An independent conformance test suite that reads the specification rather
    than the implementation.
 5. Constant-time crypto, or removal of crypto from the shipped surface.

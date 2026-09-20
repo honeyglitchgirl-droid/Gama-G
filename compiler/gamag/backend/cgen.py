@@ -204,6 +204,71 @@ def unsupported(program: GProgram) -> Support:
 
 
 # ---------------------------------------------------------------------------
+# Arena release
+# ---------------------------------------------------------------------------
+
+#: Types the native runtime represents as a machine value.  Everything else --
+#: text, lists, maps, records, enums, tensors, and anything this list has not
+#: heard of -- is a pointer into the arena.
+#:
+#: The list is deliberately a *whitelist*.  Asking "is this one of the heap
+#: types?" and answering "no" for a type the list does not know would treat an
+#: unknown pointer type as a scalar and release memory a live value points
+#: into; asking "is this one of the four scalars?" and answering "no" for a
+#: type this code has not heard of only costs a missed release.  The
+#: failure directions are not comparable.
+_SCALAR_TYPES = (T.IntType, T.FloatType, T.BoolType, T.CharType,
+                 T.DurationType, T.UnitType, T.NeverType)
+
+
+def _holds_pointer(type_: Any) -> bool:
+    """Whether a value of this type may point into the arena."""
+    return not isinstance(type_, _SCALAR_TYPES)
+
+
+def release_eligible(fn: GFunction) -> bool:
+    """Whether this function may release its arena allocations on return.
+
+    The arena used to grow for the lifetime of the process, so a program that
+    repeatedly called a helper allocating a temporary grew without bound.  The
+    fix is to release at return, and this is the rule that makes releasing
+    *safe* -- it has to be conservative, because releasing memory a live value
+    points into is a use-after-free.
+
+    A value allocated by this function can outlive it in exactly three ways:
+
+    1. **through the return value** -- so a function returning a heap type is
+       out, and only scalar (pointer-free) returns qualify;
+    2. **through a global** -- so any `STORE_GLOBAL` disqualifies it;
+    3. **through another function** -- so any `CALL` disqualifies it.  The only
+       remaining way to hand a value to code that might keep it is a call, and
+       this backend already refuses `CALL_INDIRECT` and `METHOD_CALL` outright,
+       so `CALL` is the whole of that route.
+
+    `SET_INDEX` disqualifies it too: it mutates a container, and if the
+    container came in as a parameter or from a global then storing a freshly
+    allocated value in it is an escape.  Telling the two cases apart needs
+    escape analysis this backend does not have, so it declines both.  Failing
+    to release costs memory; releasing too early corrupts, and only one of
+    those is recoverable.
+    """
+    if _holds_pointer(fn.ret):
+        return False
+    for block in fn.blocks:
+        for instr in block.instrs:
+            if instr.op in (Op.STORE_GLOBAL, Op.CALL, Op.SET_INDEX):
+                return False
+    return True
+
+
+def release_coverage(program: GProgram) -> Tuple[List[str], int]:
+    """Which functions get the release path, and how many there are."""
+    eligible = [name for name, fn in program.functions.items()
+                if release_eligible(fn)]
+    return eligible, len(program.functions)
+
+
+# ---------------------------------------------------------------------------
 # Emission
 # ---------------------------------------------------------------------------
 
@@ -392,6 +457,15 @@ class CGenerator:
             else:
                 decls.append(f"    GValue s{index}; (void)s{index};")
         self.emit("\n".join(decls))
+        # The release path: mark here, release before every return.  The mark
+        # is a local, so nested calls unwind to their own mark in the order
+        # they were taken.
+        self._releasing = release_eligible(fn)
+        if self._releasing:
+            self.emit("    GArenaMark g_mark = g_arena_mark();")
+            # Every `return` below releases first, so a function that somehow
+            # finishes without one still must not leave the arena grown.
+            self.emit("    (void)g_mark;")
         # Slots the IR references beyond the declared list.
         self._slot_count = len(slots)
         self.emit()
@@ -572,6 +646,15 @@ class CGenerator:
             self.emit(f"    goto {instr.meta.get('target_false', '')};")
         elif op == Op.RETURN:
             expr = self._operand(instr.args[0]) if instr.args else "g_unit()"
+            if getattr(self, "_releasing", False):
+                # Evaluate first, then release, then return.  Releasing before
+                # the expression is evaluated would let a temporary that reads
+                # this function's own memory run against a released region;
+                # the returned value itself is a scalar by the eligibility
+                # rule, so it survives the release.
+                self.emit(f"    GValue g_result = {expr};")
+                self.emit("    g_arena_release(g_mark);")
+                expr = "g_result"
             if isinstance(fn.ret, T.IntType):
                 lo, hi = fn.ret.range
                 lo_c = "-9223372036854775807LL - 1" if lo == -(2 ** 63) else f"{lo}LL"

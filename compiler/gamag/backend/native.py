@@ -202,12 +202,22 @@ def build(program: GProgram, source_path: str = "<program>",
 
 
 def run(exe_path: str, args: Sequence[str] = (),
-        timeout: float = 30.0, stdin_text: str = "") -> NativeRun:
-    """Execute a native binary and capture what it did."""
+        timeout: float = 30.0, stdin_text: str = "",
+        env: Optional[Dict[str, str]] = None) -> NativeRun:
+    """Execute a native binary and capture what it did.
+
+    ``env`` is merged over the current environment, so a test can turn on the
+    runtime's own instrumentation (``GG_ARENA_STATS``) without losing PATH.
+    """
     started = time.perf_counter()
+    child_env = None
+    if env:
+        child_env = dict(os.environ)
+        child_env.update(env)
     try:
         proc = subprocess.run([exe_path, *args], capture_output=True,
-                              text=True, timeout=timeout, input=stdin_text)
+                              text=True, timeout=timeout, input=stdin_text,
+                              env=child_env)
     except subprocess.TimeoutExpired as exc:
         return NativeRun(returncode=-1,
                          stdout=(exc.stdout or b"").decode("utf-8", "replace")

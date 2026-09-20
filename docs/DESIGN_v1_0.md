@@ -157,10 +157,22 @@ section: never claim a capability the toolchain lacks.
   agents, method dispatch and indirect calls are not implemented natively.  They
   are refused by name, never miscompiled.  A program that uses them runs on the
   interpreter.
-- **The native runtime allocates from an arena** and does not free until exit.
-  The language's deterministic-destruction guarantee is a property the *memory
-  model* computes over the derived graph and `ggc memory` reports; the native
-  runtime does not yet act on those extents.
+- **The native runtime releases at function return, not at the memory model's
+  extents.**  The arena used to grow for the lifetime of the process, so a
+  program that repeatedly called a helper allocating a temporary leaked by
+  construction.  It now marks on entry and releases before returning, for
+  every function that cannot hand an allocated value on -- no heap return, no
+  `STORE_GLOBAL`, no `CALL`, no `SET_INDEX` -- which is decided before emission
+  and reported by `ggc native` as a coverage count.  Measured: a loop calling
+  such a helper 200 000 times peaks at 368 bytes, the same as at 2 000
+  iterations, where the same loop through a function that stores a global
+  reaches 7.3 MB at 20 000.
+  What this is *not*: the extents the *memory model* derives, per level, for a
+  core program.  Those remain a static proof that `ggc memory` reports.  The
+  rule the runtime acts on is self-contained and conservative, and driving the
+  runtime from the model's extents is still future work.  A function that
+  stores a global, calls anything, mutates a container or returns text still
+  grows the arena for as long as it runs.
 - **No GPU has ever run a kernel from this repository.**  Detection and code
   generation exist; execution does not, here.
 - **`messaging` is in-process.**  A broker needs `NetworkConnect` plumbing.

@@ -322,6 +322,14 @@ host-derived: the interpreter keeps its activations on an explicit stack, so a
 Gama-G frame costs no host frame and the limit is the language's own ceiling of
 1500 frames.  A file that is not UTF-8 is a diagnostic too.
 
+**The native arena releases, where it can prove that is safe.**  A function
+that cannot hand an allocated value on -- no heap return, no global store, no
+call, no container mutation -- marks the arena on entry and releases before it
+returns, so a loop through such a function does not grow.  Measured with the
+runtime's own counters: 368 bytes peak at both 2 000 and 200 000 iterations,
+against 7.3 MB at 20 000 through a function that stores a global and is
+therefore not released.  `ggc native` prints how many functions are covered.
+
 **No performance claim** is made anywhere.  `ggc bench` measures and reports the
 conditions of the measurement, and refuses to compare two runs whose conditions
 differ.

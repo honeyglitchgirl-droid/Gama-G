@@ -145,6 +145,26 @@ char  *g_strdup(const char *s);
 void   g_arena_reset(void);
 size_t g_arena_bytes(void);
 
+/* Arena release path.  A mark records a position; releasing it returns every
+ * byte allocated since to the arena.  Marks nest and are released newest
+ * first, because a function marks on entry and releases before returning.
+ *
+ * This exists so that a program which repeatedly calls a function does not
+ * grow without bound: without it the arena only ever grew, and a long-running
+ * program leaked by construction. */
+typedef struct {
+    struct GChunk *chunk;           /* struct GChunk is private to the .c file */
+    size_t         used;
+} GArenaMark;
+
+GArenaMark g_arena_mark(void);
+void       g_arena_release(GArenaMark mark);
+
+/* Bytes handed out and not released (the leak measure) and its high-water
+ * mark.  `g_arena_bytes` is cumulative and only ever grows. */
+size_t g_arena_live(void);
+size_t g_arena_peak(void);
+
 /* ------------------------------------------------------------------ */
 /* Constructors                                                        */
 /* ------------------------------------------------------------------ */

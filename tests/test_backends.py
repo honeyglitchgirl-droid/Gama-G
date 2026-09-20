@@ -290,6 +290,224 @@ class NativeValueFormatting(TempBuild):
 # Priority 7 -- differential testing
 # ---------------------------------------------------------------------------
 
+#: A helper that allocates a temporary, returns a scalar, stores nothing
+#: global and calls nothing -- so its allocations die at its return.
+RELEASABLE = """
+fn work(n: I64) -> I64
+    pure
+    let s = "temporary text " + str(n)
+    let parts = ["a", "b", "c", s]
+    return len(parts) + len(s)
+
+fn main() -> Unit
+    io
+    var i = 0
+    var total = 0
+    while i < ITERATIONS
+        total = total + work(i)
+        i = i + 1
+    print("total", total)
+"""
+
+#: The same loop, one difference: the helper stores a global, so a value it
+#: allocated can outlive the call and releasing its region would be a
+#: use-after-free.  This is the control that proves the measurement below can
+#: detect a leak rather than only reporting a small number.
+LEAKING = """
+var sink = ""
+
+fn work(n: I64) -> I64
+    pure
+    let s = "temporary text " + str(n)
+    let parts = ["a", "b", "c", s]
+    sink = s
+    return len(parts) + len(s)
+
+fn main() -> Unit
+    io
+    var i = 0
+    var total = 0
+    while i < ITERATIONS
+        total = total + work(i)
+        i = i + 1
+    print("total", total, len(sink))
+"""
+
+
+def program_for(source: str, iterations: int, name: str = "arena.gg"):
+    return compiled_program(source.replace("ITERATIONS", str(iterations)), name)
+
+
+def arena_peak(testcase, source: str, iterations: int, build_dir: str) -> int:
+    """Build, run with the runtime's arena counters on, and read the peak.
+
+    The counters are the runtime's own, read from its stderr: measuring the
+    allocator from outside would measure the process, which includes the C
+    compiler's memory and everything else the harness did.
+    """
+    program = program_for(source, iterations)
+    result = native.build(program, "arena.gg", build_dir=build_dir)
+    testcase.assertTrue(result.ok, "\n".join(result.render()))
+    run = native.run(result.exe_path, env={"GG_ARENA_STATS": "1"})
+    testcase.assertEqual(run.returncode, 0, run.stderr)
+    for line in run.stderr.splitlines():
+        if line.startswith("gama-g arena:"):
+            for field in line.split():
+                if field.startswith("peak="):
+                    return int(field.split("=", 1)[1])
+    testcase.fail(f"the runtime reported no arena statistics:\n{run.stderr}")
+
+
+class ArenaReleaseEligibility(TempBuild):
+    """The rule that decides when releasing is safe.
+
+    Releasing memory a live value points into is a use-after-free, so the rule
+    is conservative and its refusals are as important as its acceptances.
+    """
+
+    def eligible(self, source: str) -> bool:
+        program = program_for(source, 1, "e.gg")
+        names = [n for n, fn in program.functions.items()
+                 if cgen.release_eligible(fn)]
+        return "work" in names
+
+    def test_a_helper_that_hands_nothing_on_is_eligible(self):
+        self.assertTrue(self.eligible(RELEASABLE))
+
+    def test_a_function_returning_a_heap_value_is_not_eligible(self):
+        self.assertFalse(self.eligible("""
+fn work(n: I64) -> Text
+    pure
+    return "temporary " + str(n)
+
+fn main() -> Unit
+    io
+    print(work(1))
+"""))
+
+    def test_a_function_storing_a_global_is_not_eligible(self):
+        self.assertFalse(self.eligible(LEAKING))
+
+    def test_a_function_that_calls_another_is_not_eligible(self):
+        # The callee could keep what it is handed, and this backend has no way
+        # to see inside it.
+        self.assertFalse(self.eligible("""
+fn other(x: I64) -> I64
+    pure
+    return x + 1
+
+fn work(n: I64) -> I64
+    pure
+    return other(n)
+
+fn main() -> Unit
+    io
+    print(work(1))
+"""))
+
+    def test_a_function_that_mutates_a_container_is_not_eligible(self):
+        # `SET_INDEX` writes into a container that may have come from outside.
+        self.assertFalse(self.eligible("""
+fn work(xs: List<I64>) -> I64
+    pure
+    let fresh = [1, 2, 3]
+    xs[0] = fresh[0]
+    return len(xs)
+
+fn main() -> Unit
+    io
+    let xs = [9, 9]
+    print(work(xs))
+"""))
+
+    def test_an_unknown_type_counts_as_a_pointer(self):
+        """The rule fails safe: what it does not recognise it will not free."""
+        self.assertTrue(cgen._holds_pointer(object()))
+        self.assertTrue(cgen._holds_pointer(__import__("gamag.semantic.types",
+                                                       fromlist=["x"]).ANY))
+        self.assertFalse(cgen._holds_pointer(
+            __import__("gamag.semantic.types", fromlist=["x"]).PRIMITIVES["I64"]))
+
+    def test_coverage_names_the_functions_it_leaves_alone(self):
+        program = program_for(LEAKING, 1, "c.gg")
+        eligible, total = cgen.release_coverage(program)
+        self.assertEqual(eligible, [])
+        self.assertGreater(total, 0)
+
+
+class ArenaReleaseEmission(TempBuild):
+    """What the generator writes for an eligible function."""
+
+    def test_an_eligible_function_marks_and_releases(self):
+        source = cgen.generate_c(program_for(RELEASABLE, 1, "e.gg"), "e.gg")
+        self.assertIn("GArenaMark g_mark = g_arena_mark();", source)
+        self.assertIn("g_arena_release(g_mark);", source)
+
+    def test_an_ineligible_function_is_not_released(self):
+        source = cgen.generate_c(program_for(LEAKING, 1, "e.gg"), "e.gg")
+        self.assertNotIn("g_arena_release(g_mark);", source)
+
+    def test_the_value_is_read_before_the_release(self):
+        """Releasing first would free the memory the expression reads.
+
+        The returned value is a scalar by the eligibility rule, but the
+        expression that produces it may read text this function allocated, so
+        the order in the generated code is not cosmetic.
+        """
+        source = cgen.generate_c(program_for(RELEASABLE, 1, "e.gg"), "e.gg")
+        capture = source.index("GValue g_result = ")
+        release = source.index("g_arena_release(g_mark);")
+        self.assertLess(capture, release,
+                        "the result is captured after the region is released")
+
+
+@unittest.skipUnless(HAS_CC, "no C compiler on this machine")
+class ArenaReleaseActuallyReleases(TempBuild):
+    """The claim is about a running program, so it is measured on one."""
+
+    def test_the_arena_stops_growing_across_iterations(self):
+        """The point of the whole path: a long-running loop stops leaking.
+
+        The peak is the runtime's own high-water mark.  If the release path
+        did nothing this number would grow with the iteration count, which is
+        what the next test demonstrates.
+        """
+        small = arena_peak(self, RELEASABLE, 2_000, self.build_dir)
+        large = arena_peak(self, RELEASABLE, 20_000, self.build_dir)
+        self.assertLess(small, 64 * 1024,
+                        "the eligible program used more memory than it should")
+        self.assertLess(large, small * 4,
+                        f"peak grew from {small} to {large} bytes for ten "
+                        f"times the iterations, so the arena is not bounded")
+
+    def test_the_measurement_detects_a_leak(self):
+        """The control.  Without it the test above proves nothing.
+
+        A check that always reports 'bounded' would pass the previous test and
+        be worthless.  This is the same loop with a function that cannot be
+        released: it must grow, and roughly in proportion to the iterations.
+        """
+        small = arena_peak(self, LEAKING, 2_000, self.build_dir)
+        large = arena_peak(self, LEAKING, 20_000, self.build_dir)
+        self.assertGreater(large, small * 4,
+                           f"peak went from {small} to {large} bytes for ten "
+                           f"times the iterations, so this test cannot tell a "
+                           f"leak from a bounded program")
+
+    def test_releasing_changes_nothing_a_program_can_observe(self):
+        """Memory management is not allowed to change what a program means."""
+        import support as S2
+        source = RELEASABLE.replace("ITERATIONS", "500")
+        program = compiled_program(source, "obs.gg")
+        result = native.build(program, "obs.gg", build_dir=self.build_dir)
+        self.assertTrue(result.ok, "\n".join(result.render()))
+
+        native_run = native.run(result.exe_path)
+        interpreted = S2.run(source)
+        self.assertEqual(native_run.returncode, 0, native_run.stderr)
+        self.assertEqual(native_run.stdout, interpreted.output)
+
+
 class DifferentialTesting(TempBuild):
     """The only evidence that a backend is correct."""
 

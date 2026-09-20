@@ -23,38 +23,134 @@ jmp_buf g_fault_jmp;
 
 #define G_CHUNK (1u << 20)
 
-static char  *g_arena_cur = NULL;
-static size_t g_arena_left = 0;
-static size_t g_arena_total = 0;
+/* A chunk owns a run of bytes.  Chunks are kept in a list, newest first, so a
+ * mark can name the chunk it was taken in and everything allocated after it
+ * lives in that chunk or in the ones in front of it. */
+typedef struct GChunk {
+    struct GChunk *next;
+    size_t size;                    /* bytes owned by this chunk */
+    size_t used;                    /* bytes handed out */
+    size_t reserved;                /* keeps the payload 16-byte aligned */
+} GChunk;
 
-static void arena_grow(size_t need)
+static GChunk *g_arena_head = NULL;     /* newest chunk still holding values */
+static GChunk *g_arena_pool = NULL;     /* released chunks, reused before malloc */
+static size_t  g_live_bytes = 0;        /* bytes handed out right now */
+static size_t  g_peak_bytes = 0;        /* high-water mark of g_live_bytes */
+static size_t  g_arena_total = 0;       /* cumulative bytes taken from malloc */
+static int     g_arena_stats_hooked = 0;
+
+static void arena_stats(void)
 {
+    const char *want = getenv("GG_ARENA_STATS");
+    if (want == NULL || want[0] == '\0')
+        return;
+    fprintf(stderr, "gama-g arena: live=%lu peak=%lu total=%lu\n",
+            (unsigned long)g_live_bytes, (unsigned long)g_peak_bytes,
+            (unsigned long)g_arena_total);
+}
+
+static void arena_push(size_t need)
+{
+    /* A chunk that was released is reused rather than returned to malloc: the
+     * program's footprint then settles at its high-water mark instead of
+     * churning, which is what a long-running program wants. */
+    if (need <= G_CHUNK && g_arena_pool != NULL) {
+        GChunk *c = g_arena_pool;
+        g_arena_pool = c->next;
+        c->next = g_arena_head;
+        c->used = 0;
+        g_arena_head = c;
+        return;
+    }
     size_t n = need > G_CHUNK ? need : G_CHUNK;
-    char *p = (char *)malloc(n);
-    if (!p) {
+    GChunk *c = (GChunk *)malloc(sizeof(GChunk) + n);
+    if (!c) {
         fprintf(stderr, "gama-g native: out of memory\n");
         exit(G_EXIT_RUNTIME);
     }
-    /* The previous chunk is deliberately leaked: nothing is freed until exit,
-     * which is the documented limitation of this runtime. */
-    g_arena_cur = p;
-    g_arena_left = n;
+    c->next = g_arena_head;
+    c->size = n;
+    c->used = 0;
+    c->reserved = 0;
+    g_arena_head = c;
     g_arena_total += n;
+    if (!g_arena_stats_hooked) {
+        g_arena_stats_hooked = 1;
+        atexit(arena_stats);
+    }
 }
 
 void *g_alloc(size_t n)
 {
     n = (n + 15u) & ~(size_t)15u;
-    if (n > g_arena_left) arena_grow(n);
-    void *p = g_arena_cur;
-    g_arena_cur += n;
-    g_arena_left -= n;
+    GChunk *c = g_arena_head;
+    if (c == NULL || c->size - c->used < n) {
+        arena_push(n);
+        c = g_arena_head;
+    }
+    char *base = (char *)(c + 1);
+    void *p = base + c->used;
+    c->used += n;
+    g_live_bytes += n;
+    if (g_live_bytes > g_peak_bytes)
+        g_peak_bytes = g_live_bytes;
     return p;
 }
 
+/* Bytes handed out and not yet released.  This is the number that says whether
+ * a program leaks; `g_arena_bytes` below is the cumulative figure and only ever
+ * grows. */
+size_t g_arena_live(void) { return g_live_bytes; }
+size_t g_arena_peak(void) { return g_peak_bytes; }
 size_t g_arena_bytes(void) { return g_arena_total; }
 
-void g_arena_reset(void) { g_arena_cur = NULL; g_arena_left = 0; }
+GArenaMark g_arena_mark(void)
+{
+    GArenaMark m;
+    m.chunk = g_arena_head;
+    m.used = g_arena_head ? g_arena_head->used : 0;
+    return m;
+}
+
+/* Release everything allocated since `m`.
+ *
+ * Marks nest, because a function marks on entry and releases before it
+ * returns, and calls nest: the newest mark is always released first.  That is
+ * what makes freeing whole chunks in a loop correct -- there is never a live
+ * value behind the mark being released.
+ *
+ * Only chunks are freed, and only to the pool.  A value allocated since the
+ * mark and still in use would be a bug in the caller's decision to release,
+ * and the release decision is conservative by construction: see
+ * `cgen.release_eligible`. */
+void g_arena_release(GArenaMark m)
+{
+    while (g_arena_head != m.chunk) {
+        GChunk *c = g_arena_head;
+        g_arena_head = c->next;
+        g_live_bytes -= c->used;
+        c->used = 0;
+        c->next = g_arena_pool;
+        g_arena_pool = c;
+    }
+    if (g_arena_head != NULL && g_arena_head->used > m.used) {
+        g_live_bytes -= (g_arena_head->used - m.used);
+        g_arena_head->used = m.used;
+    }
+}
+
+void g_arena_reset(void)
+{
+    while (g_arena_head != NULL) {
+        GChunk *c = g_arena_head;
+        g_arena_head = c->next;
+        c->used = 0;
+        c->next = g_arena_pool;
+        g_arena_pool = c;
+    }
+    g_live_bytes = 0;
+}
 
 char *g_strdup_n(const char *s, size_t n)
 {
