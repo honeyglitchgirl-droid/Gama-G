@@ -1,0 +1,46 @@
+// Gama-G core: the lifecycle of a secret.
+//
+// Spec section 8 gives sensitive data "stronger lifecycle controls, including
+// restrictions on logging, serialization, and accidental conversion to ordinary
+// Text", and section 12 says secrets cannot be printed through ordinary logging.
+// Both are enforced here rather than advised. The binding is marked at the point
+// it enters; an ordinary renderer refuses it; and letting the value out takes
+// `secrets.expose` under the `SecretExpose` capability, which the intent has to
+// declare and the audit log then records.
+//
+//   ggc run examples/core/custody.gg
+//   ggc run examples/core/custody.gg --audit /tmp/custody.jsonl
+
+gama core 0.2
+
+intent Custody
+    purpose    hold one patient identifier and disclose it only on purpose
+    authority  SecretExpose, AuditWrite
+    trail      custody of the identifier
+
+source secret patientId : I64 from 4471
+
+// A fingerprint is derived *from* the identifier without being the identifier,
+// so it can leave. This is the ordinary way to use a secret: compute with it,
+// disclose something that is not it.
+operation Digest
+    uses     patientId
+    yields   fingerprint : Text
+    effect   crypto
+    computes secrets.fingerprint(patientId)
+    trail    a fingerprint, not the identifier
+
+// Disclosing the value itself is a different act, and the language treats it as
+// one: it needs `SecretExpose`, it needs a reason, and it is audited.
+operation Disclosed
+    uses     patientId
+    yields   revealed : Text
+    effect   crypto, audit
+    needs    SecretExpose
+    computes to_text(secrets.expose(patientId, "clinician opened the record"))
+    trail    deliberate disclosure
+
+// The outcome is not the secret. Had it been, the generated entry point would
+// have printed `[secret revealed]` instead of the value, because a program that
+// wants a secret on stdout should say so in its own body.
+outcome revealed

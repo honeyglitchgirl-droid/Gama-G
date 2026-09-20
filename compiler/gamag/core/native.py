@@ -42,9 +42,12 @@ from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from ..diagnostics import DiagnosticBag, Phase, SourcePos
 from ..gir.ir import (BasicBlock, GFunction, GProgram, Instr, Operand, Op,
-                      ParallelTask, Slot)
+                      ParallelTask, RecoveryPlan, Slot)
 from ..semantic import types as T
 from ..std import library as L
+from . import capability as CAP
+from . import memory as MEM
+from . import recovery as REC
 from . import mir as M
 
 # Fault kinds the core can raise.  These are the core's own vocabulary: they
@@ -327,15 +330,17 @@ class NativeChecker:
         self.node_effects[node.name] = used
         if not used:
             return
-        declared = node.effect or "pure"
-        missing = sorted(used - {declared})
+        declared = set(node.effects) or {"pure"}
+        missing = sorted(used - declared)
         if missing:
+            written = "`" + "`, `".join(sorted(declared)) + "`"
             self.error(
-                f"`{node.name}` declares effect `{declared}` but calls "
+                f"`{node.name}` declares effect {written} but calls "
                 f"{'`' + '`, `'.join(missing) + '`'} work", node.pos,
                 phase=Phase.EFFECT, code="E-effect-undeclared",
                 help_text="effects are declared, not inferred: an operation "
-                          "that does something must say so")
+                          "that does something must say so, and `effect` takes a "
+                          "list -- write `effect crypto, audit`")
 
     def _effects_of(self, expr: Optional[M.MExpr],
                     out: Optional[Set[str]] = None) -> Set[str]:
@@ -357,6 +362,17 @@ class NativeChecker:
 
     def _builtin_key(self, call: M.MCall) -> str:
         return f"{call.module}.{call.name}" if call.module else call.name
+
+    def secret_bindings(self) -> Set[str]:
+        """Every binding whose *resolved* type is secret.
+
+        Not the same as the bindings whose declaration says `secret`. A value
+        becomes secret by propagation -- anything computed from a secret carries
+        the marking -- and the rules about where a secret may go have to see those
+        too, or the propagation the checker just proved would stop mattering the
+        moment the capability rules were derived.
+        """
+        return {name for name, type_ in self.env.items() if is_secret(type_)}
 
     # ------------------------------------------------------------------
     def infer(self, expr: Optional[M.MExpr]) -> T.Type:
@@ -552,10 +568,12 @@ class Lowerer:
     """
 
     def __init__(self, model: M.SemanticModel, checker: NativeChecker,
-                 bag: DiagnosticBag):
+                 bag: DiagnosticBag,
+                 memory: Optional[MEM.MemoryModel] = None):
         self.m = model
         self.c = checker
         self.bag = bag
+        self.memory = memory
         self.intent_name = model.intent.name or "Intent"
         self.prog = GProgram(name=self.intent_name,
                              grants=list(model.intent.authority))
@@ -565,6 +583,16 @@ class Lowerer:
         self.blocks_made = 0
         self.instrs_made = 0
         self.temps_made = 0
+        # The recovery policy the intent declared, if any. When it exists the
+        # intent lowers to a protected region around its own work rather than to
+        # a bare sequence, which is what "direct recovery representation" means:
+        # the policy reaches the machine as a policy.
+        self.policy = REC.policy_of(model.intent)
+        # node name -> the capabilities its calls actually demand, derived by the
+        # graph builder from the standard library's own metadata
+        self.demands: Dict[str, List[M.DerivedDemand]] = {}
+        for demand in model.authority.derived:
+            self.demands.setdefault(demand.node, []).append(demand)
 
     # ------------------------------------------------------------------
     # IR helpers
@@ -609,14 +637,64 @@ class Lowerer:
 
     def binding(self, name: str, type_: T.Type, *, mutable: bool = False,
                 kind: str = "local", pos=None) -> int:
-        """Allocate the slot a binding lives in, and remember it by name."""
+        """Allocate the slot a binding lives in, and remember it by name.
+
+        When the memory model says this binding's extent does not overlap another
+        binding of the same type, they share a slot. That is deterministic
+        destruction showing up in the IR rather than only in a report: the release
+        point was derived from the graph, so the slot is genuinely free, and no
+        collector had to decide anything.
+        """
         assert self.fn is not None
         if name in self.slots:
             return self.slots[name]
+        if self.memory is not None:
+            record = self.memory.bindings.get(name)
+            if record is not None and record.shares_with:
+                shared = self.slots.get(record.shares_with)
+                if shared is not None:
+                    self.slots[name] = shared
+                    return shared
         index = self.fn.new_slot(name, type_, kind, mutable=mutable,
                                  secret=is_secret(type_))
         self.slots[name] = index
         return index
+
+    def guard_secret(self, name: str, slot: int, pos=None) -> None:
+        """Mark a secret binding at the point it comes into existence.
+
+        Spec section 8 asks for stronger lifecycle controls on secrets, and
+        section 12 for them not to reach ordinary logging. GIR has an instruction
+        for the first half -- `SECRET_GUARD` -- so the marking is something the
+        machine does at a known point rather than something the value happens to
+        carry. Emitting it here, at every definition of a secret binding, is what
+        makes that point known.
+        """
+        if not is_secret(self.c.env.get(name, T.ANY)):
+            return
+        self.emit(Op.SECRET_GUARD, [self.slot_op(slot)], dst=-1,
+                  meta={"binding": name}, pos=pos)
+        assert self.fn is not None
+        self.fn.secret_points += 1
+
+    def capability_checks(self, node: M.OpNode) -> None:
+        """Emit a runtime check for every capability this node's calls demand.
+
+        The compile-time check already proved these are covered by the intent's
+        authority. The runtime check is emitted anyway, for the same reason a
+        proven-exhaustive selection still keeps its `NoActiveAlternative` fault:
+        a proof is a reason to trust the program, not a reason to remove the
+        boundary. A capability that is only checked at compile time is not
+        enforced against a hand-edited IR or a future backend that reorders it.
+        """
+        for demand in self.demands.get(node.name, ()):
+            for name in demand.alternatives:
+                self.emit(Op.CAP_CHECK, [], dst=-1,
+                          meta={"capability": name,
+                                "what": f"{node.name}: {demand.origin}"},
+                          pos=node.pos)
+                assert self.fn is not None
+                self.fn.cap_points += 1
 
     def goto(self, block: BasicBlock) -> None:
         self.emit(Op.JUMP, meta={"target": block.id})
@@ -628,16 +706,92 @@ class Lowerer:
 
     # ------------------------------------------------------------------
     def lower(self) -> GProgram:
-        self._intent_function()
+        if self.policy.steps:
+            # The work moves into its own function so that the intent can wrap it
+            # in a protected region. The runtime calls the protected body with no
+            # knowledge of what it does, which is the point: the policy is the
+            # intent's, and the body is just the work.
+            work = f"{self.intent_name}.work"
+            self._intent_function(work, kind="intent")
+            self._protected_function(work)
+        else:
+            self._intent_function()
         self._main_function()
         return self.prog
+
+    def _protected_function(self, work_name: str) -> None:
+        """An intent with a declared `recover` policy, as a protected region.
+
+        Spec section 10 makes recovery a language capability and section 18 makes
+        a failure before commit a recovery state rather than a half-applied
+        change. GIR already has the instruction for both, and the runtime already
+        implements the six levels -- so the policy the program declared is handed
+        to the machine as a policy, not re-encoded as a fault message and a jump.
+
+        Two things this makes true that a bare `FAULT` could not:
+
+        * a checkpoint is captured *before* the work runs, so a `restore` step
+          returns to recorded state instead of inventing some;
+        * every recovery action taken is audited, because the region is entered
+          with `audit_all`. That is section 10's "every recovery action should be
+          observable and auditable", discharged by the lowering rather than left
+          to the program to remember.
+        """
+        graph = self.m.operations
+        effects = self._effects()
+        self.fn = GFunction(
+            name=self.intent_name, kind="service",
+            ret=self._outcome_type(), effects=effects,
+            caps=tuple(self.m.intent.authority),
+            deterministic=not ({"io", "network", "unsafe"} & set(effects)))
+        self.fn.recovery = RecoveryPlan(steps=self.policy.to_steps(),
+                                       audit_all=True,
+                                       level_names=dict(REC.LEVEL_NAMES))
+        self.fn.recovery_points += 1
+        self.slots = {}
+        self.blocks_made = self.instrs_made = self.temps_made = 0
+        self.start("protected")
+
+        args: List[Operand] = []
+        for name, node in graph.inputs.items():
+            type_ = self.c.env.get(name, T.ANY)
+            slot = self.binding(name, type_, kind="param")
+            assert self.fn is not None
+            self.fn.params.append(slot)
+            self.fn.param_names.append(name)
+            if is_secret(type_):
+                self.fn.secret_params.append(slot)
+                self.guard_secret(name, slot, node.pos)
+            args.append(self.slot_op(slot))
+
+        outcome = self.temp(T.ANY)
+        self.emit(Op.PROTECTED, args, dst=outcome,
+                  meta={"protect": work_name,
+                        "steps": self.policy.to_steps(),
+                        "checkpoints": list(self.policy.checkpoints),
+                        "audit_all": True,
+                        "component": self.intent_name},
+                  pos=self.m.intent.pos)
+        # The region's result is a RecoveryOutcome record; the intent's contract
+        # is its outcome, so the value is taken back out of it. Whether recovery
+        # was needed is visible in the audit trail, not in the return type --
+        # changing the type on the failure path would make a caller handle two
+        # shapes for one intent.
+        value = self.temp(self._outcome_type())
+        self.emit(Op.FIELD, [self.slot_op(outcome)], dst=value,
+                  type_=self._outcome_type(), meta={"name": "value"},
+                  pos=self.m.intent.pos)
+        self.emit(Op.RETURN, [self.slot_op(value)],
+                  type_=self._outcome_type(), pos=self.m.intent.pos)
+        self.prog.add(self.fn)
 
     # ------------------------------------------------------------------
     def _effects(self) -> Tuple[str, ...]:
         found: List[str] = []
         for node in self.m.operations.nodes.values():
-            if node.effect and node.effect not in found:
-                found.append(node.effect)
+            for effect in node.effects:
+                if effect and effect not in found:
+                    found.append(effect)
             if node.trail and "audit" not in found:
                 found.append("audit")
             for used in self.c.node_effects.get(node.name, ()):
@@ -658,11 +812,12 @@ class Lowerer:
         return self.c.env.get(self.m.operations.outcome, T.UNIT)
 
     # ------------------------------------------------------------------
-    def _intent_function(self) -> None:
+    def _intent_function(self, name: Optional[str] = None,
+                         kind: str = "intent") -> None:
         graph = self.m.operations
         effects = self._effects()
         self.fn = GFunction(
-            name=self.intent_name, kind="intent",
+            name=name or self.intent_name, kind=kind,
             ret=self._outcome_type(), effects=effects,
             caps=tuple(self.m.intent.authority),
             deterministic=not ({"io", "network", "unsafe"} & set(effects)))
@@ -679,8 +834,12 @@ class Lowerer:
             self.fn.param_names.append(name)
             if is_secret(type_):
                 self.fn.secret_params.append(slot)
+                # marked at the boundary it enters through, not at the first
+                # place something happens to notice it
+                self.guard_secret(name, slot, node.pos)
 
         self._resources()
+        self._checkpoints()
         self._compute_phase()
         self._commit_phase()
         self._outcome()
@@ -703,6 +862,23 @@ class Lowerer:
                 value = self.expr(state.initial)
                 self.emit(Op.COPY, [value], dst=slot, type_=type_,
                           pos=state.pos)
+            self.guard_secret(name, slot, state.pos)
+
+    def _checkpoints(self) -> None:
+        """Record the checkpoints the intent declared, before any work runs.
+
+        A `recover` policy may name a checkpoint only if one was declared, and a
+        declaration is worth nothing unless the state is actually captured -- so
+        the capture happens here, with the resources at their initial values.
+        That is what makes `restore checkpoint admission` return to admission
+        rather than to whatever happened to be recorded most recently.
+        """
+        for label in self.m.intent.checkpoints:
+            self.emit(Op.CHECKPOINT, [], dst=-1,
+                      meta={"mode": "at", "raw": label},
+                      pos=self.m.intent.pos)
+            assert self.fn is not None
+            self.fn.recovery_points += 1
 
     def _compute_phase(self) -> None:
         graph = self.m.operations
@@ -719,8 +895,25 @@ class Lowerer:
             self._node(node)
 
     def _commit_phase(self) -> None:
-        for name in self.m.operations.commit_order():
-            self._node(self.m.operations.nodes[name])
+        order = self.m.operations.commit_order()
+        if not order:
+            return
+        name = self.m.intent.name or self.intent_name
+        # Spec section 18: either the transitions take effect or they do not, and
+        # a failure before the commit leaves a recovery state rather than a half
+        # applied change. The core's two-phase split is already that shape --
+        # every derivation first, every state change last -- so it is emitted as
+        # a transaction instead of as a run of copies that happen to come at the
+        # end. If a `holds` constraint fails in here, the runtime aborts the
+        # transaction it was executing; see `Context.transaction_owner`.
+        self.emit(Op.TRANSACTION, [], dst=-1,
+                  meta={"action": "begin", "name": name},
+                  pos=self.m.intent.pos)
+        for node_name in order:
+            self._node(self.m.operations.nodes[node_name])
+        self.emit(Op.TRANSACTION, [], dst=-1,
+                  meta={"action": "commit", "name": name},
+                  pos=self.m.intent.pos)
 
     def _outcome(self) -> None:
         outcome = self.m.operations.outcome
@@ -759,6 +952,7 @@ class Lowerer:
     # ------------------------------------------------------------------
     def _node(self, node: M.OpNode) -> None:
         label = f"{node.kind}:{node.name}"
+        self.capability_checks(node)
         if node.kind == "refine":
             self._refine(node, label)       # type: ignore[arg-type]
         elif node.kind == "fanout":
@@ -771,6 +965,19 @@ class Lowerer:
             self._compute(node, label)
         self._constraints(node)
         self._trail(node)
+        self._guard_node(node)
+
+    def _guard_node(self, node: M.OpNode) -> None:
+        """Mark the binding a node produced, once the node is done with it.
+
+        The guard goes *after* the node's own constraints and trail rather than
+        before: within the node the value is still being computed and checked,
+        and the marking is what protects it on its way to everything else.
+        """
+        name = node.produces or getattr(node, "state", "")
+        slot = self.slots.get(name)
+        if slot is not None:
+            self.guard_secret(name, slot, node.pos)
 
     def _slot_for(self, node: M.OpNode, mutable: bool = False) -> int:
         type_ = self.c.env.get(node.produces, T.ANY)
@@ -857,6 +1064,9 @@ class Lowerer:
             f"{len(selection.members)} guarded alternatives, none active"
             + proof, first.pos)
         self.cur = join
+        for name in selection.members:
+            self.capability_checks(graph.nodes[name])
+        self.guard_secret(selection.binding, slot, first.pos)
 
     def _refine(self, node: M.RefinementNode, label: str) -> None:
         """Bounded recurrence.
@@ -1077,8 +1287,22 @@ class Lowerer:
         self.emit(Op.CALL, args, dst=result, type_=self._outcome_type(),
                   meta={"callee": self.intent_name}, pos=self.m.intent.pos)
         shown = self.temp(T.UNIT)
-        self.emit(Op.BUILTIN, [self.slot_op(result)], dst=shown,
-                  type_=T.UNIT, meta={"name": "print"}, pos=self.m.intent.pos)
+        if is_secret(self._outcome_type()):
+            # Spec section 12: secrets cannot be printed through ordinary
+            # logging. The generated entry point therefore says that there is a
+            # result and what it is called, not what it holds. Reaching `print`
+            # with the value would demand `SecretExpose`, and a program that
+            # wants that should ask for it in its own body rather than have the
+            # compiler do it silently on the way out.
+            self.emit(Op.BUILTIN,
+                      [self.const(f"[secret {graph.outcome or 'outcome'}]",
+                                  T.TEXT)],
+                      dst=shown, type_=T.UNIT, meta={"name": "print"},
+                      pos=self.m.intent.pos)
+        else:
+            self.emit(Op.BUILTIN, [self.slot_op(result)], dst=shown,
+                      type_=T.UNIT, meta={"name": "print"},
+                      pos=self.m.intent.pos)
         self._finish()
 
         self.fn, self.cur = saved_fn, saved_cur
@@ -1144,6 +1368,13 @@ class Lowerer:
 
 
 def lower(model: M.SemanticModel, checker: NativeChecker,
-          bag: DiagnosticBag) -> GProgram:
-    """Public entry point: semantic model -> GIR."""
-    return Lowerer(model, checker, bag).lower()
+          bag: DiagnosticBag,
+          memory: Optional[MEM.MemoryModel] = None) -> GProgram:
+    """Public entry point: semantic model -> GIR.
+
+    ``memory`` is the model from :mod:`gamag.core.memory`. It is optional so that
+    lowering still works without it, but when it is present the lowerer uses its
+    extents to reuse slots, which is the part of the memory model that changes
+    the emitted code rather than only describing it.
+    """
+    return Lowerer(model, checker, bag, memory=memory).lower()

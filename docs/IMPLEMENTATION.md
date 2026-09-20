@@ -21,8 +21,14 @@ it is covered in §11 here and in [`DESIGN_v0_3.md`](DESIGN_v0_3.md). The core
 compiles through its own IR and runs on the v0.1 machine, so both surfaces are
 enforced by the same tested runtime.
 
+On top of that sits **v0.4, the formal semantics of the core** — the same audit's
+priorities 4–6: an explicit memory/resource model, formal capability semantics,
+and a direct transition/recovery representation. It is covered in §12 here and in
+[`DESIGN_v0_4.md`](DESIGN_v0_4.md). Priority 3, a native CPU backend, is
+deliberately not started.
+
 Everything claimed below is exercised by the test suite (`python3 -m unittest
-discover -s tests`, 269 tests) and demonstrated by a
+discover -s tests`, 318 tests) and demonstrated by a
 runnable example in `examples/` or `examples/core/`. Where a claim is partial,
 the missing part is named.
 
@@ -33,14 +39,16 @@ the missing part is named.
 | | |
 |---|---|
 | Implementation language | Python 3.11+ (reference implementation) |
-| Compiler source | ~17,600 lines across 33 modules |
+| Compiler source | ~19,400 lines across 37 modules |
 | Standard library | 215 builtins across 18 modules |
 | Language surface | 23 hard keywords, 84 contextual keywords, 9 effects |
 | AST node types | 70 |
 | GIR operations | 41 |
-| Tests | 269 (all passing under `unittest discover`) |
-| Examples | 8 v0.1 + 6 core, each runnable with `ggc run` |
-| Language core | 4 modules, ~2,900 lines in `compiler/gamag/core/`; see §10–11 |
+| Tests | 318 (all passing under `unittest discover`) |
+| Examples | 8 v0.1 + 8 core, each runnable with `ggc run` |
+| Language core | 8 modules, ~4,300 lines in `compiler/gamag/core/`; see §10–12 |
+| Formal models | memory · capability · recovery, one module each, plus a
+  shared capability algebra; see §12 |
 | Licence | Apache-2.0 (`LICENSE`); version in `VERSION`, packaging in `pyproject.toml` |
 | Dialects | selected per file by the `gama core <version>` pragma |
 | Native backend | **not implemented** — see §5 |
@@ -100,7 +108,10 @@ Implemented and tested:
   names the undeclared effect.
 - **§8 Memory / secrets** — `secret T` is a distinct type. Printing,
   concatenating or auditing a secret is a compile error. `secrets.expose`
-  requires a reason and that reason is audited.
+  requires a reason and that reason is audited. For the **core** there is now an
+  explicit memory model — one owner per binding, an extent in the derived order,
+  a slot assigned only where extents provably do not overlap, a `SECRET_GUARD`
+  per secret definition, and `ggc memory` to print it. See §12.
 - **§9 Concurrency** — structured `parallel` regions. Tasks are ordered by
   dependency; independent ones run concurrently on real threads.
 - **§9B Agents** — `agent` declarations with typed `on <event>` handlers and
@@ -109,9 +120,15 @@ Implemented and tested:
 - **§10–11 Self-healing and checkpointing** — `service` with `protect`/
   `recover`, the six recovery levels in spec order, bounded retry, checkpoint
   capture and restore, operator escalation. Every recovery action is audited
-  with its level, whether it succeeded, and what it did.
+  with its level, whether it succeeded, and what it did. `recover` and
+  `checkpoint` are now **core syntax too**, lowered as a policy into a `PROTECTED`
+  region that carries the declared steps in the program's own words. See §12.
 - **§12 Security** — `grant` headers; capability handles minted at run time and
-  permission-checked on every access; no ambient authority.
+  permission-checked on every access; no ambient authority. One capability
+  algebra is now shared by the checker and the runtime, so `covers()` means the
+  same thing on both sides of the boundary, and every demand a core node derives
+  from what it calls becomes a `CAP_CHECK` — even one the compiler already
+  proved. See §12.
 - **§13 Audit** — append-only, hash-chained, signed records. Tampering with a
   field, an action, or deleting a record from the middle is detected. Exports as
   newline-delimited JSON that round-trips.
@@ -127,7 +144,8 @@ Implemented and tested:
   `audit` rules producing explainable decisions that quote the rule text.
 - **§18 Transactions** — `transaction` blocks that commit or abort; a fault
   before commit records `TRANSACTION_ABORT` with the reason rather than leaving
-  the transaction open.
+  the transaction open. Every core **transition** is emitted inside one, whether
+  or not the intent declares a recovery policy.
 - **§19 Errors** — classified faults (`DivideByZero`, `ContractViolation`,
   `CapabilityViolation`, `RecoveryExhausted`, …) with source positions.
 - **§21 GIR** — a serialisable IR with 41 operations, inspectable per function
@@ -189,11 +207,17 @@ machine code. Programs execute on the GAEM reference interpreter
 resolution, registry, lockfile or vendoring. A program is a file or a directory
 of files.
 
-**No borrow checker.** §8's ownership model is implemented as immutability by
-default plus secret-type propagation. There are no lifetimes, no move
-semantics, no aliasing analysis and no use-after-free prevention (the
-interpreter is garbage collected, so that class of defect cannot arise — but
-neither is it *prevented by analysis*, which is what the spec describes).
+**No borrow checker in the Rust sense.** The **core** has an explicit memory
+model since v0.4: one owner per binding, extents computed from the derived
+execution order, slots shared only where extents provably do not overlap, and
+use-after-free prevented by that analysis rather than by the host's collector.
+What it does not have is alias analysis over arbitrary mutation — there is no
+arbitrary mutation in the core to analyse, no lifetimes to infer across function
+boundaries, and no move semantics, because the core is single-assignment by
+construction. The **v0.1 surface** still relies on immutability by default plus
+secret-type propagation, and for it the older description holds: the interpreter
+is garbage collected, so that class of defect cannot arise, but neither is it
+prevented by analysis.
 
 **No pipeline stage fusion.** §3's operation-graph analysis exists for
 `parallel` regions. `pipeline` declarations parse, type-check and run, but the
@@ -332,12 +356,14 @@ rather than behind the v0.1 surface.
    *acting* on the derived levels (parallel execution of a level), not deriving
    them.
 1a. **Extend the core** — modules and composition between intents, more than two
-   guarded alternatives with a real exhaustiveness proof, recovery policy in core
-   syntax, and a container choice for `each` other than `List`.
+   guarded alternatives with a real exhaustiveness proof, and a container choice
+   for `each` other than `List`. (Recovery policy in core syntax is done — see
+   §12.)
 2. **A real backend** (§22 stages 11–12) — WASM first, because it gives
    portability and a sandbox boundary at once; native afterwards.
-3. **Borrow checking** (§8) — the largest remaining gap between what the spec
-   describes and what is enforced.
+3. **Borrow checking** (§8) — narrowed by v0.4's memory model for the core, and
+   still the largest remaining gap for the v0.1 surface, where there are no
+   lifetimes and no alias analysis.
 4. **`gpm`** (§30) — needed before any library ecosystem is possible.
 5. **Fuzzing and property generation** (§26) — `test fuzz` is parsed as a
    category but generates nothing.
@@ -491,10 +517,11 @@ all five graphs.
 
 ### 11.3 What v0.3 does not do
 
-The audit's priorities 3–16 are untouched, in the order it sequences them: no
-native CPU backend, no memory model, no WASM or GPU target, no `gpm`, no FFI, no
-FHIR profile, no benchmarks and no fuzzing. **No performance number appears
-anywhere in this repository**, and §6's list of claims not made is unchanged.
+At the time of v0.3 the audit's priorities 3–16 were untouched, in the order it
+sequences them. Priorities 4–6 have since been built as v0.4 (§12). Still
+untouched: the native CPU backend, WASM and GPU targets, `gpm`, FFI, the FHIR
+profile, benchmarks and fuzzing. **No performance number appears anywhere in this
+repository**, and §6's list of claims not made is unchanged.
 
 ### 11.4 Test split (audit §14)
 
@@ -511,3 +538,110 @@ is now split accordingly:
 
 The class formerly named `OriginalityGuarantees` is `LanguageInvariants`. The old
 name asserted more than the tests delivered.
+
+---
+
+## 12. The v0.4 formal semantics of the core
+
+The audit's priorities 4–6, built as three models the toolchain computes rather
+than three properties a document repeats. [`DESIGN_v0_4.md`](DESIGN_v0_4.md) has
+the detail; this is the status.
+
+### 12.1 What was built
+
+| Priority | Model | Module | Diagnostics it can raise |
+|---|---|---|---|
+| 4 | Explicit memory/resource | `core/memory.py` | `E-memory-model` (driver), `E-secret-escape` (native) |
+| 5 | Formal capability semantics | `core/capability.py`, `capabilities.py` | `E-unknown-capability`, `E-capability-unmet`, `E-authority-unmet`, `E-unknown-effect`, `E-effect-undeclared` |
+| 6 | Direct transition/recovery | `core/recovery.py` | `E-unknown-recovery`, `E-recovery-unordered`, `E-unknown-checkpoint`, `E-unbounded-recovery` |
+
+What reaches the machine:
+
+* `SECRET_GUARD` per secret definition, `CAP_CHECK` per derived demand,
+  `CHECKPOINT` per declared label, `PROTECTED` per recovery policy,
+  `TRANSACTION` begin/commit per transition.
+* A `GFunction.recovery` plan carrying the declared steps in the program's own
+  words, with the specification's level names — so the policy that runs is the
+  policy that was written.
+* One capability algebra (`capabilities.py::covers`) used by the checker and by
+  `Context.has_cap`, including the runtime's `"*"` wildcard.
+
+`ggc memory <file>` prints the model; `--slots` lists slot lifetimes and reuse;
+`--json` dumps bindings, slots, acquisitions, `slots_saved` and violations.
+`ggc graph` already showed the capability and recovery sections, because they are
+part of `model.render()` — the models are inspectable through the command that
+existed for the graphs.
+
+### 12.2 What is checkable about it
+
+47 tests in `tests/test_formal_semantics.py`, named after the specification
+sections they implement rather than after the modules that hold the code:
+
+* **Memory** — ownership is one-to-one; every borrower falls inside its owner's
+  extent; parameters and outcomes live to the return; nothing is mutable without
+  a declared `state`; a reused slot's occupants provably do not overlap and are
+  of one type; **a two-operation chain reuses nothing**, which is the negative
+  case that makes the positive one mean something; secrets are guarded, a
+  fingerprint of a secret is not itself secret, and the generated entry point
+  prints `[secret <name>]`; acquisitions name their owner, resource and extent.
+* **Capability** — the two spellings of one capability parse alike; `Write ⇒ Read`
+  on a resource and nothing across resources; `Connect`/`Sign`/`Spawn` entail
+  nothing; attenuation is coverage read backwards and no combination amplifies;
+  an unknown capability is refused; a secret reaching a renderer demands
+  `SecretExpose`; a covered demand is satisfied and an uncovered one is refused;
+  **the runtime applies the same relation the compiler proved**; a boundary is
+  emitted even for a proven demand, and refusing it at runtime records
+  `CAPABILITY_DENIED` at security level.
+* **Recovery** — the levels are the specification's; a policy parses into its
+  steps with resolved targets; levels may not decrease; a named checkpoint must
+  have been declared while a bare `restore checkpoint` needs none; an unbounded
+  retry and an unknown action are refused; the policy lowers to a `PROTECTED`
+  region carrying its own words with `audit_all`; declared checkpoints are
+  captured **before** the transaction; a named restore names the checkpoint it
+  used in the audit trail; audited levels never decrease; a constraint failing in
+  the commit phase leaves the transaction `aborted`, never half-applied; and a
+  transition with no recovery policy still runs inside a transaction.
+
+Two examples were added: `examples/core/custody.gg` and
+`examples/core/recover.gg`. The core set is now eight programs.
+
+### 12.3 Two defects the models found
+
+Both were invisible to the 269 tests that passed before them, and both were found
+by running a program the model said should work:
+
+* **A core program's declared `authority` never reached the runtime.** Four call
+  sites read `compilation.checker.grants`, which is `None` for a core program, so
+  the compiler proved every demand covered and the runtime denied every one.
+  Fixed by `driver.program_grants(compilation, extra)`, which unions the
+  program's own grants, the checker's and the caller's; every run path uses it.
+* **`effect` was singular, so multi-effect builtins were uncallable.** The
+  standard library's own `secrets.expose` (crypto + audit),
+  `medical.fhir_serialize` (medical + io) and `model.load` (model + storage)
+  could not be called from the core at all — a formally checked capability that
+  could not be exercised. `OpNode.effects` is now a list, with `effect` kept as a
+  read-only property returning the first.
+
+`tests/test_enforcement.py::SourceTreeHygiene` now scans every module for a
+top-level name defined twice and for two functions with identical bodies, because
+the first of those was how a duplicated `known()` survived a refactor unnoticed.
+
+### 12.4 What v0.4 does not do
+
+* **Priority 3, the native CPU backend, is not started.** It is a multi-session
+  code-generation effort rather than a model, and starting it badly would be
+  worse than naming it absent. Priorities 7–16 are untouched.
+* **No alias analysis over arbitrary mutation, no lifetime inference across
+  function boundaries, no move semantics** — see §5. The core has no arbitrary
+  mutation to analyse, which is a stronger starting position and not the same
+  thing as a borrow checker.
+* **No data-race detector.** The derived graph makes the order explicit and
+  `parallel` regions carry dependency analysis, but nothing here proves the
+  absence of races in a program that has been given one.
+* **No claim that a recovery policy will succeed.** Bounded, ordered, named and
+  audited is the guarantee. Whether retrying twice is *enough* is a property of
+  the failure.
+* **The memory model describes the core only.** The v0.1 surface keeps its own
+  ownership checking in `semantic/checker.py`, unchanged.
+* `slots_saved` is a count from the model, not a measurement. **No performance
+  number appears anywhere in this repository.**

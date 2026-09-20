@@ -24,12 +24,11 @@ from ..diagnostics import CapabilityViolation, GamaRuntimeFault
 from .audit import AuditLog
 from .checkpoint import CheckpointStore
 
-# Capabilities named by spec section 12.
-KNOWN_CAPABILITIES = frozenset({
-    "FileRead", "FileWrite", "NetworkConnect", "DatabaseRead", "DatabaseWrite",
-    "PatientRead", "PatientWrite", "CryptoSign", "AuditWrite", "ProcessSpawn",
-    "EnvironmentRead", "SecretExpose", "ModelLoad", "Network",
-})
+# The capability vocabulary and the coverage relation both live in
+# `gamag.capabilities`, shared with the compile-time checker. They are re-exported
+# here because this module is where the runtime looks for them, and a second copy
+# of the list would eventually disagree with the first.
+from ..capabilities import KNOWN_CAPABILITIES, covers as _covers  # noqa: E402
 
 
 @dataclass
@@ -103,6 +102,12 @@ class Context:
         self.transactions: Dict[str, Dict[str, Any]] = {}
         self.roles: List[str] = []
         self.active_transaction: Optional[str] = None
+        # Which function opened the transaction that is still active. Without
+        # this, a fault escaping a *callee* would abort a transaction belonging to
+        # its caller, and a fault escaping the caller could not be attributed at
+        # all -- spec section 18 needs the abort to land on the transaction that
+        # actually failed.
+        self.transaction_owner: Optional[str] = None
         self._call_hook: Optional[Callable[[Any, tuple], Any]] = None
         self._clock = 0.0
 
@@ -133,7 +138,16 @@ class Context:
     # capabilities (spec section 12)
     # ------------------------------------------------------------------
     def has_cap(self, cap: str) -> bool:
-        return cap in self.grants or "*" in self.grants
+        """Whether the granted set satisfies a demand for ``cap``.
+
+        Coverage, not membership, and the same relation the compiler used when it
+        accepted the program: an intent holding `PatientWrite` satisfies a demand
+        for `PatientRead` at run time exactly as it did at compile time. A runtime
+        that tested membership would deny programs the checker had accepted, and
+        the denial would look like a bug in the program rather than a disagreement
+        between two halves of the toolchain.
+        """
+        return _covers(self.grants, cap)
 
     def require_capability(self, cap: str, *, what: str = "",
                            pos: Any = None) -> None:

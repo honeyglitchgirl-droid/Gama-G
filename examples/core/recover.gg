@@ -1,0 +1,54 @@
+// Gama-G core: a declared recovery policy, executed rather than described.
+//
+//   ggc run examples/core/recover.gg --audit /tmp/recover.jsonl
+//
+// Spec section 10 makes recovery a language capability with six levels and asks
+// two things that are easy to write down: that it never silently invents state,
+// and that every action is observable and auditable. Section 18 asks that a
+// failure before commit leave a recovery state rather than a half-applied change.
+//
+// The compiler hands this policy to the runtime *as a policy* -- a GIR protected
+// region carrying these very steps -- and captures the `admission` checkpoint
+// before any work runs, so `restore checkpoint admission` returns to admission
+// rather than to whatever was recorded most recently. The transition at the end
+// is emitted as a transaction, so a constraint failing there is recorded as an
+// abort. Change `reading` to 500 and watch the whole policy run in the audit log.
+
+gama core 0.2
+
+intent Vitals
+    purpose    record one observation, and recover if the reading is implausible
+    authority  PatientWrite, AuditWrite
+    checkpoint admission
+    recover
+        retry within 2 rounds
+        restore checkpoint admission
+        escalate operator
+    trail      vitals recording
+
+source reading : I64 from 72
+
+// The state at its initial value is what `admission` records, so a restore puts
+// the program back here rather than somewhere the policy never reasoned about.
+state recorded : I64
+    starts 0
+
+operation Plausible
+    uses     reading
+    yields   checked : I64
+    effect   pure
+    holds    checked > 0
+    computes reading
+
+// A transition is the only way a state changes, it runs after every derivation,
+// and it is the only thing inside the transaction.
+transition Record
+    alters   recorded
+    uses     checked
+    effect   audit
+    needs    AuditWrite
+    holds    checked <= 200
+    computes recorded + checked
+    trail    observation recorded
+
+outcome recorded

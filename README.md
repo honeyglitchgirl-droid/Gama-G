@@ -173,6 +173,71 @@ and not checked at all.
 
 ---
 
+## v0.4: the formal semantics of the core
+
+The same audit sequences the rest of the work, and its priorities 4, 5 and 6 are
+the three models the specification writes down formally but that v0.3 could only
+describe in prose — *explicit memory/resource model*, *formal capability
+semantics*, *direct transition/recovery representation*. v0.4 builds all three,
+so the properties are computed by the toolchain rather than asserted in a
+document.
+
+```
+core source → CoreParser → SemanticModel → NativeChecker → Lowerer → GIR → VM
+                              │                 │
+                     five inspectable     three formal models:
+                     graphs (v0.3):       memory · capability · recovery
+                     intent · operations
+                     constraints · authority · recovery
+```
+
+**Memory (priority 4, spec §8).** Every binding gets exactly one owner, an extent
+`[first, last]` in the derived order, and a slot. A slot is shared only where two
+extents provably do not overlap, and `slots_saved` counts the reuse the allocator
+*earned* rather than assumed — a two-operation chain reuses nothing, because
+there every value is live at the same time as its neighbour. Secrets are marked
+where they enter, guarded by a `SECRET_GUARD` instruction, and an ordinary
+renderer refuses them. The only way a value leaves is
+`secrets.expose(value, reason)` under `SecretExpose`, which the audit log records
+as `SECRET_EXPOSED` at security level. `ggc memory <file>` prints the model, its
+slots and any violation.
+
+**Capability (priority 5, spec §12).** One algebra — `compiler/gamag/capabilities.py`
+— is used by *both* the checker and the runtime, because a guarantee the compiler
+proves and the runtime does not enforce is a guarantee about a program that cannot
+be run. A capability is a permission over a resource, so `PatientStore[Write]`
+covers `PatientRead` and nothing crosses resources. Grants attenuate and never
+amplify: two reads on different resources are still only two reads. What a node
+needs is *derived* from what it calls, so a `CAP_CHECK` boundary is emitted even
+for a demand the compiler already proved — the proof is about the program, not
+about the environment it is deployed into.
+
+**Transition and recovery (priority 6, spec §10 and §18).** `recover` and
+`checkpoint` are core syntax, and a declared policy is lowered *as a policy*: a
+`PROTECTED` region carrying those very steps in the specification's own words, at
+its own levels (0 local retry … 5 operator escalation), which may not decrease.
+A named checkpoint is captured before the work runs, so `restore checkpoint
+admission` returns to `admission` and never to whatever was recorded most
+recently; restoring to a checkpoint the intent never declared is a compile error,
+because §10 forbids silently inventing state. Every transition runs inside a
+`TRANSACTION`, so a constraint that fails in the commit phase is recorded as an
+abort instead of being left half-applied.
+
+Two examples were added for it: [`custody.gg`](examples/core/custody.gg) follows
+one secret through its whole lifecycle, and
+[`recover.gg`](examples/core/recover.gg) declares a policy and runs it. Change
+`recover.gg`'s `reading` to `500` and the audit trail shows the policy escalate
+for real — retry, restore to the named `admission` checkpoint, operator alert,
+`RecoveryExhausted` — with every action recorded in the program's own words.
+
+[`docs/DESIGN_v0_4.md`](docs/DESIGN_v0_4.md) is the design document: the three
+models, what each one proves, where the same relation is used on both sides of
+the compile/run boundary, and what remains description rather than code.
+
+Priority 3 (a native CPU backend) and priorities 7–16 are still untouched.
+
+---
+
 ## Status
 
 This repository is a **working vertical slice** of
@@ -186,16 +251,17 @@ through its own semantic IR. The **v0.1 surface** is the research /
 vertical-slice reference implementation: a complete compiler front end (lexer,
 parser, name resolution, type/effect/capability/ownership checking), the Gama IR,
 an optimizer, and a reference interpreter, with the safety systems enforced end
-to end. Both dialects run on that one tested machine — 269 passing tests.
+to end. Both dialects run on that one tested machine — 316 passing tests.
 
 What is not: **there is no native backend, no package manager and no borrow
 checker.** Programs run on an interpreter. Performance is interpreter-grade and
 **no benchmark against native code has been run or is claimed.**
 
-The current milestone is **v0.3, the native semantic IR**, because the second
-audit sequences native backends, a memory model and production v1.0 *after* the
-compiler stops depending on the older language's model. That is the order being
-followed: its priorities 3–16 are untouched.
+The current milestone is **v0.4, the formal semantics of the core**: the second
+audit's priorities 4, 5 and 6, each working end to end with real code, real tests
+and the honest limits named. Priorities 1 and 2 shipped in v0.3. Priority 3 — a
+native CPU backend, which is a multi-session code-generation effort rather than a
+model — is deliberately not started, as are priorities 7–16.
 
 [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md) goes through the
 specification section by section and says what is done, what is partial and what
@@ -235,12 +301,12 @@ error, `4` test failure.
 
 ## The examples
 
-Fourteen programs, each runnable and each covered by tests that assert on their
+Sixteen programs, each runnable and each covered by tests that assert on their
 output rather than merely on their exit code.
 
 ### The v0.2 core — `examples/core/`
 
-Six programs, one per construct family.
+Eight programs: one per construct family, and two for the v0.4 models.
 
 | Example | What it demonstrates |
 |---|---|
@@ -250,6 +316,8 @@ Six programs, one per construct family.
 | [`traverse.gg`](examples/core/traverse.gg) | `each … over X as x`: fan-out as a graph node |
 | [`classify.gg`](examples/core/classify.gg) | `resolve … choose`: exhaustive dispatch |
 | [`ledger.gg`](examples/core/ledger.gg) | `state` + `transition`: the only mutable resource, under authority, in the commit phase |
+| [`custody.gg`](examples/core/custody.gg) | A secret's whole lifecycle: guarded, unrenderable, and disclosable only under `SecretExpose` with a reason and an audit record |
+| [`recover.gg`](examples/core/recover.gg) | `checkpoint` + `recover` as a lowered policy: named restore, escalating levels, a transition in a transaction |
 
 ### The v0.1 reference surface — `examples/`
 
@@ -437,6 +505,9 @@ LICENSE                                      Apache-2.0
 VERSION pyproject.toml                       the version, stated once
 compiler/gamag/
   core/{mir,parser,graph,native}.py        the language core and its own IR
+  core/{memory,capability,recovery}.py     the three v0.4 models
+  capabilities.py                          one capability algebra, used by the
+                                           checker and the runtime alike
   lexer.py parser.py ast_nodes.py          front end
   semantic/{types,checker}.py              type lattice and checking
   gir/{ir,builder,optimizer}.py            the IR, lowering, optimization
@@ -446,9 +517,11 @@ compiler/gamag/
   methods.py                               one method table, shared by checker and VM
   cli/main.py driver.py                    ggc
 tools/bin/{ggc,ggtest}                     entry points
-examples/core/                             six core programs
+examples/core/                             eight core programs
 examples/                                  eight v0.1 programs
-tests/                                     269 tests
+tests/                                     316 tests
+docs/DESIGN_v0_4.md                        the memory, capability and recovery
+                                           models, and what each one proves
 docs/DESIGN_v0_3.md                        the native IR, the five graphs, and
                                            what is proven vs. only checked
 docs/DESIGN_v0_2.md                        the language design, and the first
@@ -473,7 +546,12 @@ tests/test_enforcement.py    what must be refused, the claims the docs may not
                              make, and the packaging that must agree
 tests/test_runtime.py        autodiff, the audit chain, recovery, secrets,
                              determinism
-tests/test_examples.py       all fourteen examples, end to end
+tests/test_formal_semantics.py
+                             the v0.4 models: ownership and extents, slot reuse
+                             as a proof, secret guarding, the capability algebra
+                             on both sides of the compile/run boundary, recovery
+                             levels, named checkpoints, transactions
+tests/test_examples.py       all sixteen examples, end to end
 ```
 
 The vocabulary and example suites read the blueprint out of the repository at

@@ -315,12 +315,20 @@ class VM:
                 return UNIT
             except GamaRuntimeFault as fault:
                 # Spec section 18: a transaction that fails before it commits
-                # must not leave its effects half applied.  The builder emits
-                # begin ... body ... commit with no branch between them, so
-                # this is the only place a failed transaction can be marked
-                # aborted; otherwise it would stay "open" forever and the
-                # audit trail would show a begin with no matching outcome.
-                if fn.kind == "transaction":
+                # must not leave its effects half applied.  Emitting
+                # begin ... body ... commit leaves no branch to hang an abort on,
+                # so this is the only place a failed transaction can be marked
+                # aborted; otherwise it would stay "open" forever and the audit
+                # trail would show a begin with no matching outcome.
+                active = self.ctx.active_transaction
+                if active is not None and self.ctx.transaction_owner == fn.name:
+                    # the function that opened the still-active transaction is the
+                    # one whose fault closes it
+                    self.ctx.abort_transaction(
+                        active, f"{fault.kind}: {fault.message}")
+                    self.ctx.active_transaction = None
+                    self.ctx.transaction_owner = None
+                elif fn.kind == "transaction":
                     self.ctx.abort_transaction(
                         fn.name, f"{fault.kind}: {fault.message}")
                 raise
@@ -1081,12 +1089,15 @@ class VM:
         if action == "begin":
             self.ctx.begin_transaction(name)
             self.ctx.active_transaction = name
+            self.ctx.transaction_owner = frame.fn.name
         elif action == "commit":
             self.ctx.commit_transaction(name)
             self.ctx.active_transaction = None
+            self.ctx.transaction_owner = None
         elif action == "abort":
             self.ctx.abort_transaction(name, instr.meta.get("reason", ""))
             self.ctx.active_transaction = None
+            self.ctx.transaction_owner = None
 
     # ------------------------------------------------------------------
     # parallel regions -- the operation graph (spec sections 3, 9C)
@@ -1167,11 +1178,16 @@ class VM:
             self.ctx.capture_checkpoint(f"{component}-entry",
                                         authorization=f"service:{component}")
 
+        # The region's operands are the arguments its protected work takes. The
+        # older builder emits a protected region around a nullary service body and
+        # so passes none, which is why this defaults to empty rather than being
+        # required: a core intent's work takes its sources.
+        protected_args = [self.resolve(frame, a) for a in instr.args]
         engine = RecoveryEngine(self.ctx)
         with self.lock:
             outcome = engine.run(
                 steps,
-                (lambda: self.call_function(protect, [])) if protect
+                (lambda: self.call_function(protect, protected_args)) if protect
                 else (lambda: UNIT),
                 name=component)
         self.ctx.stats.recoveries += 1 if outcome.actions else 0

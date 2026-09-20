@@ -22,7 +22,8 @@ SPEC_PATH = os.path.join(
 if COMPILER_DIR not in sys.path:
     sys.path.insert(0, COMPILER_DIR)
 
-from gamag.driver import compile_source, execute, find_entry  # noqa: E402
+from gamag.driver import (compile_source, execute,  # noqa: E402
+                          find_entry, program_grants)
 from gamag.runtime.context import Context  # noqa: E402
 
 
@@ -161,9 +162,8 @@ def run(source: str, *, entry: str = "main", profile: str = "standard",
     # The module's own `grant` header is part of the program; without merging
     # it in, every example that declares capabilities would fail here for a
     # reason that has nothing to do with the language.
-    declared = set(compilation.checker.grants) if compilation.checker else set()
-    context = Context(grants=declared | set(grants), stdout=buffer, seed=seed,
-                      deterministic=deterministic)
+    context = Context(grants=program_grants(compilation, grants),
+                      stdout=buffer, seed=seed, deterministic=deterministic)
     name = find_entry(compilation, preferred=entry)
     execution = execute(compilation, entry=name, context=context, grants=grants)
     return Outcome(source=source, compilation=compilation,

@@ -470,3 +470,59 @@ class Packaging(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SourceTreeHygiene(unittest.TestCase):
+    """Properties of the source tree itself, rather than of a program.
+
+    These exist because two real defects in this repository were invisible to
+    every other test: a helper defined twice after a module was refactored (the
+    second silently shadowing the first), and a name that had vanished during a
+    move.  Neither changed any behaviour that a test asserted on, so neither was
+    caught -- they were caught by reading.  A scan is cheaper than reading.
+    """
+
+    def _modules(self):
+        root = os.path.join(S.REPO_ROOT, "compiler", "gamag")
+        for dirpath, _dirnames, filenames in os.walk(root):
+            for name in sorted(filenames):
+                if name.endswith(".py"):
+                    yield os.path.join(dirpath, name)
+
+    def test_no_module_defines_the_same_top_level_name_twice(self):
+        import ast
+        import collections
+        offenders = []
+        for path in self._modules():
+            with open(path, encoding="utf-8") as handle:
+                tree = ast.parse(handle.read(), path)
+            names = [node.name for node in tree.body
+                     if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                          ast.ClassDef))]
+            dupes = [n for n, c in collections.Counter(names).items() if c > 1]
+            if dupes:
+                offenders.append(f"{os.path.relpath(path, S.REPO_ROOT)}: {dupes}")
+        self.assertEqual(offenders, [],
+                         "a second definition silently shadows the first; the "
+                         "surviving one is whichever was written last, which is "
+                         "not a decision anyone made: " + "; ".join(offenders))
+
+    def test_no_module_defines_a_name_it_immediately_redefines(self):
+        # A narrower version of the above, kept because it names the mistake
+        # precisely: two identical bodies in one file is a refactor that moved
+        # code without deleting the original.
+        import ast
+        for path in self._modules():
+            with open(path, encoding="utf-8") as handle:
+                source = handle.read()
+            tree = ast.parse(source, path)
+            seen = {}
+            for node in tree.body:
+                if not isinstance(node, ast.FunctionDef):
+                    continue
+                body = ast.get_source_segment(source, node) or ""
+                if body in seen:
+                    self.fail(f"{os.path.relpath(path, S.REPO_ROOT)}: "
+                              f"`{node.name}` and `{seen[body]}` have identical "
+                              f"bodies -- one of them is dead code")
+                seen[body] = node.name

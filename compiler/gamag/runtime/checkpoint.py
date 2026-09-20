@@ -122,6 +122,21 @@ class CheckpointStore:
     def latest(self) -> Optional[Checkpoint]:
         return self.history[-1] if self.history else None
 
+    def with_label(self, label: str) -> Optional[Checkpoint]:
+        """The most recent checkpoint recorded under ``label``, if any.
+
+        A recovery policy that names a checkpoint has to get *that* checkpoint.
+        Restoring the latest one instead would return the program to state it did
+        not reason about, which is a quiet version of the invention spec section
+        10 forbids -- the state is genuine, but it is not the state asked for.
+        """
+        if not label:
+            return None
+        for cp in reversed(self.history):
+            if cp.label == label:
+                return cp
+        return None
+
     def get(self, cp_id: str) -> Optional[Checkpoint]:
         for cp in self.history:
             if cp.id == cp_id:

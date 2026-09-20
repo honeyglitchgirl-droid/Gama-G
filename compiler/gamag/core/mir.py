@@ -217,7 +217,15 @@ class OpNode:
     type: Optional[MType] = None
     secret: bool = False
     consumes: List[str] = field(default_factory=list)
-    effect: str = ""
+    #: The effects this operation declares, in the order written.
+    #:
+    #: Plural because the specification's effect algebra is a set and the standard
+    #: library's own operations declare more than one: `secrets.expose` is `crypto`
+    #: *and* `audit`, `medical.fhir_serialize` is `medical` *and* `io`, `model.load`
+    #: is `model` *and* `storage`. A node that could name only one effect could not
+    #: call any of them, which would make the capabilities they demand impossible
+    #: to exercise however correctly they were checked.
+    effects: List[str] = field(default_factory=list)
     needs: List[str] = field(default_factory=list)
     trail: str = ""
     holds: List[Constraint] = field(default_factory=list)
@@ -228,6 +236,11 @@ class OpNode:
     phase: str = "compute"           # compute | commit
     upstream: List[str] = field(default_factory=list)
     downstream: List[str] = field(default_factory=list)
+
+    @property
+    def effect(self) -> str:
+        """The primary declared effect, for messages and single-effect contexts."""
+        return self.effects[0] if self.effects else ""
 
 
 @dataclass
@@ -312,6 +325,12 @@ class IntentGraph:
     authority: List[str] = field(default_factory=list)
     trail: str = ""
     outcome: str = ""
+    #: what to do when the intent's work fails, in escalation order
+    recovery: List[RecoveryStep] = field(default_factory=list)
+    #: the checkpoints a `restore` or `replay` step is allowed to return to.
+    #: Declaring them is what makes spec section 10's "never silently invent
+    #: state during recovery" checkable rather than aspirational.
+    checkpoints: List[str] = field(default_factory=list)
     pos: Optional[SourcePos] = None
 
     def render(self) -> List[str]:
@@ -322,6 +341,8 @@ class IntentGraph:
             lines.append(f"  authority  {', '.join(self.authority)}")
         if self.trail:
             lines.append(f"  trail      {self.trail}")
+        if self.checkpoints:
+            lines.append(f"  checkpoint {', '.join(self.checkpoints)}")
         lines.append(f"  outcome    {self.outcome}")
         return lines
 
@@ -338,6 +359,8 @@ class OperationGraph:
     nodes: Dict[str, OpNode] = field(default_factory=dict)
     levels: List[List[str]] = field(default_factory=list)
     producers_of: Dict[str, List[str]] = field(default_factory=dict)
+    # the inverse index, filled on first use by `readers_of`
+    reader_index: Dict[str, List[str]] = field(default_factory=dict)
     selections: Dict[str, Selection] = field(default_factory=dict)
     sources: List[str] = field(default_factory=list)
     states: List[str] = field(default_factory=list)
@@ -355,6 +378,23 @@ class OperationGraph:
 
     def commit_order(self) -> List[str]:
         return [n for n in self.order() if self.nodes[n].phase == "commit"]
+
+    def readers_of(self, binding: str) -> List[str]:
+        """The nodes that read a binding: the inverse of `producers_of`.
+
+        Ownership is only a fact if the borrowers are known, and the memory model
+        needs them to compute where a binding's life ends.
+        """
+        if not self.reader_index:
+            for name in (self.order() or list(self.nodes)):
+                node = self.nodes.get(name)
+                if node is None:
+                    continue
+                for read in reads_of(node):
+                    self.reader_index.setdefault(read, []).append(name)
+            for names in self.reader_index.values():
+                names.sort()
+        return list(self.reader_index.get(binding, []))
 
     def edges(self) -> List[Tuple[str, str]]:
         """Every derived dependency, as (producer, consumer)."""
@@ -416,14 +456,36 @@ class AuthorityDemand:
 
 
 @dataclass
+class DerivedDemand:
+    """A capability demand derived from what a node does, not what it declares.
+
+    The distinction is the point of priority 5.  A declared `needs` is a promise
+    the program makes about itself; a derived demand is what the operations it
+    actually calls require, taken from the standard library's own metadata.  A
+    program can under-declare, and only the second list catches that.
+    """
+
+    node: str = ""
+    origin: str = ""
+    alternatives: List[str] = field(default_factory=list)
+    satisfied: bool = False
+    covered_by: str = ""
+
+
+@dataclass
 class AuthorityGraph:
     """Every capability demand, and whether the intent actually holds it."""
 
     held: List[str] = field(default_factory=list)
     demands: List[AuthorityDemand] = field(default_factory=list)
+    derived: List[DerivedDemand] = field(default_factory=list)
+    unknown: List[str] = field(default_factory=list)
 
     def unmet(self) -> List[AuthorityDemand]:
         return [d for d in self.demands if not d.granted]
+
+    def unmet_derived(self) -> List[DerivedDemand]:
+        return [d for d in self.derived if not d.satisfied]
 
     def render(self) -> List[str]:
         lines = [f"  held by the intent: {', '.join(self.held) or '(none)'}"]
@@ -433,7 +495,34 @@ class AuthorityGraph:
             mark = "ok" if demand.granted else "UNMET"
             lines.append(f"    {demand.node} needs "
                          f"{', '.join(demand.needs)} [{mark}]")
+        for demand in self.derived:
+            mark = "ok" if demand.satisfied else "UNMET"
+            covered = (f", covered by `{demand.covered_by}`"
+                       if demand.covered_by else "")
+            lines.append(f"    {demand.node} demands "
+                         f"{' or '.join(demand.alternatives)} "
+                         f"because {demand.origin} [{mark}{covered}]")
+        if self.unknown:
+            lines.append("    not in the capability vocabulary: "
+                         + ", ".join(self.unknown))
         return lines
+
+
+@dataclass
+class RecoveryStep:
+    """One line of an intent's `recover` policy.
+
+    Spec section 10's own shape: an action, optionally bounded, optionally aimed
+    at something.  ``restore checkpoint baseline`` is action ``restore``, target
+    ``checkpoint baseline``.  The vocabulary of actions is the runtime's, so
+    there is one list of levels in the project and not two.
+    """
+
+    action: str = ""
+    count: Optional[int] = None
+    target: str = ""
+    raw: str = ""
+    pos: Optional[SourcePos] = None
 
 
 @dataclass
@@ -457,6 +546,9 @@ class RecoveryGraph:
     """
 
     obligations: List[RecoveryObligation] = field(default_factory=list)
+    #: the intent's declared escalation policy, and the checkpoints it may use
+    policy: List[RecoveryStep] = field(default_factory=list)
+    checkpoints: List[str] = field(default_factory=list)
 
     def faults(self) -> List[str]:
         return sorted({o.fault for o in self.obligations if o.fault})
@@ -469,6 +561,14 @@ class RecoveryGraph:
                              f"rounds, else {o.fault}")
             else:
                 lines.append(f"  {o.node}: {o.fault} ({o.reason})")
+        if self.policy:
+            lines.append("  declared policy, in escalation order:")
+            for step in self.policy:
+                bound = f" within {step.count} rounds" if step.count else ""
+                target = f" {step.target}" if step.target else ""
+                lines.append(f"    {step.action}{bound}{target}")
+        if self.checkpoints:
+            lines.append("  checkpoints: " + ", ".join(self.checkpoints))
         return lines
 
 
@@ -570,6 +670,21 @@ def pattern_bindings(pattern: MPattern) -> Set[str]:
             out |= pattern_bindings(arg)
         return out
     return set()
+
+
+def reads_of(node: OpNode) -> List[str]:
+    """Every binding a node reads, in a stable order.
+
+    The declared relationships plus the references actually present.  The checker
+    requires the two to agree, so for a checked model this is normally just
+    ``node.consumes``; walking the expressions as well means an unchecked model
+    still gives a usable answer, which is what the memory model needs in order to
+    compute an extent before it can be trusted.
+    """
+    found: Set[str] = set(node.consumes)
+    for expr in node_expressions(node):
+        references(expr, found)
+    return sorted(found)
 
 
 def node_expressions(node: OpNode) -> List[Optional[MExpr]]:

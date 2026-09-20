@@ -288,6 +288,10 @@ class GFunction:
     recovery: Optional[RecoveryPlan] = None
     audit_points: int = 0
     recovery_points: int = 0
+    # boundaries the lowering made explicit, counted so that a tool can tell
+    # whether a program has any at all rather than inferring it from the body
+    secret_points: int = 0
+    cap_points: int = 0
 
     def block(self, bid: str) -> Optional[BasicBlock]:
         for b in self.blocks:
@@ -332,6 +336,10 @@ class GFunction:
                               f"writes={t.writes} depends_on={deps}")
         if self.recovery:
             header.append(f"  recovery plan: {len(self.recovery.steps)} step(s)")
+        if self.cap_points:
+            header.append(f"  capability boundaries: {self.cap_points}")
+        if self.secret_points:
+            header.append(f"  secret boundaries: {self.secret_points}")
         body: List[str] = []
         for b in self.blocks:
             body.extend(b.render(self))

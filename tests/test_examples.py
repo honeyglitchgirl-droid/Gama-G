@@ -26,14 +26,15 @@ class ExampleInventory(unittest.TestCase):
                          "the example set changed; update this test and the "
                          "README's tour of the examples")
 
-    def test_the_six_core_examples_are_present(self):
+    def test_the_core_examples_are_present(self):
         expected = {
-            "core/classify.gg", "core/converge.gg", "core/dose.gg",
-            "core/ledger.gg", "core/selection.gg", "core/traverse.gg",
+            "core/classify.gg", "core/converge.gg", "core/custody.gg",
+            "core/dose.gg", "core/ledger.gg", "core/recover.gg",
+            "core/selection.gg", "core/traverse.gg",
         }
         self.assertEqual(set(S.core_example_names()), expected,
                          "the core example set changed; update this test, the "
-                         "README's tour and docs/DESIGN_v0_2.md")
+                         "README's tour and the design documents")
 
     def test_every_example_uses_only_supported_comment_syntax(self):
         """Comments are `//` and `/* */`; a `#` comment is a lex error."""

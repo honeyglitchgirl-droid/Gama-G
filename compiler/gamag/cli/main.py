@@ -22,7 +22,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from .. import GIR_VERSION, SPEC_VERSION, __version__
 from ..diagnostics import GamaRuntimeFault
-from ..driver import Compilation, compile_file, execute, find_entry
+from ..driver import Compilation, compile_file, execute, find_entry, program_grants
 from ..std import library as L
 
 EXIT_OK = 0
@@ -83,6 +83,13 @@ def build_parser() -> argparse.ArgumentParser:
     add_common(p)
     p.add_argument("--edges", action="store_true",
                    help="list every derived dependency edge")
+
+    p = sub.add_parser(
+        "memory",
+        help="print the memory and resource model the core derived")
+    add_common(p)
+    p.add_argument("--slots", action="store_true",
+                   help="list every slot and the bindings that occupied it")
 
     p = sub.add_parser("run", help="compile and execute")
     add_common(p)
@@ -302,6 +309,69 @@ def cmd_graph(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def cmd_memory(args: argparse.Namespace) -> int:
+    """Print who owns what, for how long, and what that proves.
+
+    Spec section 8 asks for ownership, borrowing, controlled mutation and
+    deterministic destruction. This is those four as facts about one program
+    rather than as properties of an allocator: every release point below is a
+    level the compiler derived from the graph, and no collector decided any of
+    them at some later moment it chose.
+
+    It also prints the violations, which are expected to be none. A model that
+    could not report its own inconsistency would only be a report.
+    """
+    compilations, status = _compile(args.files, args)
+    if status != EXIT_OK:
+        for compilation in compilations:
+            _report(compilation, not args.no_color, args.json)
+        return status
+    for compilation in compilations:
+        memory = compilation.core_memory
+        if memory is None:
+            print(f"{compilation.path}: not a core program, so there is no "
+                  f"derived memory model to show.", file=sys.stderr)
+            return EXIT_USAGE
+        if getattr(args, "json", False):
+            print(json.dumps({
+                "path": compilation.path,
+                "bindings": [
+                    {"name": b.name, "kind": b.kind, "owner": b.owner,
+                     "borrowers": b.borrowers, "type": b.type.render(),
+                     "secret": b.secret, "mutable": b.mutable,
+                     "first_level": b.first, "last_level": b.last,
+                     "released_after": b.released_after,
+                     "slot": b.slot, "shares_with": b.shares_with}
+                    for b in sorted(memory.bindings.values(),
+                                    key=lambda x: (x.first, x.name))],
+                "slots": [{"index": life.index,
+                           "occupants": [b.name for b in life.occupants],
+                           "reused": life.reused} for life in memory.slots],
+                "acquisitions": [
+                    {"node": a.node, "resource": a.resource,
+                     "effect": a.effect, "spans": a.spans}
+                    for a in memory.acquisitions],
+                "slots_saved": memory.slots_saved,
+                "violations": memory.violations,
+            }, indent=2))
+            continue
+        print(memory.render())
+        if args.slots:
+            print()
+            print("slots:")
+            for life in memory.slots:
+                occupants = ", ".join(f"{b.name}[{b.first}..{b.last}]"
+                                      for b in life.occupants)
+                note = "  (reused)" if life.reused else ""
+                print(f"  %{life.index}: {occupants}{note}")
+        if memory.violations:
+            # A violation is the compiler disagreeing with itself, not the
+            # program being wrong, so it is reported as a compilation failure
+            # rather than a runtime one.
+            return EXIT_COMPILE
+    return EXIT_OK
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     compilations, status = _compile(args.files, args)
     if status != EXIT_OK:
@@ -320,8 +390,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         from ..runtime.context import Context
         ctx = Context(
             deterministic=not args.lenient_runtime,
-            grants=set(args.grant) | set(
-                compilation.checker.grants if compilation.checker else ()),
+            grants=program_grants(compilation, args.grant),
             program_version=__version__)
         result = execute(compilation, entry=entry, context=ctx)
         if not result.ok:
@@ -386,8 +455,8 @@ def cmd_test(args: argparse.Namespace) -> int:
             label = name.split(":", 1)[1]
             category = categories.get(name, "")
             total += 1
-            ctx = Context(deterministic=True, grants=set(args.grant) | set(
-                compilation.checker.grants if compilation.checker else ()))
+            ctx = Context(deterministic=True,
+                          grants=program_grants(compilation, args.grant))
             from ..runtime.vm import VM
             vm = VM(compilation.program, ctx, compilation.checker)
             try:
@@ -524,6 +593,7 @@ COMMANDS = {
     "build": cmd_build,
     "gir": cmd_gir,
     "graph": cmd_graph,
+    "memory": cmd_memory,
     "run": cmd_run,
     "test": cmd_test,
     "explain": cmd_explain,

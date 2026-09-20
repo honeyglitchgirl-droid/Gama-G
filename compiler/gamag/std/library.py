@@ -1903,7 +1903,7 @@ _MAX_RANGE = 10_000_000
 
 @reg("__range", ("start", "end", "inclusive"), ret=T.ListType(T.ANY),
      hidden=True, doc="internal: materialise `a..b` / `a..=b`")
-def _range(ctx, start, end, inclusive):
+def _range_span(ctx, start, end, inclusive):
     if isinstance(start, bool) or isinstance(end, bool):
         raise TypeFault("range bounds must be numeric, not Bool")
     if isinstance(start, float) or isinstance(end, float):

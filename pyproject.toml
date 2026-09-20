@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "gama-g"
-version = "0.3.0"
+version = "0.4.0"
 description = """Reference toolchain for the Gama-G language: an intent-and-operation \
 core, a native semantic IR, Gama IR, and a reference abstract execution model."""
 readme = "README.md"

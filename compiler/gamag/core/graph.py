@@ -33,7 +33,9 @@ import re
 from typing import Dict, List, Optional, Set, Tuple
 
 from ..diagnostics import DiagnosticBag, Phase
+from . import capability as CAP
 from . import mir as M
+from . import recovery as REC
 from .parser import CoreSyntax
 
 COMPUTE_KINDS = ("compute", "refine", "fanout", "dispatch")
@@ -213,10 +215,12 @@ class ModelBuilder:
             if kind == "transition" and node.value is None:  # type: ignore[attr-defined]
                 self.error(f"transition `{node.name}` has no `computes` "
                            f"expression", node.pos, code="E-no-computes")
-            if node.effect and node.effect not in EFFECTS:
-                self.error(f"`{node.effect}` is not an effect", node.pos,
-                           code="E-unknown-effect",
-                           help_text="effects are: " + ", ".join(sorted(EFFECTS)))
+            for declared in node.effects:
+                if declared not in EFFECTS:
+                    self.error(
+                        f"`{declared}` is not an effect", node.pos,
+                        code="E-unknown-effect",
+                        help_text="effects are: " + ", ".join(sorted(EFFECTS)))
 
     # ------------------------------------------------------------------
     def _relationships(self) -> None:
@@ -296,14 +300,44 @@ class ModelBuilder:
 
     # ------------------------------------------------------------------
     def _authority(self) -> None:
-        """Every capability demand must be met by the intent's authority."""
-        held = set(self.model.intent.authority)
+        """Every capability demand must be met by the intent's authority.
+
+        "Met" is coverage under the capability algebra in
+        :mod:`gamag.core.capability`, not set membership. An intent holding
+        `PatientWrite` satisfies an operation demanding `PatientRead`, because
+        writing a store entails reading it; that implication is written down
+        there with its reason rather than being an accident of a comparison.
+
+        Two kinds of demand are checked. What a node *declares* in `needs` is a
+        promise about itself. What its calls *require*, taken from the standard
+        library's own `caps` metadata, is a fact -- and only the second catches a
+        program that under-declares.
+        """
+        policy = CAP.CapabilityPolicy.of(self.model.intent.authority)
         graph = self.model.authority
         graph.held = list(self.model.intent.authority)
+        graph.unknown = list(policy.unknown)
+        vocabulary = ", ".join(f"`{c}`" for c in sorted(CAP.KNOWN_CAPABILITIES))
+        for name in policy.unknown:
+            self.error(
+                f"`{name}` is not a capability the language knows",
+                self.model.intent.pos, code="E-unknown-capability",
+                help_text=f"the vocabulary is the specification's own "
+                          f"(section 12): {vocabulary}")
+
         for node in self.s.nodes:
+            for need in node.needs:
+                if not CAP.known(need.split("[")[0]) and \
+                        not CAP.Capability.parse(need).permission:
+                    self.error(
+                        f"`{node.name}` needs `{need}`, which is not a "
+                        f"capability the language knows", node.pos,
+                        code="E-unknown-capability",
+                        help_text=f"the vocabulary is: {vocabulary}")
             if not node.needs:
                 continue
-            missing = sorted(set(node.needs) - held)
+            missing = sorted(n for n in node.needs
+                             if not policy.covers(CAP.Capability.parse(n)))
             demand = M.AuthorityDemand(node=node.name, needs=list(node.needs),
                                        granted=not missing, missing=missing)
             graph.demands.append(demand)
@@ -311,18 +345,60 @@ class ModelBuilder:
                 self.error(
                     f"`{node.name}` needs {'`' + '`, `'.join(missing) + '`'} "
                     f"but the intent holds "
-                    f"{'`' + '`, `'.join(sorted(held)) + '`' if held else 'no authority'}",
+                    f"{'`' + '`, `'.join(sorted(CAP.held_names(policy))) + '`' if policy.held else 'no authority'}",
                     node.pos, code="E-authority-unmet",
                     help_text="an operation may not require authority its "
                               "intent does not have; add it to the intent's "
                               "`authority` or remove the demand")
         for name, state in self.model.operations.resources.items():
-            missing = sorted(set(state.authority) - held)
+            missing = sorted(n for n in state.authority
+                             if not policy.covers(CAP.Capability.parse(n)))
             if missing:
                 self.error(
                     f"state `{name}` is guarded by "
                     f"{'`' + '`, `'.join(missing) + '`'}, which the intent does "
                     f"not hold", state.pos, code="E-authority-unmet")
+
+        self._derived_demands(policy)
+
+    def _secret_bindings(self) -> Set[str]:
+        """Every binding whose declaration marks it secret."""
+        found: Set[str] = set()
+        for node in self.s.nodes:
+            if node.produces and (node.secret or
+                                  (node.type is not None and node.type.secret)):
+                found.add(node.produces)
+        return found
+
+    def _derived_demands(self, policy: "CAP.CapabilityPolicy") -> None:
+        """What the program's calls actually require, as opposed to declare."""
+        graph = self.model.authority
+        CAP.all_demands(self.model, self._secret_bindings(), policy)
+        for demand in policy.demands:
+            covered = demand.satisfied_by(policy.held)
+            by = next((h.name for h in policy.held
+                       if any(h.grants(a) for a in demand.alternatives)), "")
+            graph.derived.append(M.DerivedDemand(
+                node=demand.node, origin=demand.origin,
+                alternatives=[a.name for a in demand.alternatives],
+                satisfied=covered, covered_by=by))
+            if covered:
+                continue
+            wanted = " or ".join(f"`{a.name}`" for a in demand.alternatives)
+            secret = demand.secret
+            self.error(
+                f"`{demand.node}` needs {wanted} because {demand.origin}, but "
+                f"the intent holds "
+                f"{'`' + '`, `'.join(sorted(CAP.held_names(policy))) + '`' if policy.held else 'no authority'}",
+                demand.pos, code="E-capability-unmet",
+                help_text=(
+                    "spec section 12: a secret must not reach an ordinary "
+                    "renderer without `SecretExpose`. Redact it first, or give "
+                    "the intent that authority and accept that the value can "
+                    "leave"
+                    if secret else
+                    "add the capability to the intent's `authority`, or do not "
+                    "call an operation that requires it"))
 
     # ------------------------------------------------------------------
     def _order(self) -> None:
@@ -456,6 +532,23 @@ class ModelBuilder:
                     fault=selection.fallback_fault,
                     reason=f"{len(selection.members)} guards over `{binding}` "
                            f"were not proven complementary"))
+
+        # The intent's own escalation policy. Validating it here rather than at
+        # run time is what makes spec section 10's two requirements checkable:
+        # a policy may only escalate, and a restore must have recorded state to
+        # return to rather than state the runtime would have to invent.
+        policy = REC.policy_of(self.model.intent)
+        recovery.policy = list(policy.steps)
+        recovery.checkpoints = list(policy.checkpoints)
+        for code, pos, message, help_text in policy.validate():
+            self.error(message, pos, code=code, help_text=help_text)
+        if policy.steps and not policy.bounded:
+            self.error(
+                "a `retry` step in the recovery policy has no bound",
+                self.model.intent.pos, code="E-unbounded-recovery",
+                help_text="write `retry within N rounds`. Unbounded recovery is "
+                          "the same defect as unbounded refinement, and the "
+                          "core refuses it there for the same reason")
 
     # ------------------------------------------------------------------
     # the old names, kept as views so existing tools and tests keep working

@@ -14,12 +14,15 @@ from __future__ import annotations
 import os
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from . import ast_nodes as A
+from .core import capability as core_capability
 from .core import graph as core_graph
+from .core import memory as core_memory
 from .core import mir as CoreMIR
 from .core import native as core_native
+from .core import recovery as core_recovery
 from .core.parser import CoreParser, CoreSyntax
 from .diagnostics import (DiagnosticBag, GamaError, Phase, Severity, SourcePos)
 from .gir.builder import build_program
@@ -69,14 +72,21 @@ class Compilation:
     optimization: Optional[OptimizationReport] = None
     timings: PhaseTimings = field(default_factory=PhaseTimings)
     stopped_at: Optional[str] = None
-    # The v0.2 core front end (audit report sections 16-18).  `dialect` is
-    # "core" when the source opened with `gama core <version>`; `core` and
-    # `core_graph` then hold the program as written and the execution graph the
-    # compiler derived from it.  `module` is always the elaborated form that the
-    # rest of the pipeline consumes.
+    # The core front end (first audit sections 16-18, second audit section 13).
+    # `dialect` is "core" when the source opened with `gama core <version>`, and
+    # the fields below then hold the program as written, the semantic model the
+    # compiler derived from it, and the two models that give that derivation its
+    # formal meaning.  `module` stays None for a core program: nothing is
+    # elaborated into the older language's AST any more.
     dialect: str = "v0.1"
     core_syntax: Optional[CoreSyntax] = None
     core_model: Optional[CoreMIR.SemanticModel] = None
+    #: ownership, extents, releases and the proofs about them (audit priority 4)
+    core_memory: Optional[core_memory.MemoryModel] = None
+    #: what the program holds and what it demands (audit priority 5)
+    core_capabilities: Optional[core_capability.CapabilityPolicy] = None
+    #: the declared escalation policy, if any (audit priority 6)
+    core_recovery: Optional[core_recovery.RecoveryPolicy] = None
 
     @property
     def core_graph(self) -> Optional[CoreMIR.OperationGraph]:
@@ -250,6 +260,25 @@ def _compile_core(c: "Compilation", source: str, *, profile: str,
     for diag in model_bag.diagnostics:
         if diag not in c.bag.diagnostics:
             c.bag.add(diag)
+
+    # The two formal models. They are built whether or not GIR is being emitted,
+    # because `ggc graph` and `ggc memory` report on them without lowering, and
+    # because a model that only exists on the way to codegen is not a model.
+    c.core_capabilities = core_capability.CapabilityPolicy.of(
+        c.core_model.intent.authority)
+    core_capability.all_demands(c.core_model, checker.secret_bindings(),
+                                c.core_capabilities)
+    c.core_recovery = core_recovery.policy_of(c.core_model.intent)
+    c.core_memory = core_memory.build(c.core_model, checker=checker)
+    for violation in c.core_memory.violations:
+        model_bag.error(f"the memory model is inconsistent: {violation}",
+                        phase=Phase.GIR, code="E-memory-model",
+                        help_text="this is a compiler bug rather than a problem "
+                                  "with the program; please report it")
+    for diag in model_bag.diagnostics:
+        if diag not in c.bag.diagnostics:
+            c.bag.add(diag)
+
     c.timings.check = time.perf_counter() - t0
     if not model_bag.ok:
         c.stopped_at = "check"
@@ -260,7 +289,8 @@ def _compile_core(c: "Compilation", source: str, *, profile: str,
     t0 = time.perf_counter()
     lower_bag = DiagnosticBag()
     try:
-        c.program = core_native.lower(c.core_model, checker, lower_bag)
+        c.program = core_native.lower(c.core_model, checker, lower_bag,
+                                      memory=c.core_memory)
     except GamaError as exc:
         c.bag.add(exc.diagnostic)
         c.stopped_at = "lower"
@@ -319,8 +349,7 @@ def execute(compilation: Compilation, *, entry: str = "main",
     # explicit opt-out: pass your own Context, or `--lenient-runtime`.
     ctx = context or Context(
         deterministic=True,
-        grants=set(grants) | set(compilation.checker.grants
-                                 if compilation.checker else ()),
+        grants=program_grants(compilation, grants),
         program_version=GIR_VERSION)
     vm = VM(compilation.program, ctx, compilation.checker)
     result = Execution(context=ctx, vm=vm)
@@ -345,6 +374,32 @@ def run_source(source: str, path: str = "<source>", *, entry: str = "main",
         return compilation, Execution(fault=None)
     return compilation, execute(compilation, entry=entry, args=args,
                                 context=context, grants=grants)
+
+
+def program_grants(compilation: "Compilation",
+                   extra: Sequence[str] = ()) -> Set[str]:
+    """Every capability a run of this compilation is granted.
+
+    Three sources, and a core program relies on the second:
+
+    * what the caller asked for, on the command line or in a test harness;
+    * what the *program* declares -- a ``grant`` header in the older dialect, or
+      ``authority`` on a core intent, which the lowerer writes into
+      :attr:`GProgram.grants`;
+    * what the older checker resolved, when there is one.
+
+    Reading only the checker's grants is the defect this replaces. A core program
+    has no checker, so its declared authority reached nothing at all: the compiler
+    proved every capability demand was covered and the runtime then denied every
+    one of them, which looks like a bug in the program and is a disagreement
+    between two halves of the toolchain.
+    """
+    granted = set(extra)
+    if compilation.program is not None:
+        granted |= set(compilation.program.grants)
+    if compilation.checker is not None:
+        granted |= set(compilation.checker.grants)
+    return granted
 
 
 def find_entry(compilation: Compilation, preferred: str = "main") -> Optional[str]:

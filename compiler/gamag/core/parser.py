@@ -31,7 +31,7 @@ from . import mir as M
 # language a misspelled clause would otherwise silently drop a constraint or a
 # capability demand.
 CLAUSES = {
-    "intent": {"purpose", "authority", "trail"},
+    "intent": {"purpose", "authority", "trail", "recover", "checkpoint"},
     "source": set(),
     "state": {"starts", "authority"},
     "operation": {"uses", "yields", "effect", "needs", "holds", "when",
@@ -245,6 +245,10 @@ class CoreParser:
                 intent.authority = list(clause.get("names", []))
             elif keyword == "trail":
                 intent.trail = clause.get("text", "")
+            elif keyword == "recover":
+                intent.recovery = list(clause.get("steps", []))
+            elif keyword == "checkpoint":
+                intent.checkpoints = list(clause.get("names", []))
         return intent
 
     def _source(self) -> M.SourceNode:
@@ -304,7 +308,11 @@ class CoreParser:
         elif keyword == "needs":
             node.needs = list(clause.get("names", []))
         elif keyword == "effect":
-            node.effect = clause.get("text", "").strip()
+            # `effect crypto, audit` -- the algebra is a set, and the standard
+            # library's own operations declare more than one
+            node.effects = [part.strip() for part in
+                            clause.get("text", "").split(",")
+                            if part.strip()]
         elif keyword == "trail":
             node.trail = clause.get("text", "")
         elif keyword == "yields":
@@ -383,8 +391,11 @@ class CoreParser:
         if keyword in ("purpose", "trail", "effect"):
             clause["text"] = self._rest_of_line()
             return clause
-        if keyword in ("uses", "needs", "authority"):
+        if keyword in ("uses", "needs", "authority", "checkpoint"):
             clause["names"] = self._name_list()
+            return clause
+        if keyword == "recover":
+            clause["steps"] = self._recovery_block()
             return clause
         if keyword == "within":
             number = self.expect(TokenKind.INT, "a repetition bound")
@@ -444,6 +455,54 @@ class CoreParser:
                              self.peek())
         self.adv()
         return out
+
+    def _recovery_block(self) -> List[M.RecoveryStep]:
+        """An indented escalation policy, in the shape spec section 10 shows.
+
+        Each line is an action from the runtime's own vocabulary, optionally
+        bounded (`retry within 3 rounds`) and optionally aimed at something
+        (`restore checkpoint baseline`, `alert operator`). The action word is
+        recognised here so that the rest of the line can be kept as the target
+        verbatim -- the target is prose the operator reads, not a name the
+        compiler resolves.
+        """
+        if not self.at(TokenKind.NEWLINE):
+            raise self.error(
+                "expected an indented policy after `recover`", self.peek(),
+                help_text="write the actions on their own lines, one per step, "
+                          "in escalation order")
+        self.adv()
+        if not self.at(TokenKind.INDENT):
+            raise self.error("expected indented recovery steps after `recover`",
+                             self.peek())
+        self.adv()
+        steps: List[M.RecoveryStep] = []
+        self.end_of_line()
+        while not self.at(TokenKind.DEDENT, TokenKind.EOF):
+            start = self.peek().pos.offset
+            pos = self.peek().pos
+            action = self.expect(TokenKind.IDENT, "a recovery action")
+            count: Optional[int] = None
+            if self.at_kw("within"):
+                self.adv()
+                number = self.expect(TokenKind.INT, "a number of rounds")
+                count = int(number.value)
+                if self.at(TokenKind.IDENT):     # `rounds`/`times` are optional
+                    self.adv()
+            target_start = self.peek().pos.offset
+            while not self.at(TokenKind.NEWLINE, TokenKind.DEDENT,
+                              TokenKind.EOF):
+                self.adv()
+            target = self._text_since(target_start).strip()
+            steps.append(M.RecoveryStep(
+                action=action.text, count=count, target=target,
+                raw=self._text_since(start).strip(), pos=pos))
+            self.end_of_line()
+        if not self.at(TokenKind.DEDENT):
+            raise self.error("unexpected end of file inside `recover`",
+                             self.peek())
+        self.adv()
+        return steps
 
     def _name_list(self) -> List[str]:
         names: List[str] = []

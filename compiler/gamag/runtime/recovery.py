@@ -56,6 +56,35 @@ ACTION_LEVELS: Dict[str, int] = {
 TERMINAL_ACTIONS = {"alert", "escalate"}
 
 
+def _checkpoint_label(target: str) -> str:
+    """The checkpoint a `restore` step names, or "" for "the latest one".
+
+    ``restore checkpoint baseline`` names ``baseline``. A bare ``restore
+    checkpoint`` names nothing and means the checkpoint the protected region
+    captured on entry, which is what the older surface has always meant by it.
+    Prose targets -- ``replay safe events`` -- are not checkpoint names either.
+    """
+    words = (target or "").split()
+    if not words:
+        return ""
+    if words[0] == "checkpoint":
+        return words[1] if len(words) > 1 else ""
+    return words[0] if len(words) == 1 else ""
+
+
+def describe_failure(exc: BaseException) -> str:
+    """One description of a failure, rather than its kind printed twice.
+
+    A :class:`GamaRuntimeFault` already renders as ``Kind: message``, and the
+    exception class is itself named after the kind -- so prefixing the rendering
+    with the class name reports the classification twice, which is what a
+    recovery trail then records and an operator then reads.
+    """
+    if getattr(exc, "kind", ""):
+        return str(exc)
+    return f"{type(exc).__name__}: {exc}"
+
+
 @dataclass
 class RecoveryStepSpec:
     """One parsed line of a ``recover`` block."""
@@ -142,7 +171,7 @@ class RecoveryEngine:
         except CheckpointRejected as exc:
             last_error = "checkpoint rejected: " + "; ".join(exc.problems)
         except Exception as exc:                      # noqa: BLE001
-            last_error = f"{type(exc).__name__}: {exc}"
+            last_error = describe_failure(exc)
 
         for step in steps:
             action = RecoveryAction(step=step, level=step.level)
@@ -170,7 +199,7 @@ class RecoveryEngine:
                     except CheckpointRejected as exc:
                         last_error = "checkpoint rejected: " + "; ".join(exc.problems)
                     except Exception as exc:          # noqa: BLE001
-                        last_error = f"{type(exc).__name__}: {exc}"
+                        last_error = describe_failure(exc)
 
         # Policy exhausted without recovery: escalate to an operator.
         if not outcome.recovered:
@@ -205,14 +234,23 @@ class RecoveryEngine:
             return (f"{action} completed for `{name}`", True)
 
         if action == "restore":
-            # Never invent state: restore only genuinely recorded state.
+            # Never invent state: restore only genuinely recorded state, and when
+            # the policy named a checkpoint, restore *that* one.
+            label = _checkpoint_label(step.target)
+            chosen = self.ctx.checkpoints.with_label(label)
+            if label and chosen is None:
+                return (f"refusing to restore `{label}`: no checkpoint was ever "
+                        f"recorded under that name, and inventing one is what "
+                        f"spec section 10 forbids", False)
             try:
-                state = self.ctx.checkpoints.restore()
+                state = self.ctx.checkpoints.restore(chosen)
             except CheckpointRejected as exc:
                 return ("refusing to restore: " + "; ".join(exc.problems), False)
             restored = self.ctx.apply_restored_state(state)
+            used = chosen or self.ctx.checkpoints.latest()
             return (f"restored {len(restored)} state binding(s) from checkpoint "
-                    f"{self.ctx.checkpoints.latest().id}", True)
+                    f"{used.id if used else '?'}"
+                    + (f" (`{label}`)" if label else ""), True)
 
         if action == "replay":
             events = self.ctx.replay_safe_events()

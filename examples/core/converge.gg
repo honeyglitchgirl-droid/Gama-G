@@ -10,9 +10,13 @@
 
 gama core 0.2
 
+// No `authority` clause: this intent reads nothing, writes nothing and reaches
+// no network, so it demands no capability at all. Capability names come from the
+// specification's own vocabulary (section 12) and an unknown one is refused, so
+// this is not a place to invent one.
+
 intent SquareRoot
     purpose    converge on a square root by repeated refinement
-    authority  ComputeOnly
 
 source n : F64 from 2.0
 
