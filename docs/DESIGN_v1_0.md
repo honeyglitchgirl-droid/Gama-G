@@ -176,12 +176,13 @@ section: never claim a capability the toolchain lacks.
   can measure it.  It exists because the alternative was a symmetric MAC, which
   proves possession of a shared secret rather than identity; in production, use
   an audited library.
-- **The nesting and call-depth limits are host-derived.**  A default CPython
-  host carries about 50 levels of syntactic nesting, about 256 levels of AST
-  depth and about 129 Gama-G call frames; the limits move with
-  `sys.setrecursionlimit`.  Exceeding any of them is a diagnostic or a
-  classified fault, never a traceback -- but a realistic recursive algorithm is
-  bounded by that 129 until the interpreter has an explicit call stack.
+- **The nesting and tree-depth limits are host-derived.**  A default CPython
+  host carries about 52 levels of syntactic nesting and 256 levels of tree
+  depth, and those limits move with `sys.setrecursionlimit`, because the parser
+  and the tree walkers are recursive.  Exceeding either is a diagnostic naming
+  the limit, never a traceback.  Call depth is no longer in this list: the
+  interpreter has an explicit stack, so its limit is the language's own 1500
+  frames and does not move with the host.
 - **The fuzzer found eight bugs and no more.**  That is a statement about the
   campaigns that were run, not about the absence of bugs.
 - **No performance claim is made anywhere.**  The benchmark harness reports
@@ -257,7 +258,25 @@ something.
     compiler error`, and the first implementation of the parallel rule was
     blind to an effect that the enclosing function had already performed before
     the region.
-16. **The wheel omitted the C runtime.**  `gamag_rt.c` is not a Python module,
+16. **The interpreter's call depth was the host's, not the language's.**  The
+    guard has failed twice in the same way.  First it was set to 1500 frames
+    while the recursive interpreter needed about six host frames per Gama-G
+    call, so it never fired and the user was told `internal error:
+    RecursionError` (defect 13).  Deriving it from the host stack made the
+    guard fire, and made the *effective* limit 129 frames -- a number no
+    Gama-G program can be written against, and one that moved when
+    `sys.setrecursionlimit` was changed.  The interpreter now keeps its
+    activations on an explicit stack: `execute` is a loop over `Activation`
+    records and a call is a suspension point (`run_from` saves the instruction
+    pointer and the trampoline pushes the new activation).  A Gama-G frame
+    costs no host frame, 1200-deep recursion runs, the ceiling is 1500, and
+    lowering `sys.setrecursionlimit` to 300 changes nothing.  Measured cost:
+    about 13% on a call-bound benchmark (40 x `fib(16)`, 127,722 calls: 1.64 s
+    before, 1.86 s after, median of five runs on this host) -- the price of the
+    bounded-fault guarantee being reachable rather than nominal, paid in the
+    reference interpreter, which is the one component where clarity is worth
+    more than speed.
+17. **The wheel omitted the C runtime.**  `gamag_rt.c` is not a Python module,
     so setuptools left it out and `ggc native` would have failed on every
     installed copy while working from a checkout.  Found while writing the CI
     packaging job, which now runs `ggc native` after installing.

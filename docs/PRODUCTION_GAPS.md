@@ -54,11 +54,18 @@ ggc run deep_but_legitimate.gg     # 126 levels of recursion: runs
 ggc run runaway_recursion.gg       # past the limit: runtime fault [StackOverflow]
 ```
 
-The honest reading of this fix: a realistic recursive algorithm is limited to
-about 129 frames on a default host.  Raising `sys.setrecursionlimit` raises the
-limit proportionally, and the remaining real fix -- an interpreter with an
-explicit call stack rather than a recursive one -- is future work.  The limit
-is documented rather than silent, which is the part that matters.
+The honest reading of that fix, at the time: it made the guard fire, but it
+also made the *effective* limit 129 frames -- a number that moves when
+`sys.setrecursionlimit` moves, and that no Gama-G program can be written
+against.
+
+**That is now repaired.**  The interpreter keeps its activations on an explicit
+stack (`run_from` suspends at a call, the trampoline pushes the activation), so
+a Gama-G frame costs no host frame.  Measured: 1200-deep recursion runs;
+`VM.MAX_DEPTH` (1500) is the limit that actually applies and the fault names
+it; and lowering `sys.setrecursionlimit` to 300 changes none of that.  The cost
+is about 13% on a call-bound benchmark (40 x `fib(16)`, 127,722 calls: 1.64 s
+before, 1.86 s after, median of five runs on this host).
 
 ### 2.2 A file that was not UTF-8 crashed the compiler (fixed)
 
@@ -170,8 +177,9 @@ one is already stated in `docs/DESIGN_v1_0.md` section 5.
 
 In rough order of return on effort:
 
-1. An interpreter with an explicit call stack, removing the ~129-frame recursion
-   limit for real recursive algorithms.
+1. ~~An interpreter with an explicit call stack, removing the ~129-frame
+   recursion limit~~ -- **done** in this revision, with its cost measured and
+   stated rather than assumed.
 2. Capability enforcement in the native runtime, so the security model does not
    depend on refusal alone.
 3. A free/release path in the arena, so the memory model's extents mean

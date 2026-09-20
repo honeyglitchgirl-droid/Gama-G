@@ -116,32 +116,6 @@ def ast_depth_limit() -> int:
     return _budget(FRAMES_PER_AST_LEVEL, MAX_AST_DEPTH)
 
 
-#: Python frames one Gama-G *call* costs.  The interpreter is recursive --
-#: ``execute`` calls ``run_block`` calls an opcode handler calls back into
-#: ``execute`` -- and this is that per-call cost, measured by finding the
-#: recursion depth at which the reference interpreter ran out of host stack.
-FRAMES_PER_VM_CALL = 6
-
-#: Frames kept in hand for the call-depth fault itself.  A stack overflow is
-#: detected at the top of the deepest Gama-G call, so the fault has to be
-#: built, raised, unwound through every frame, and given to the transaction
-#: bookkeeping -- all while the stack is at its fullest.
-VM_STACK_RESERVE = 220
-
-
-def vm_depth_limit(ceiling: int) -> int:
-    """Effective limit on Gama-G call depth for the host as configured now.
-
-    This is what makes the language's call-depth guarantee *reachable*.  The
-    policy ceiling used to be 1500 frames while the host could only carry about
-    a quarter of that, so the guard never fired and the user got a raw
-    ``RecursionError`` -- reported by the CLI as an internal error, which is
-    the one thing a call-depth limit must never look like.  Deriving the limit
-    from the host means the guard fires first, always, and reports a fault.
-    """
-    return _budget(FRAMES_PER_VM_CALL, ceiling, VM_STACK_RESERVE)
-
-
 # ----------------------------------------------------------------------
 # bounding the parsers
 # ----------------------------------------------------------------------

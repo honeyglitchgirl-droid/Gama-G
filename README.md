@@ -314,11 +314,13 @@ emits has ever been executed; `ggc wasm` says so when it writes one.  There is n
 accelerator either, so no kernel has been run: `ggc device` reports the CPU as
 the device that ran the work rather than falling back silently.
 
-**Input is bounded, not crashed on.**  Nesting and call depth are limited by
-what the host stack can carry -- about 50 levels of syntactic nesting and about
-129 call frames on a default CPython host -- and exceeding either is a
-diagnostic or a classified runtime fault naming the limit, never a Python
-traceback.  A file that is not UTF-8 is a diagnostic too.
+**Input is bounded, not crashed on.**  Syntactic nesting and tree depth are
+limited by what the host stack can carry -- about 52 levels of nesting and 256
+levels of tree depth on a default CPython host -- and exceeding either is a
+diagnostic naming the limit, never a Python traceback.  Call depth is *not*
+host-derived: the interpreter keeps its activations on an explicit stack, so a
+Gama-G frame costs no host frame and the limit is the language's own ceiling of
+1500 frames.  A file that is not UTF-8 is a diagnostic too.
 
 **No performance claim** is made anywhere.  `ggc bench` measures and reports the
 conditions of the measurement, and refuses to compare two runs whose conditions

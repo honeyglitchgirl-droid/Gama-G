@@ -24,7 +24,6 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Set
 
 from ..diagnostics import (ContractViolation, CapabilityViolation,
                            GamaRuntimeFault, SecretLeak, SourcePos, TypeFault)
-from ..nesting import vm_depth_limit
 from ..gir.ir import GFunction, GProgram, Instr, Op
 from ..semantic import types as T
 from ..std import library as L
@@ -69,13 +68,37 @@ class _Jump(Exception):
     pass
 
 
-class Frame:
-    __slots__ = ("fn", "slots", "depth")
+#: Control results that carry no payload.  Returned as shared objects rather
+#: than fresh tuples: a block transition happens for every `while` iteration
+#: and every call, and the allocation was measurable.
+_JUMPED: Tuple[str, Any] = ("jump", None)
+_ENDED: Tuple[str, Any] = ("end", None)
 
-    def __init__(self, fn: GFunction, depth: int):
+
+class Activation:
+    """One Gama-G function activation on the interpreter's explicit stack.
+
+    This is also the frame: the two were separate records until the profiler
+    showed the split costing an allocation and an indirection per call for
+    nothing.  The opcode handlers read ``slots``, so it is the same object
+    they already took.
+
+    ``bid``/``pc`` are the resume point -- where this activation was when it
+    yielded control to a call.  ``dst`` is the slot the call's result belongs
+    in, and ``steps`` counts basic-block transitions for the runaway-loop
+    bound that used to live in a host frame.
+    """
+
+    __slots__ = ("fn", "slots", "depth", "bid", "pc", "dst", "steps")
+
+    def __init__(self, fn: GFunction, depth: int, dst: int):
         self.fn = fn
         self.slots: List[Any] = [None] * len(fn.slots)
         self.depth = depth
+        self.bid: Optional[str] = fn.entry
+        self.pc = 0
+        self.dst = dst
+        self.steps = 0
 
 
 # Method dispatch tables: `obj.method(args)` resolved by the runtime type of
@@ -106,14 +129,17 @@ from ..methods import (  # single source of truth, shared with the checker
 
 
 class VM:
-    #: Policy ceiling on Gama-G call depth.  The *effective* limit is lower
-    #: whenever the host stack cannot carry this many frames, because the
-    #: interpreter is recursive: each Gama-G call costs about
-    #: ``nesting.FRAMES_PER_VM_CALL`` Python frames, and exhausting the host
-    #: stack is a crash rather than a fault.  Raising the host's recursion
-    #: limit raises this back towards the ceiling.
+    #: Policy ceiling on Gama-G call depth.  This is now the *effective* limit
+    #: as well: the interpreter keeps its activations on an explicit stack, so
+    #: a Gama-G frame costs no host frames and the host stack cannot be reached
+    #: first.  Recursion through a standard-library callback (`map`, `filter`,
+    #: a comparator) still re-enters through the host stack, and a host
+    #: overflow there is translated into the same `StackOverflow` fault.
     MAX_DEPTH = 1500
     CHECKPOINT_POLL_INSTRS = 512
+    #: Basic-block transitions one activation may make.  A `while` loop is a
+    #: back edge, so this is what bounds a runaway loop that never returns.
+    MAX_BLOCK_TRANSITIONS = 5_000_000
 
     def __init__(self, program: GProgram, context: Optional[Context] = None,
                  checker: Any = None):
@@ -122,10 +148,9 @@ class VM:
         self.checker = checker
         self.globals: Dict[str, Any] = {}
         self.lock = threading.RLock()
-        self.depth = 0
-        # Derived once, at construction, because the budget depends on how
-        # much host stack is already in use and that only grows from here.
-        self.max_depth = vm_depth_limit(self.MAX_DEPTH)
+        #: Per-thread activation stacks; `depth` is derived from this.
+        self._tls = threading.local()
+        self.max_depth = self.MAX_DEPTH
         self._armed_checkpoint: Optional[float] = None
         self._since_poll = 0
         # Whether the `<main>` module initializer has run yet.
@@ -135,8 +160,7 @@ class VM:
             Op.LOAD_GLOBAL: self.op_load_global,
             Op.STORE_GLOBAL: self.op_store_global,
             Op.BINOP: self.op_binop, Op.UNOP: self.op_unop, Op.CAST: self.op_cast,
-            Op.CALL: self.op_call, Op.CALL_INDIRECT: self.op_call_indirect,
-            Op.BUILTIN: self.op_builtin, Op.METHOD_CALL: self.op_method_call,
+            Op.BUILTIN: self.op_builtin,
             Op.MAKE_LIST: self.op_make_list, Op.MAKE_MAP: self.op_make_map,
             Op.MAKE_SET: self.op_make_set, Op.MAKE_TUPLE: self.op_make_tuple,
             Op.MAKE_RECORD: self.op_make_record,
@@ -287,85 +311,185 @@ class VM:
     # ------------------------------------------------------------------
     def execute(self, fn: GFunction, args: List[Any],
                 pos: Optional[SourcePos] = None) -> Any:
-        with self.lock:
-            self.depth += 1
-        if self.depth > self.max_depth:
-            self.depth -= 1
+        """Run `fn` to completion on this thread's activation stack.
+
+        The interpreter used to be recursive: ``execute`` called ``run_block``,
+        which called an opcode handler, which called ``execute`` again -- about
+        six host frames per Gama-G call.  That is why the call-depth limit was
+        derived from the host's configured stack instead of from this
+        interpreter's policy ceiling, and why ``MAX_DEPTH = 1500`` was
+        unreachable in practice: the host ran out first.  Recursion is now a
+        loop over `Activation` records, so a Gama-G frame costs no host frame
+        and the limit is the number the language says it is.
+        """
+        stack = self._tls_stack()
+        base = len(stack)
+        self._push(stack, fn, args, pos, -1)
+        try:
+            while len(stack) > base:
+                act = stack[-1]
+                kind, payload = self.run_from(act)
+                if kind == "call":
+                    target, call_args, dst, call_pos = payload
+                    self._push(stack, target, call_args, call_pos, dst)
+                elif kind in ("return", "end"):
+                    act = stack.pop()
+                    value = self.coerce_return(
+                        payload if kind == "return" else UNIT, act.fn)
+                    if len(stack) > base:
+                        if act.dst >= 0:
+                            self.store(stack[-1], act.dst, value)
+                    else:
+                        return value
+        except RecursionError:
+            # The activation stack is explicit and costs no host frames, so
+            # this can only come from a path that still re-enters the
+            # interpreter through the host stack: a standard-library builtin
+            # invoking a Gama-G function (`map`, `filter`, a comparator).
+            # Translated into a language-level fault rather than escaping as
+            # an internal error.
+            raise GamaRuntimeFault(
+                "StackOverflow",
+                f"call depth exceeded {self.max_depth} frames "
+                f"(re-entered through a standard-library callback)",
+                pos, context={"function": fn.name, "limit": self.max_depth},
+                hint="the limit is a policy ceiling, not a property of the "
+                     "host stack; rewrite the recursion iteratively")
+        except GamaRuntimeFault as fault:
+            # Spec section 18: a transaction that fails before it commits must
+            # not leave its effects half applied.  Emitting begin ... body ...
+            # commit leaves no branch to hang an abort on, so this is the only
+            # place a failed transaction can be marked aborted; otherwise it
+            # would stay "open" forever and the audit trail would show a begin
+            # with no matching outcome.
+            failed = stack[-1].fn if len(stack) > base else fn
+            active = self.ctx.active_transaction
+            if active is not None and self.ctx.transaction_owner == failed.name:
+                # the function that opened the still-active transaction is the
+                # one whose fault closes it
+                self.ctx.abort_transaction(
+                    active, f"{fault.kind}: {fault.message}")
+                self.ctx.active_transaction = None
+                self.ctx.transaction_owner = None
+            elif failed.kind == "transaction":
+                self.ctx.abort_transaction(
+                    failed.name, f"{fault.kind}: {fault.message}")
+            raise
+        finally:
+            # Unwind this trampoline.  `depth` is derived from the stack, so
+            # there is no counter to keep in step; a nested trampoline (a
+            # builtin calling back in) leaves the outer activations alone.
+            del stack[base:]
+
+    def _tls_stack(self) -> List["Activation"]:
+        """The activation stack for the calling thread.
+
+        Per-thread because `parallel` runs its tasks on real threads (see
+        `_run_task`), and two threads must not share one stack.
+        """
+        stack = getattr(self._tls, "stack", None)
+        if stack is None:
+            stack = []
+            self._tls.stack = stack
+        return stack
+
+    @property
+    def depth(self) -> int:
+        """Gama-G frames currently active on this thread."""
+        return len(self._tls_stack())
+
+    def _push(self, stack: List["Activation"], fn: GFunction, args: List[Any],
+              pos: Optional[SourcePos], dst: int) -> "Activation":
+        if len(stack) >= self.max_depth:
             raise GamaRuntimeFault(
                 "StackOverflow",
                 f"call depth exceeded {self.max_depth} frames",
                 pos,
                 context={"function": fn.name, "limit": self.max_depth},
-                hint=("the limit is what this host's stack carries, not a "
-                      "fixed language rule; rewrite the recursion "
-                      "iteratively, or raise sys.setrecursionlimit"))
-        frame = Frame(fn, self.depth)
-        try:
-            for i, slot in enumerate(fn.params):
-                value = args[i] if i < len(args) else default_for(fn.slots[slot].type)
-                self.store(frame, slot, value)
-            if len(args) > len(fn.params):
-                raise TypeFault(
-                    f"`{fn.name}` takes {len(fn.params)} argument(s) but "
-                    f"received {len(args)}", pos)
-            self.ctx.stats.calls += 1
-            bid = fn.entry
-            steps = 0
-            try:
-                while bid is not None:
-                    block = fn.block(bid)
-                    if block is None:
-                        raise GamaRuntimeFault(
-                            "BadGIR", f"block `{bid}` is missing from `{fn.name}`")
-                    next_bid, value, returned = self.run_block(frame, block)
-                    if returned:
-                        return self.coerce_return(value, fn)
-                    bid = next_bid
-                    steps += 1
-                    if steps > 5_000_000:
-                        raise GamaRuntimeFault(
-                            "RunawayLoop",
-                            f"`{fn.name}` exceeded the basic-block step budget")
-                return UNIT
-            except RecursionError:
-                # The bound above is derived from the host stack and should
-                # always fire first.  It cannot when the stack is shallower
-                # than the host reports -- a worker thread, an embedder with a
-                # deep stack of its own -- so the overflow is translated here
-                # rather than escaping as an internal error.
-                raise GamaRuntimeFault(
-                    "StackOverflow",
-                    f"call depth exceeded the {self.max_depth} frames this "
-                    f"host stack can carry",
-                    pos, context={"function": fn.name},
-                    hint="rewrite the recursion iteratively, or run on a "
-                         "host with a deeper stack")
-            except GamaRuntimeFault as fault:
-                # Spec section 18: a transaction that fails before it commits
-                # must not leave its effects half applied.  Emitting
-                # begin ... body ... commit leaves no branch to hang an abort on,
-                # so this is the only place a failed transaction can be marked
-                # aborted; otherwise it would stay "open" forever and the audit
-                # trail would show a begin with no matching outcome.
-                active = self.ctx.active_transaction
-                if active is not None and self.ctx.transaction_owner == fn.name:
-                    # the function that opened the still-active transaction is the
-                    # one whose fault closes it
-                    self.ctx.abort_transaction(
-                        active, f"{fault.kind}: {fault.message}")
-                    self.ctx.active_transaction = None
-                    self.ctx.transaction_owner = None
-                elif fn.kind == "transaction":
-                    self.ctx.abort_transaction(
-                        fn.name, f"{fault.kind}: {fault.message}")
-                raise
-        finally:
-            with self.lock:
-                self.depth -= 1
+                hint=(f"the limit is a language policy ceiling "
+                      f"({self.MAX_DEPTH} frames), not a property of the "
+                      f"host stack; rewrite the recursion iteratively"))
+        if len(args) > len(fn.params):
+            raise TypeFault(
+                f"`{fn.name}` takes {len(fn.params)} argument(s) but "
+                f"received {len(args)}", pos)
+        act = Activation(fn, len(stack) + 1, dst)
+        for i, slot in enumerate(fn.params):
+            value = args[i] if i < len(args) else default_for(fn.slots[slot].type)
+            self.store(act, slot, value)
+        self.ctx.stats.calls += 1
+        stack.append(act)
+        return act
 
-    def run_block(self, frame: Frame, block) -> Tuple[Optional[str], Any, bool]:
-        for instr in block.instrs:
+    def _callee(self, name: str, pos: Optional[SourcePos]) -> GFunction:
+        """The GIR function a call by name enters.  Mirrors `call_function`."""
+        fn = self.prog.functions.get(name)
+        if fn is None:
+            value = self.globals.get(name)
+            if isinstance(value, GFnValue):
+                fn = value.gir
+        if fn is None:
+            raise GamaRuntimeFault(
+                "UnknownFunction", f"no GIR function named `{name}`", pos)
+        return fn
+
+    def _indirect_callee(self, callee: Any, args: List[Any],
+                         pos: Optional[SourcePos]) -> Tuple[str, Any]:
+        """What a call through a value enters.  Mirrors `call_value`."""
+        if isinstance(callee, GFnValue):
+            return "gir", callee.gir
+        if isinstance(callee, GBuiltinRef):
+            return "value", self.invoke_builtin(callee.builtin, args)
+        if isinstance(callee, GComponent):
+            target = callee.methods.get("run") or callee.methods.get("evaluate") \
+                or callee.methods.get("send") or callee.name
+            return "gir", self._callee(target, pos)
+        if isinstance(callee, GVariant):
+            return "value", callee
+        raise TypeFault(
+            f"{type_name(callee)} is not callable",
+            hint="only functions, pipelines, models, services, policies and "
+                 "standard-library builtins can be called")
+
+    def _method_callee(self, obj: Any, method: str) -> Optional[GFunction]:
+        """The GIR function a method call enters, if it enters one.
+
+        A component's methods and a `fn` value held in a slot are Gama-G
+        functions, so calling them goes through the activation stack like any
+        other call.  Everything else -- builtins, tensor kernels, record
+        fields -- `dispatch_method` runs in place.
+        """
+        if isinstance(obj, GComponent):
+            target = obj.methods.get(method)
+            if target is None:
+                return None         # dispatch_method reports it with context
+            return self._callee(target, None)
+        if isinstance(obj, GFnValue):
+            return obj.gir
+        return None
+
+    def run_from(self, act: "Activation") -> Tuple[str, Any]:
+        """Run `act`'s current block until it yields control.
+
+        Returns ``("jump", None)`` when the block changed, ``("call", (fn,
+        args, dst, pos))`` when a Gama-G call is required, ``("return",
+        value)`` at a ``return``, and ``("end", None)`` when the block ran off
+        its end -- which is also how a function yields UNIT.  The instruction
+        pointer is saved in the activation, so a call resumes exactly where it
+        left off, and no host frame is consumed per Gama-G frame.
+        """
+        fn = act.fn
+        block = fn.block(act.bid)
+        if block is None:
+            raise GamaRuntimeFault(
+                "BadGIR", f"block `{act.bid}` is missing from `{fn.name}`")
+        instrs = block.instrs
+        i = act.pc
+        n = len(instrs)
+        while i < n:
+            instr = instrs[i]
             if instr.dead:
+                i += 1
                 continue
             self.ctx.step()
             self._since_poll += 1
@@ -374,32 +498,87 @@ class VM:
                 self._poll_armed_checkpoint()
             op = instr.op
             if op is Op.JUMP:
-                return instr.meta["target"], None, False
+                act.bid = instr.meta["target"]
+                act.pc = 0
+                act.steps += 1
+                if act.steps > self.MAX_BLOCK_TRANSITIONS:
+                    raise GamaRuntimeFault(
+                        "RunawayLoop",
+                        f"`{fn.name}` exceeded the basic-block step budget")
+                return _JUMPED
             if op is Op.JUMP_IF:
-                cond = truthy(self.resolve(frame, instr.args[0]))
+                cond = truthy(self.resolve(act, instr.args[0]))
                 target = instr.meta["target"] if cond else \
                     instr.meta.get("target_false")
-                return target, None, False
+                act.pc = 0
+                if target is None:
+                    return _ENDED
+                act.bid = target
+                act.steps += 1
+                if act.steps > self.MAX_BLOCK_TRANSITIONS:
+                    raise GamaRuntimeFault(
+                        "RunawayLoop",
+                        f"`{fn.name}` exceeded the basic-block step budget")
+                return _JUMPED
             if op is Op.RETURN:
-                value = self.resolve(frame, instr.args[0]) if instr.args else UNIT
-                return None, value, True
+                value = self.resolve(act, instr.args[0]) \
+                    if instr.args else UNIT
+                return "return", value
             if op is Op.FAULT:
                 raise GamaRuntimeFault(
                     str(instr.meta.get("kind", "Fault")),
                     str(instr.meta.get("message", "")), instr.pos)
             if op is Op.MATCH_FAIL:
-                value = self.resolve(frame, instr.args[0]) if instr.args else None
+                value = self.resolve(act, instr.args[0]) \
+                    if instr.args else None
                 raise GamaRuntimeFault(
                     "MatchError",
                     f"no match arm accepted a value of type {type_name(value)}",
                     instr.pos, context={"value": display(value)})
+            # Suspension points.  A call saves the resume point and returns to
+            # the trampoline, which pushes the new activation; the interpreter
+            # never calls itself, so call depth is a number this class owns.
+            if op is Op.CALL:
+                call_args = [self.resolve(act, a) for a in instr.args]
+                act.pc = i + 1
+                return "call", (self._callee(instr.meta["callee"], instr.pos),
+                                call_args, instr.dst, instr.pos)
+            if op is Op.CALL_INDIRECT:
+                callee = self.resolve(act, instr.args[0])
+                call_args = [self.resolve(act, a)
+                             for a in instr.args[1:]]
+                kind, target = self._indirect_callee(callee, call_args, instr.pos)
+                if kind == "gir":
+                    act.pc = i + 1
+                    return "call", (target, call_args, instr.dst, instr.pos)
+                if instr.dst >= 0:
+                    self.store(act, instr.dst, target)
+                i += 1
+                continue
+            if op is Op.METHOD_CALL:
+                obj = self.resolve(act, instr.args[0])
+                call_args = [self.resolve(act, a)
+                             for a in instr.args[1:]]
+                target = self._method_callee(obj, instr.meta["method"])
+                if target is not None:
+                    act.pc = i + 1
+                    return "call", (target, call_args, instr.dst, instr.pos)
+                value = self.dispatch_method(obj, instr.meta["method"],
+                                             call_args, instr.pos)
+                if instr.dst >= 0:
+                    self.store(act, instr.dst, value)
+                i += 1
+                continue
             handler = self.dispatch.get(op)
             if handler is None:
                 raise GamaRuntimeFault("UnsupportedGIR",
                                        f"the reference interpreter cannot "
                                        f"execute `{op.value}`", instr.pos)
-            handler(frame, instr)
-        return None, UNIT, True
+            handler(act, instr)
+            i += 1
+        act.pc = 0
+        return _ENDED
+
 
     # ------------------------------------------------------------------
     # operands and slots
@@ -559,19 +738,6 @@ class VM:
             result = value
         self.store(frame, instr.dst, result)
 
-    def op_call(self, frame: Frame, instr: Instr) -> None:
-        args = [self.resolve(frame, a) for a in instr.args]
-        value = self.call_function(instr.meta["callee"], args, instr.pos)
-        if instr.dst >= 0:
-            self.store(frame, instr.dst, value)
-
-    def op_call_indirect(self, frame: Frame, instr: Instr) -> None:
-        callee = self.resolve(frame, instr.args[0])
-        args = [self.resolve(frame, a) for a in instr.args[1:]]
-        value = self.call_value(callee, args)
-        if instr.dst >= 0:
-            self.store(frame, instr.dst, value)
-
     def op_builtin(self, frame: Frame, instr: Instr) -> None:
         name = instr.meta["name"]
         b = L.BUILTINS.get(name)
@@ -614,14 +780,6 @@ class VM:
             finally:
                 self.ctx.grants -= extra
         return self.invoke_builtin(b, args)
-
-    def op_method_call(self, frame: Frame, instr: Instr) -> None:
-        obj = self.resolve(frame, instr.args[0])
-        args = [self.resolve(frame, a) for a in instr.args[1:]]
-        method = instr.meta["method"]
-        value = self.dispatch_method(obj, method, args, instr.pos)
-        if instr.dst >= 0:
-            self.store(frame, instr.dst, value)
 
     def dispatch_method(self, obj: Any, method: str, args: List[Any],
                         pos: Optional[SourcePos] = None) -> Any:

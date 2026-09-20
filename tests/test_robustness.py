@@ -32,7 +32,7 @@ from gamag.diagnostics import GamaRuntimeFault
 from gamag.fuzz import oracle
 from gamag.nesting import (E_NESTING_CODE, MAX_AST_DEPTH, MAX_PARSE_NESTING,
                            ast_depth_limit, parse_nesting_limit,
-                           python_frame_depth, vm_depth_limit)
+                           python_frame_depth)
 from gamag.runtime.vm import VM
 
 
@@ -266,7 +266,16 @@ class DeeplyNestedSource(unittest.TestCase):
 
 
 class CallDepth(unittest.TestCase):
-    """Defect 1: the depth guard has to fire before the host stack does."""
+    """Defect 1: the depth guard has to fire before the host stack does.
+
+    The interpreter used to be recursive -- ``execute`` called ``run_block``
+    called an opcode handler called ``execute`` again, about six host frames
+    per Gama-G call -- so the call-depth limit had to be derived from the
+    host's configured stack.  On a default CPython that put the *effective*
+    ceiling near 129 frames while ``VM.MAX_DEPTH`` said 1500, which meant the
+    language's own limit was unreachable and a legitimate deep recursion was
+    refused for a reason that had nothing to do with the language.
+    """
 
     DOWN = ("fn down(n: I64) -> I64\n"
             "    if n <= 0\n"
@@ -275,9 +284,38 @@ class CallDepth(unittest.TestCase):
             "fn main() -> Unit\n"
             "    print(down({n}))\n")
 
+    #: Deeper than the host-derived ceiling that used to apply (~129 frames on
+    #: this host), and well inside the language's policy ceiling of 1500.
+    DEEP = 1200
+
     def test_recursion_within_the_limit_runs(self):
         outcome = S.run(self.DOWN.format(n=50))
         outcome.assert_output_contains(self, "50")
+
+    def test_deep_recursion_runs(self):
+        """The acceptance criterion for an explicit stack.
+
+        This is the case the old interpreter could not run: 1200 frames, which
+        the host stack could not carry but the language's ceiling allows.
+        """
+        outcome = S.run(self.DOWN.format(n=self.DEEP))
+        outcome.assert_output_contains(self, str(self.DEEP))
+
+    def test_deep_recursion_costs_no_host_frames(self):
+        """The witness that the depth is the interpreter's own, not the host's.
+
+        With the host's recursionlimit lowered to a value that a recursive
+        interpreter could not have run this program under at all -- 1200
+        frames at six host frames each -- the program still runs, because a
+        Gama-G frame no longer occupies a host frame.
+        """
+        before = sys.getrecursionlimit()
+        try:
+            sys.setrecursionlimit(300)
+            outcome = S.run(self.DOWN.format(n=self.DEEP))
+        finally:
+            sys.setrecursionlimit(before)
+        outcome.assert_output_contains(self, str(self.DEEP))
 
     def test_unbounded_recursion_is_a_fault(self):
         outcome = S.run(self.DOWN.format(n=5000))
@@ -301,46 +339,35 @@ class CallDepth(unittest.TestCase):
         self.assertIn("call depth exceeded", str(outcome.fault))
         self.assertIsNotNone(getattr(outcome.fault, "hint", None))
 
-    def test_the_guard_fires_before_the_host_stack_does(self):
-        """The old ceiling of 1500 frames was unreachable, so it never fired."""
-        limit = vm_depth_limit(VM.MAX_DEPTH)
-        self.assertLess(limit, VM.MAX_DEPTH,
-                        "the effective limit equals the policy ceiling, so the "
-                        "guard can only fire if the host stack allows it")
-        self.assertGreater(limit, 8)
+    def test_the_limit_is_the_policy_ceiling(self):
+        """Past the ceiling the fault must name the language's number.
 
-    def test_the_guard_is_the_thing_that_fired(self):
-        """Past the limit the fault must come from the guard, not the backstop.
-
-        The guard knows the limit and reports it; the backstop is a translation
-        of a host stack overflow and says so.  Only the first is evidence that
-        the bound is doing its job.
+        It used to name whatever the host stack happened to carry, which is
+        not a number any Gama-G program can be written against.
         """
         outcome = S.run(self.DOWN.format(n=5000))
-        self.assertIn(str(vm_depth_limit(VM.MAX_DEPTH)),
-                      str(outcome.fault))
+        self.assertIn(str(VM.MAX_DEPTH), str(outcome.fault))
+        self.assertEqual(outcome.fault.context.get("limit"), VM.MAX_DEPTH)
 
-    def test_a_deeper_host_gets_a_deeper_limit(self):
-        """The bound follows the host's configured stack, not a constant."""
+    def test_the_limit_does_not_follow_the_host_stack(self):
+        """Inversion of the property that used to hold.
+
+        Raising the host's recursionlimit used to raise the effective limit;
+        raising or lowering it must now change nothing, because the limit is
+        the interpreter's own.
+        """
         before = sys.getrecursionlimit()
         try:
-            sys.setrecursionlimit(before * 3)
-            deeper = vm_depth_limit(VM.MAX_DEPTH)
+            sys.setrecursionlimit(before * 20)
+            outcome = S.run(self.DOWN.format(n=5000))
         finally:
             sys.setrecursionlimit(before)
-        self.assertGreater(deeper, vm_depth_limit(VM.MAX_DEPTH))
-
-    def test_the_limit_never_exceeds_the_policy_ceiling(self):
-        before = sys.getrecursionlimit()
-        try:
-            sys.setrecursionlimit(before * 100)
-            self.assertEqual(vm_depth_limit(VM.MAX_DEPTH), VM.MAX_DEPTH)
-        finally:
-            sys.setrecursionlimit(before)
+        self.assertIn(str(VM.MAX_DEPTH), str(outcome.fault))
 
     def test_python_frame_depth_is_measurable(self):
-        """The budget is derived from this; a wrong answer would mis-size it."""
+        """The parse and AST budgets are still derived from it."""
         self.assertGreater(python_frame_depth(), 0)
+
 
 
 class Totality(unittest.TestCase):
