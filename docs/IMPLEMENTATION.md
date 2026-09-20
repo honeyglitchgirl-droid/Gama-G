@@ -33,7 +33,7 @@ The per-milestone design notes remain as the record of how each part was built:
 honest status; `DESIGN_v1_0.md` is the consolidated design.
 
 Everything claimed below is exercised by the test suite (`python3 -m unittest
-discover -s tests`, **501 tests**) and demonstrated by a runnable example in
+discover -s tests`, **536 tests**) and demonstrated by a runnable example in
 `examples/` or `examples/core/`. Where a claim is partial, the missing part is
 named.
 

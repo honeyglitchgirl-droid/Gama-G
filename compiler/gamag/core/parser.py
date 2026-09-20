@@ -24,6 +24,7 @@ from typing import Any, List, Optional, Tuple
 
 from ..diagnostics import (Diagnostic, ParseError, Phase, Severity,
                            SourcePos, front_end_code)
+from ..nesting import BoundedRecursion
 from ..tokens import Token, TokenKind
 from . import mir as M
 
@@ -112,13 +113,16 @@ class CoreFunction:
         return whole[start:end]
 
 
-class CoreParser:
+class CoreParser(BoundedRecursion):
     def __init__(self, tokens: List[Token], filename: str = "<core>",
                  source: str = ""):
         self.toks = tokens
         self.i = 0
         self.file = filename
         self.source = source
+        # Nesting depth of the expression, type and pattern grammars, bounded
+        # so that deeply nested input is a diagnostic, not a RecursionError.
+        self._nesting = 0
 
     # ------------------------------------------------------------------
     # token stream (SEPARATOR tokens are transparent, as in the lexer's design)
@@ -614,7 +618,7 @@ class CoreParser:
         if self.at(TokenKind.LT):
             self.adv()
             while not self.at(TokenKind.GT, TokenKind.EOF):
-                args.append(self._type())
+                args.append(self.descend(self._type))
                 if not self.accept(TokenKind.COMMA):
                     break
             self.expect(TokenKind.GT, "`>` to close the type arguments")
@@ -649,7 +653,7 @@ class CoreParser:
                 self.adv()
                 args: List[M.MPattern] = []
                 while not self.at(TokenKind.RPAREN, TokenKind.EOF):
-                    args.append(self._pattern())
+                    args.append(self.descend(self._pattern))
                     if not self.accept(TokenKind.COMMA):
                         break
                 self.expect(TokenKind.RPAREN, "`)`")
@@ -682,20 +686,23 @@ class CoreParser:
         left = self._unary()
         if self.at(TokenKind.POWER):
             self.adv()
-            right = self._power()               # right-associative
+            right = self.descend(self._power)   # right-associative
             return M.MBin(pos=left.pos, op="**", left=left, right=right)
         return left
 
     def _unary(self) -> M.MExpr:
         tok = self.peek()
         if self.accept(TokenKind.NOT):
-            return M.MUn(pos=tok.pos, op="not", operand=self._unary())
+            return M.MUn(pos=tok.pos, op="not",
+                         operand=self.descend(self._unary))
         if self.accept(TokenKind.BANG):
-            return M.MUn(pos=tok.pos, op="not", operand=self._unary())
+            return M.MUn(pos=tok.pos, op="not",
+                         operand=self.descend(self._unary))
         if self.accept(TokenKind.MINUS):
-            return M.MUn(pos=tok.pos, op="-", operand=self._unary())
+            return M.MUn(pos=tok.pos, op="-",
+                         operand=self.descend(self._unary))
         if self.accept(TokenKind.PLUS):
-            return self._unary()
+            return self.descend(self._unary)
         return self._postfix()
 
     def _postfix(self) -> M.MExpr:
@@ -707,18 +714,18 @@ class CoreParser:
                     # `math.clamp(...)`: a library operation, not a method on a
                     # value.  The core has no user-defined methods.
                     base = expr.binding if isinstance(expr, M.MRef) else ""
-                    args = self._call_args()
+                    args = self.descend(self._call_args)
                     expr = M.MCall(pos=expr.pos, module=base or expr.text,
                                    name=attr.text, args=args)
                 else:
                     expr = M.MField(pos=expr.pos, obj=expr, attr=attr.text)
             elif self.at(TokenKind.LBRACKET):
                 self.adv()
-                index = self._expr()
+                index = self.descend(self._expr)
                 self.expect(TokenKind.RBRACKET, "`]`")
                 expr = M.MIndex(pos=expr.pos, obj=expr, index=index)
             elif self.at(TokenKind.LPAREN) and isinstance(expr, M.MRef):
-                args = self._call_args()
+                args = self.descend(self._call_args)
                 expr = M.MCall(pos=expr.pos, module="", name=expr.binding,
                                args=args)
             else:
@@ -737,14 +744,14 @@ class CoreParser:
     def _primary(self) -> M.MExpr:
         tok = self.peek()
         if self.accept(TokenKind.LPAREN):
-            inner = self._expr()
+            inner = self.descend(self._expr)
             self.expect(TokenKind.RPAREN, "`)`")
             return inner
         if self.at(TokenKind.LBRACKET):
             self.adv()
             items: List[M.MExpr] = []
             while not self.at(TokenKind.RBRACKET, TokenKind.EOF):
-                items.append(self._expr())
+                items.append(self.descend(self._expr))
                 if not self.accept(TokenKind.COMMA):
                     break
             self.expect(TokenKind.RBRACKET, "`]`")

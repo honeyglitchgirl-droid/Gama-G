@@ -24,6 +24,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Set
 
 from ..diagnostics import (ContractViolation, CapabilityViolation,
                            GamaRuntimeFault, SecretLeak, SourcePos, TypeFault)
+from ..nesting import vm_depth_limit
 from ..gir.ir import GFunction, GProgram, Instr, Op
 from ..semantic import types as T
 from ..std import library as L
@@ -105,6 +106,12 @@ from ..methods import (  # single source of truth, shared with the checker
 
 
 class VM:
+    #: Policy ceiling on Gama-G call depth.  The *effective* limit is lower
+    #: whenever the host stack cannot carry this many frames, because the
+    #: interpreter is recursive: each Gama-G call costs about
+    #: ``nesting.FRAMES_PER_VM_CALL`` Python frames, and exhausting the host
+    #: stack is a crash rather than a fault.  Raising the host's recursion
+    #: limit raises this back towards the ceiling.
     MAX_DEPTH = 1500
     CHECKPOINT_POLL_INSTRS = 512
 
@@ -116,6 +123,9 @@ class VM:
         self.globals: Dict[str, Any] = {}
         self.lock = threading.RLock()
         self.depth = 0
+        # Derived once, at construction, because the budget depends on how
+        # much host stack is already in use and that only grows from here.
+        self.max_depth = vm_depth_limit(self.MAX_DEPTH)
         self._armed_checkpoint: Optional[float] = None
         self._since_poll = 0
         # Whether the `<main>` module initializer has run yet.
@@ -279,12 +289,16 @@ class VM:
                 pos: Optional[SourcePos] = None) -> Any:
         with self.lock:
             self.depth += 1
-        if self.depth > self.MAX_DEPTH:
+        if self.depth > self.max_depth:
             self.depth -= 1
             raise GamaRuntimeFault(
                 "StackOverflow",
-                f"call depth exceeded {self.MAX_DEPTH} frames",
-                pos, context={"function": fn.name})
+                f"call depth exceeded {self.max_depth} frames",
+                pos,
+                context={"function": fn.name, "limit": self.max_depth},
+                hint=("the limit is what this host's stack carries, not a "
+                      "fixed language rule; rewrite the recursion "
+                      "iteratively, or raise sys.setrecursionlimit"))
         frame = Frame(fn, self.depth)
         try:
             for i, slot in enumerate(fn.params):
@@ -313,6 +327,19 @@ class VM:
                             "RunawayLoop",
                             f"`{fn.name}` exceeded the basic-block step budget")
                 return UNIT
+            except RecursionError:
+                # The bound above is derived from the host stack and should
+                # always fire first.  It cannot when the stack is shallower
+                # than the host reports -- a worker thread, an embedder with a
+                # deep stack of its own -- so the overflow is translated here
+                # rather than escaping as an internal error.
+                raise GamaRuntimeFault(
+                    "StackOverflow",
+                    f"call depth exceeded the {self.max_depth} frames this "
+                    f"host stack can carry",
+                    pos, context={"function": fn.name},
+                    hint="rewrite the recursion iteratively, or run on a "
+                         "host with a deeper stack")
             except GamaRuntimeFault as fault:
                 # Spec section 18: a transaction that fails before it commits
                 # must not leave its effects half applied.  Emitting

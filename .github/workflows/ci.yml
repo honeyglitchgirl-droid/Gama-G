@@ -1,0 +1,82 @@
+name: CI
+
+# The suite ran only when a person remembered to run it, which is how a
+# toolchain with 501 green tests shipped a decoder that crashed on a file which
+# was not UTF-8.  Everything here is a check a contributor would otherwise have
+# to remember.
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    name: tests (python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # `requires-python = ">=3.9"` in pyproject.toml, so that is what is
+        # tested.  Every source file also parses under the 3.9 grammar, which
+        # is what makes the claim checkable without a 3.9 interpreter to hand.
+        python: ["3.9", "3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      # No install step: the suite is standard-library only by design, so it
+      # runs on a bare checkout exactly as the README says it does.
+      - name: The suite
+        run: python -m unittest discover -s tests -t tests -q
+
+      - name: The compiler runs from a checkout
+        run: |
+          ./tools/bin/ggc --version
+          ./tools/bin/ggc run examples/hello.gg
+          ./tools/bin/ggc check examples/*.gg examples/core/*.gg
+
+      - name: The fuzzer's own checks can still fail
+        run: python tools/fuzz_selfcheck.py
+
+      # Differential testing needs a C compiler, which the runner has.  This
+      # is the only check that compares the compiler against something other
+      # than itself: interpreter output vs compiled binary, byte for byte.
+      - name: Differential testing against the native backend
+        run: ./tools/bin/ggc difftest examples/*.gg examples/core/*.gg
+
+  package:
+    name: installs, then runs the native backend
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install .
+
+      - name: The console script is on PATH
+        run: ggc --version
+
+      - name: It compiles a program
+        run: ggc run examples/hello.gg
+
+      # The C runtime is not a Python module, so setuptools omits it unless it
+      # is declared.  Running a native build from the *installed* copy is the
+      # only way that omission is ever visible.
+      - name: And the native backend still finds its C runtime
+        run: ggc native examples/hello.gg

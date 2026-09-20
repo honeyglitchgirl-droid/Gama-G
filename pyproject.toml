@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "gama-g"
-version = "1.0.0"
+version = "1.0.1"
 description = """Reference toolchain for the Gama-G language: an intent-and-operation \
 core, a native semantic IR, Gama IR, and a reference abstract execution model."""
 readme = "README.md"
@@ -41,6 +41,15 @@ package-dir = { "" = "compiler" }
 
 [tool.setuptools.packages.find]
 where = ["compiler"]
+
+# The native backend emits C and compiles it with the two files in
+# `gamag/backend/rt/`.  They are not Python modules, so setuptools left them out
+# of the wheel by default and `ggc native` failed on an installed copy while
+# working perfectly from a checkout -- the kind of defect that only shows up
+# where nobody is looking.  The CI packaging job now runs `ggc native` after
+# installing, so the two cannot drift apart again.
+[tool.setuptools.package-data]
+"gamag.backend" = ["rt/*.c", "rt/*.h"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

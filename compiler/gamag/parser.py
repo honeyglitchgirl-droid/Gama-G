@@ -23,6 +23,7 @@ from . import ast_nodes as A
 from .diagnostics import (Diagnostic, ParseError, Phase, Severity, SourcePos,
                           front_end_code)
 from .lexer import Lexer
+from .nesting import BoundedRecursion
 from .tokens import (EFFECT_NAMES, KEYWORD_TOKEN_KINDS, Token,
                      TokenKind)
 
@@ -74,13 +75,16 @@ _CMP_OPS = {
 PAREN_TYPE_ARGS = {"Tuple", "Fn"}
 
 
-class Parser:
+class Parser(BoundedRecursion):
     def __init__(self, tokens: List[Token], filename: str = "<input>",
                  source: str = ""):
         self.toks = tokens
         self.i = 0
         self.file = filename
         self.source = source
+        # Nesting depth of the expression grammar, bounded so that deeply
+        # nested input is a diagnostic rather than a RecursionError.
+        self._nesting = 0
         # Depth of "command-style" bodies (pipeline / model).  Inside these,
         # a known verb applied to a following expression on the same line
         # means a call, so `load Model("fraud-v3")` (spec section 38) reads
@@ -600,7 +604,7 @@ class Parser:
             if self.at(TokenKind.LBRACKET):
                 args.append(self._parse_shape())
             else:
-                args.append(self.parse_type())
+                args.append(self.descend(self.parse_type))
             if not self.accept(TokenKind.COMMA):
                 break
         self.expect(closer,
@@ -1156,7 +1160,8 @@ class Parser:
     def parse_not(self) -> A.Expr:
         if self.at(TokenKind.NOT):
             op = self.adv()
-            return A.Unary(pos=op.pos, op="not", operand=self.parse_not())
+            return A.Unary(pos=op.pos, op="not",
+                           operand=self.descend(self.parse_not))
         return self.parse_cmp()
 
     def parse_cmp(self) -> A.Expr:
@@ -1188,7 +1193,7 @@ class Parser:
         left = self.parse_unary()
         if self.at(TokenKind.POWER):
             op = self.adv()
-            right = self.parse_pow()      # right-associative
+            right = self.descend(self.parse_pow)   # right-associative
             return A.Binary(pos=op.pos, op="**", left=left, right=right)
         return left
 
@@ -1196,7 +1201,7 @@ class Parser:
         if self.peek().kind in _UNARY_OPS:
             op = self.adv()
             return A.Unary(pos=op.pos, op=_UNARY_OPS[op.kind],
-                           operand=self.parse_unary())
+                           operand=self.descend(self.parse_unary))
         return self.parse_postfix()
 
     def parse_postfix(self) -> A.Expr:
@@ -1229,7 +1234,8 @@ class Parser:
                 self.expect(TokenKind.RBRACKET, "`]`")
                 expr = A.Index(pos=expr.pos, obj=expr, index=idx)
             elif self.at(TokenKind.LPAREN):
-                expr = A.Call(pos=expr.pos, callee=expr, args=self.parse_args())
+                expr = A.Call(pos=expr.pos, callee=expr,
+                              args=self.descend(self.parse_args))
             elif self.at(TokenKind.AS):
                 self.adv()
                 target = self.parse_type()
@@ -1293,14 +1299,14 @@ class Parser:
             if self.at(TokenKind.RPAREN):
                 self.adv()
                 return A.Literal(pos=tok.pos, value=None, lit_kind="unit")
-            first = self.parse_expr()
+            first = self.descend(self.parse_expr)
             if self.at(TokenKind.COMMA):
                 items = [first]
                 while self.accept(TokenKind.COMMA):
                     self.end_of_line()
                     if self.at(TokenKind.RPAREN):
                         break
-                    items.append(self.parse_expr())
+                    items.append(self.descend(self.parse_expr))
                 self.expect(TokenKind.RPAREN, "`)`")
                 return A.TupleLit(pos=tok.pos, items=items)
             self.expect(TokenKind.RPAREN, "`)`")
@@ -1311,7 +1317,7 @@ class Parser:
             items: List[A.Expr] = []
             self.end_of_line()
             while not self.at(TokenKind.RBRACKET, TokenKind.EOF):
-                items.append(self.parse_expr())
+                items.append(self.descend(self.parse_expr))
                 self.end_of_line()
                 if not self.accept(TokenKind.COMMA):
                     if self.at(TokenKind.RBRACKET, TokenKind.EOF):
@@ -1324,7 +1330,7 @@ class Parser:
             return A.ListLit(pos=tok.pos, items=items)
 
         if k is TokenKind.LBRACE:
-            return self.parse_brace_literal()
+            return self.descend(self.parse_brace_literal)
 
         if k is TokenKind.IDENT:
             text = tok.text

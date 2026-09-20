@@ -293,7 +293,9 @@ GIR the same machine serves the reference interpreter, a native CPU backend that
 emits C and compiles it to machine code, a WebAssembly encoder, and an
 accelerator layer.
 
-**501 tests pass.**  The native backend is validated by *differential testing*:
+**536 tests pass**, and CI runs them on every push and pull request across
+Python 3.9 - 3.13 (`.github/workflows/ci.yml`).  The native backend is
+validated by *differential testing*:
 the same program is run on the interpreter and on the compiled binary, and their
 stdout, exit status and fault kind are compared.  Where the two could differ --
 integer range checks, float formatting, variadic output -- the C runtime
@@ -312,9 +314,19 @@ emits has ever been executed; `ggc wasm` says so when it writes one.  There is n
 accelerator either, so no kernel has been run: `ggc device` reports the CPU as
 the device that ran the work rather than falling back silently.
 
+**Input is bounded, not crashed on.**  Nesting and call depth are limited by
+what the host stack can carry -- about 50 levels of syntactic nesting and about
+129 call frames on a default CPython host -- and exceeding either is a
+diagnostic or a classified runtime fault naming the limit, never a Python
+traceback.  A file that is not UTF-8 is a diagnostic too.
+
 **No performance claim** is made anywhere.  `ggc bench` measures and reports the
 conditions of the measurement, and refuses to compare two runs whose conditions
 differ.
+
+For the honest list of what this toolchain is *not* -- the defects found by
+auditing it, the specification surface that is still missing, and the process
+gaps -- see [`docs/PRODUCTION_GAPS.md`](docs/PRODUCTION_GAPS.md).
 
 ---
 

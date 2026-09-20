@@ -93,7 +93,7 @@ Every row names the evidence, because a feature list without one is a wish.
 
 | Area | Where | How it is checked |
 |---|---|---|
-| Language surface | `parser.py`, `core/parser.py` | 501 tests; the spec vocabulary tests read the specification's own enumerations at run time |
+| Language surface | `parser.py`, `core/parser.py` | 536 tests; the spec vocabulary tests read the specification's own enumerations at run time |
 | Types | `semantic/checker.py` | spec types 208-236, each inhabited by a compiling program |
 | Effects | `semantic/checker.py` | declared-versus-inferred comparison; `unsafe` is a declared effect |
 | Capabilities | `capabilities.py` | one algebra shared by compiler and runtime; attenuation only |
@@ -176,6 +176,12 @@ section: never claim a capability the toolchain lacks.
   can measure it.  It exists because the alternative was a symmetric MAC, which
   proves possession of a shared secret rather than identity; in production, use
   an audited library.
+- **The nesting and call-depth limits are host-derived.**  A default CPython
+  host carries about 50 levels of syntactic nesting, about 256 levels of AST
+  depth and about 129 Gama-G call frames; the limits move with
+  `sys.setrecursionlimit`.  Exceeding any of them is a diagnostic or a
+  classified fault, never a traceback -- but a realistic recursive algorithm is
+  bounded by that 129 until the interpreter has an explicit call stack.
 - **The fuzzer found eight bugs and no more.**  That is a statement about the
   campaigns that were run, not about the absence of bugs.
 - **No performance claim is made anywhere.**  The benchmark harness reports
@@ -223,6 +229,29 @@ something.
 10. **A signed package could never verify.**  The signature covered the content
     hash, the signature was stored in the manifest, and writing the manifest
     changed the very hash that was signed.
+11. **A file that was not UTF-8 crashed the compiler.**  `ggc check` on a
+    source file that did not decode produced a raw `UnicodeDecodeError`
+    traceback: no diagnostic, no code, exit 1.  The same crash covered a
+    missing file and a directory given where a file was expected.
+12. **Deeply nested input exhausted the host stack.**  Nested parentheses,
+    nested call arguments and -- the case that matters -- a *flat* `1+1+...`
+    chain five thousand terms long all reached a raw `RecursionError`.  The
+    flat chain is the instructive one: nothing recurses while parsing it, and
+    the checker's `infer`/`expr_Binary` pair runs out of stack later, so
+    bounding the parser alone would not have fixed it.
+13. **Running out of call depth was reported as an internal error.**  The
+    interpreter's guard was set to 1500 frames while the host stack carries
+    about a quarter of that, so the guard never fired and the user was told
+    `internal error: RecursionError` -- the toolchain blaming itself for a
+    program that recursed too far.
+14. **The fuzzer could not have found 11 or 12.**  Every fuzz invariant handed
+    `compile_source` a Python string, which has already decoded, so the file
+    path where 11 lived was never exercised.  A new invariant writes bytes to
+    disk and calls `compile_file`; it is tested for its ability to fail.
+15. **The wheel omitted the C runtime.**  `gamag_rt.c` is not a Python module,
+    so setuptools left it out and `ggc native` would have failed on every
+    installed copy while working from a checkout.  Found while writing the CI
+    packaging job, which now runs `ggc native` after installing.
 
 ---
 
@@ -233,7 +262,7 @@ something.
 ./tools/bin/ggc difftest examples/hello.gg     # interpreter vs native
 ./tools/bin/ggc fuzz --rounds 500              # try to break it
 python3 tools/fuzz_selfcheck.py                # prove the fuzzer can fail
-python3 -m unittest discover -s tests -t tests # 501 tests
+python3 -m unittest discover -s tests -t tests # 536 tests
 ./tools/bin/ggc manifest examples/hello.gg --check-reproducible 3
 ./tools/bin/ggc bench examples/hello.gg --repeats 20
 ./tools/bin/ggc device                         # is there an accelerator? no

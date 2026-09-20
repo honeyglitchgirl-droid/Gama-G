@@ -88,6 +88,13 @@ FRONT_END_CODES: Tuple[Tuple[str, str], ...] = (
     ("expected a core version", "E-bad-pragma"),
     ("expected `gama core", "E-bad-pragma"),
     ("expected", "E-expected"),
+    # The bounds that keep deeply nested, or non-textual, input a diagnostic
+    # rather than a Python traceback (see `gamag.nesting`).
+    ("nests deeper than", "E-nesting-too-deep"),
+    ("nests too deeply", "E-nesting-too-deep"),
+    ("nested deeper than", "E-nesting-too-deep"),
+    ("is not valid UTF-8", "E-source-unreadable"),
+    ("cannot read", "E-source-unreadable"),
 )
 
 #: The fallbacks, one per phase, so that a message no rule matches still gets a

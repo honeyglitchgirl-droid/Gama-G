@@ -24,11 +24,13 @@ from .core import mir as CoreMIR
 from .core import native as core_native
 from .core import recovery as core_recovery
 from .core.parser import CoreParser, CoreSyntax
-from .diagnostics import (DiagnosticBag, GamaError, Phase, Severity, SourcePos)
+from .diagnostics import (Diagnostic, DiagnosticBag, GamaError, Phase,
+                          Severity, SourcePos)
 from .gir.builder import build_program
 from .gir.ir import GProgram
 from .gir.optimizer import OptimizationReport, optimize
 from .lexer import tokenize
+from .nesting import E_NESTING_CODE, ast_depth_limit, deepest
 from .parser import Parser
 from .runtime.context import Context
 from .runtime.vm import VM
@@ -149,11 +151,71 @@ def is_core_dialect(tokens: Sequence[Any]) -> bool:
     return False
 
 
+def depth_diagnostic(root: Any) -> Optional[Diagnostic]:
+    """The diagnostic for an AST too deep for the recursive phases, if any.
+
+    Flat source can still be a deep tree -- ``1+1+1`` repeated five thousand
+    times parses iteratively and then recurses in the checker -- so this is
+    measured over the completed tree rather than counted while parsing, and
+    the walk is iterative so that measuring cannot itself overflow.
+    """
+    limit = ast_depth_limit()
+    depth, offender = deepest(root, limit)
+    if offender is None:
+        return None
+    return Diagnostic(
+        Severity.ERROR, Phase.PARSE,
+        f"expression is nested deeper than {limit} levels (found {depth})",
+        pos=getattr(offender, "pos", None), code=E_NESTING_CODE,
+        help_text=(
+            "later phases are recursive, so the bound protects the host "
+            "stack; simplify the expression, or raise "
+            "sys.setrecursionlimit for generated input"))
+
+
+def bounded_by_depth(c: "Compilation", root: Any) -> bool:
+    """Whether an AST is shallow enough for every recursive consumer."""
+    diag = depth_diagnostic(root)
+    if diag is None:
+        return True
+    c.bag.add(diag)
+    c.stopped_at = "parse"
+    return False
+
+
 def compile_source(source: str, path: str = "<source>", *,
                    profile: str = "strict", opt_level: int = 1,
                    grants: Sequence[str] = (),
                    emit_gir: bool = True) -> Compilation:
-    """Run every compile-time phase.  Never raises for source-level errors."""
+    """Run every compile-time phase.  Never raises for source-level errors.
+
+    That claim is about *every* input, and it used to be false for two of
+    them: a file that was not UTF-8, and nesting deep enough to exhaust the
+    host stack.  Decoding is handled where the file is read
+    (:func:`read_source`), nesting is bounded in :mod:`gamag.nesting`, and
+    this wrapper is the backstop for whatever those bounds did not foresee --
+    so that running out of stack stays a diagnostic, not a traceback.
+    """
+    try:
+        return _compile_source(source, path, profile=profile,
+                               opt_level=opt_level, grants=grants,
+                               emit_gir=emit_gir)
+    except RecursionError:
+        c = Compilation(path=path, source=source, profile=profile,
+                        opt_level=opt_level)
+        c.bag.error(
+            "input nests too deeply to compile on this host's stack",
+            phase=Phase.PARSE, code=E_NESTING_CODE,
+            help_text=("this is the backstop behind the depth bound; "
+                       "the source is beyond what this host can carry"))
+        c.stopped_at = "parse"
+        return c
+
+
+def _compile_source(source: str, path: str = "<source>", *,
+                    profile: str = "strict", opt_level: int = 1,
+                    grants: Sequence[str] = (),
+                    emit_gir: bool = True) -> Compilation:
     c = Compilation(path=path, source=source, profile=profile,
                     opt_level=opt_level)
     base = os.path.splitext(os.path.basename(path))[0] or "main"
@@ -179,6 +241,8 @@ def compile_source(source: str, path: str = "<source>", *,
         c.stopped_at = "parse"
         return c
     c.timings.parse = time.perf_counter() - t0
+    if not bounded_by_depth(c, c.module):
+        return c
     if grants:
         c.module.grants = tuple(dict.fromkeys(
             tuple(c.module.grants) + tuple(grants)))
@@ -241,6 +305,8 @@ def _compile_core(c: "Compilation", source: str, *, profile: str,
         c.stopped_at = "parse"
         return c
     c.timings.parse = time.perf_counter() - t0
+    if not bounded_by_depth(c, c.core_syntax):
+        return c
 
     # The model *is* the meaning of a core program: relationships are derived
     # from `uses`/`yields` and validated before anything is lowered.
@@ -401,6 +467,12 @@ def _compile_helpers(c: "Compilation", source: str,
         out.ok = False
         return out
 
+    depth_issue = depth_diagnostic(module)
+    if depth_issue is not None:
+        out.diagnostics.append(depth_issue)
+        out.ok = False
+        return out
+
     checker, bag = check_module(module, source, profile=profile)
     out.diagnostics.extend(bag.diagnostics)
     if not bag.ok:
@@ -450,9 +522,43 @@ def _merge_programs(core: Any, helpers: Any) -> None:
     core.grants = tuple(dict.fromkeys(tuple(core.grants) + tuple(helpers.grants)))
 
 
+def read_source(path: str) -> Tuple[Optional[str], Optional[str]]:
+    """Read a source file as UTF-8 text.
+
+    Returns ``(source, None)`` or ``(None, reason)``.  Source files are text,
+    and a compiler that is handed bytes it cannot decode has to say so: this
+    used to escape as a ``UnicodeDecodeError`` traceback, which is both a crash
+    and a lie -- it tells the user the compiler broke, when in fact the file
+    is not text.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            return handle.read(), None
+    except UnicodeDecodeError as exc:
+        offset = exc.start
+        bad = exc.object[offset:offset + 1]
+        shown = f"0x{bad[0]:02x}" if bad else "an invalid byte"
+        return None, (
+            f"{path} is not valid UTF-8 text: byte {shown} at offset "
+            f"{offset} does not decode. Gama-G source must be UTF-8; "
+            f"convert the file (for example `iconv -f latin1 -t utf-8`)")
+    except OSError as exc:
+        return None, f"cannot read {path}: {exc.strerror or exc}"
+
+
+def _unreadable(path: str, reason: str) -> Compilation:
+    """A compilation carrying one error, for a file that could not be read."""
+    c = Compilation(path=path)
+    c.bag.error(reason, phase=Phase.LEX, code="E-source-unreadable",
+                help_text="the compiler reads source files as UTF-8 text")
+    c.stopped_at = "lex"
+    return c
+
+
 def compile_file(path: str, **kwargs: Any) -> Compilation:
-    with open(path, "r", encoding="utf-8") as handle:
-        source = handle.read()
+    source, reason = read_source(path)
+    if source is None:
+        return _unreadable(path, reason)
     return compile_source(source, path, **kwargs)
 
 

@@ -16,15 +16,18 @@ happens to be called.
 from __future__ import annotations
 
 import io
+import os
 import random
 import re
+import tempfile
 import time
 import traceback
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from ..diagnostics import GamaError, GamaRuntimeFault
-from ..driver import (compile_source, execute, find_entry, program_grants)
+from ..driver import (compile_file, compile_source, execute, find_entry,
+                      program_grants)
 from ..runtime.context import Context
 
 CODE_RE = re.compile(r"^[EW]-[a-z0-9][a-z0-9-]*$")
@@ -202,6 +205,73 @@ def _check_models(compilation: Any, source: str, origin: str,
 #: instead of minutes.  A program that genuinely needs more is reporting
 #: something worth looking at, and StepLimitExceeded says so by name.
 FUZZ_MAX_STEPS = 200_000
+
+
+def check_file_path_is_total(source: str, path: str = "<fuzz>",
+                             origin: str = "",
+                             kind: str = "") -> List[Violation]:
+    """A *file* of arbitrary bytes must reach a verdict, never a traceback.
+
+    Every other check here hands ``compile_source`` a ``str`` that has already
+    decoded.  That is precisely why a source file which was not UTF-8 could
+    reach the user as a raw ``UnicodeDecodeError`` traceback while every
+    campaign reported green: the fuzzer was not testing the path the command
+    line actually takes.  This check writes bytes to disk and calls
+    ``compile_file`` -- the same function ``ggc check`` and ``ggc run`` call --
+    so the file path is covered by the invariant, not just the in-memory one.
+
+    The cases are the ways a file stops being text: a bad byte inside otherwise
+    valid source, arbitrary binary, a path that is not there, and a path that
+    is a directory.  None of them may raise.
+    """
+    out: List[Violation] = []
+    encoded = source.encode("utf-8", "surrogatepass")
+    cut = len(encoded) // 2
+    cases = {
+        "a valid file with one byte that is not UTF-8": (
+            encoded[:cut] + b"\x9e\xfe" + encoded[cut:]),
+        "arbitrary binary": bytes(range(256)),
+        "an empty file": b"",
+    }
+    with tempfile.TemporaryDirectory(prefix="ggfuzz-") as tmp:
+        for description, payload in cases.items():
+            candidate = os.path.join(tmp, "case.gg")
+            try:
+                with open(candidate, "wb") as handle:
+                    handle.write(payload)
+            except OSError as exc:                  # pragma: no cover
+                out.append(Violation(
+                    "file-path-is-total", "crash",
+                    f"the harness could not write its own test file: {exc}",
+                    source, origin, kind))
+                return out
+            out.extend(_totality(candidate, description, source, origin, kind))
+        # a path that does not exist, and a path that is a directory
+        out.extend(_totality(os.path.join(tmp, "absent.gg"),
+                             "a path that does not exist",
+                             source, origin, kind))
+        out.extend(_totality(tmp, "a path that is a directory",
+                             source, origin, kind))
+    return out
+
+
+def _totality(candidate: str, description: str, source: str, origin: str,
+              kind: str) -> List[Violation]:
+    """``compile_file`` must return a Compilation for this path, always."""
+    try:
+        compilation = compile_file(candidate)
+    except BaseException as exc:                    # noqa: BLE001
+        return [Violation(
+            "file-path-is-total", "crash",
+            f"reading {description} raised instead of producing a "
+            f"diagnostic: {type(exc).__name__}: {exc}",
+            source, origin, kind, traceback=_tb(exc))]
+    if not compilation.ok and not compilation.bag.diagnostics:
+        return [Violation(
+            "file-path-is-total", "wrong",
+            f"{description} was rejected with no diagnostic at all",
+            source, origin, kind)]
+    return []
 
 
 def check_runs_or_faults(source: str, path: str = "<fuzz>",
@@ -423,6 +493,8 @@ def run_checks(source: str, *, path: str = "<fuzz>", origin: str = "",
     out: List[Violation] = []
     out.extend(check_compiles_or_explains(source, path, origin=origin,
                                           kind=kind))
+    out.extend(check_file_path_is_total(source, path, origin=origin,
+                                        kind=kind))
 
     # Did the front end accept the program?  Recomputed here rather than
     # inferred from the violations, because "no violation" also covers a program
