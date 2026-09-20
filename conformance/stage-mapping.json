@@ -1,0 +1,78 @@
+{
+  "note": [
+    "Section 22's fourteen compilation stages, each mapped to the code that",
+    "performs it, or marked not implemented with a reason. `status` is",
+    "`implemented`, `partial` (it happens, but not for every program) or",
+    "`not-implemented`; the latter two require a reason. A stage missing from",
+    "this file is a conformance failure, and so is an entry for a stage the",
+    "specification does not name."
+  ],
+  "stages": {
+    "Lexing": {
+      "status": "implemented",
+      "where": "compiler/gamag/lexer.py"
+    },
+    "Parsing": {
+      "status": "implemented",
+      "where": "compiler/gamag/parser.py, core/parser.py (the v0.2 relation syntax)"
+    },
+    "Name resolution": {
+      "status": "implemented",
+      "where": "compiler/gamag/semantic/checker.py"
+    },
+    "Type checking": {
+      "status": "implemented",
+      "where": "compiler/gamag/semantic/checker.py, semantic/types.py"
+    },
+    "Effect checking": {
+      "status": "implemented",
+      "where": "compiler/gamag/semantic/checker.py",
+      "note": "claims `E-effect-pure`, `E-effect-undeclared`, `E-effect-determinism`"
+    },
+    "Capability checking": {
+      "status": "implemented",
+      "where": "compiler/gamag/semantic/checker.py, runtime/context.py",
+      "note": "checked at compile time and enforced again by the native runtime"
+    },
+    "Ownership analysis": {
+      "status": "implemented",
+      "where": "compiler/gamag/semantic/checker.py",
+      "note": "immutability (`E-immutable`) and secret flow (`E-secret-leak`)"
+    },
+    "Operation-graph construction": {
+      "status": "implemented",
+      "where": "compiler/gamag/core/graph.py",
+      "note": "the graph is derived and printable (`ggc graph`); it is not yet what code generation consumes"
+    },
+    "GIR generation": {
+      "status": "implemented",
+      "where": "compiler/gamag/gir/builder.py",
+      "note": "GIR version 1.0, reported by `ggc --version`"
+    },
+    "Optimization": {
+      "status": "implemented",
+      "where": "compiler/gamag/gir/optimizer.py",
+      "note": "level 0-2; the optimizer mutates the program and returns a report"
+    },
+    "Backend lowering": {
+      "status": "partial",
+      "where": "compiler/gamag/backend/cgen.py (native), backend/wasm.py (WebAssembly)",
+      "reason": "both backends accept a subset and refuse the rest with a named reason. `ggc native` compiles 4 of the 16 shipped examples and refuses 12; the interpreter runs the rest."
+    },
+    "Machine code/WASM generation": {
+      "status": "partial",
+      "where": "the native backend emits C and compiles it with a C compiler; the WebAssembly encoder emits a module",
+      "reason": "machine code is produced and runs. WebAssembly modules are emitted and structurally checked, but no WebAssembly runtime exists in this environment, so no emitted module has ever been executed here."
+    },
+    "Link/package": {
+      "status": "partial",
+      "where": "compiler/gamag/gpm/ (resolve, verify, audit, sign), `ggc manifest`, and the C compiler for the native artifact",
+      "reason": "packages resolve, verify and sign; there is no linker step of Gama-G's own, and no registry."
+    },
+    "Reproducibility verification": {
+      "status": "partial",
+      "where": "`ggc manifest --check-reproducible`, and the `compilation-is-deterministic` claim in this suite",
+      "reason": "manifests verify and compilation is checked to be a function of its input; reproducible *artifacts* are not built bit-for-bit, which needs a pinned toolchain."
+    }
+  }
+}

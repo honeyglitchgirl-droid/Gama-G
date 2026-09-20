@@ -35,6 +35,13 @@ from ..exitcodes import (EXIT_COMPILE, EXIT_OK, EXIT_RUNTIME, EXIT_TEST,
 PROFILES = ("strict", "standard", "lenient")
 
 
+#: What `ggc explain` can describe.  One place, so a caller -- the parser or a
+#: test walking every topic -- enumerates them rather than repeating the tuple.
+#: Two of these shipped broken because a test had its own copy of the list and
+#: the copy was missing them.
+EXPLAIN_TOPICS = ("modules", "builtins", "capabilities", "effects", "gaps")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="ggc",
@@ -258,11 +265,24 @@ def build_parser() -> argparse.ArgumentParser:
                    help="grant only what --grant names, ignoring the "
                         "capabilities the program declares")
 
+    p = sub.add_parser(
+        "conform",
+        help="check the toolchain against the specification document")
+    p.add_argument("--spec", metavar="PATH",
+                   help="the specification to check against "
+                        "(default: the one shipped with this checkout)")
+    p.add_argument("--suite", metavar="PATH",
+                   help="the claim suite (default: conformance/)")
+    p.add_argument("-k", dest="filter", metavar="SUBSTRING",
+                   help="run only claims whose id contains this")
+    p.add_argument("--strict", action="store_true",
+                   help="fail on recorded deviations and on requirements that "
+                        "are not fully evidenced")
+    p.add_argument("--json", action="store_true")
+
     p = sub.add_parser("explain", help="describe the language surface")
     p.add_argument("topic", nargs="?", default="modules",
-                   choices=("modules", "builtins", "capabilities", "effects",
-                            "gaps"),
-                   help="what to describe")
+                   choices=EXPLAIN_TOPICS, help="what to describe")
     p.add_argument("--module", metavar="NAME",
                    help="with `builtins`, restrict to one module")
     p.add_argument("--json", action="store_true")
@@ -681,6 +701,59 @@ def cmd_test(args: argparse.Namespace) -> int:
     else:
         print(f"{passed}/{total} test(s) passed")
     return EXIT_OK if passed == total else EXIT_TEST
+
+
+def cmd_conform(args: argparse.Namespace) -> int:
+    """Run the conformance suite.
+
+    A separate code path from the test suite on purpose: this one is available
+    to anyone with the installed toolchain, checks the *specification* rather
+    than the implementation, and reports its own inability to check as an error
+    rather than a pass.
+
+    Statuses: 0 when every claim passed, 1 when one did not, 4 when every claim
+    passed but `--strict` found something the toolchain does not fully evidence
+    (a recorded deviation, or a section 33 item answered `partial` or
+    `not-claimed`), and 3 for a misuse.
+    """
+    from .. import conformance
+
+    if args.strict and args.filter:
+        # `--strict` is about the whole picture; a filtered run would not see
+        # the deviations it is meant to fail on.
+        print("ggc: --strict cannot be combined with -k: a filtered run would "
+              "not see the deviations it fails on", file=sys.stderr)
+        return EXIT_USAGE
+    try:
+        spec_text = conformance.load_spec(args.spec)
+        report = conformance.run(spec_text, args.suite, only=args.filter,
+                                 strict=args.strict)
+    except conformance.SpecError as exc:
+        print(f"ggc: cannot check conformance: {exc}", file=sys.stderr)
+        # A suite that cannot find its document has checked nothing, and
+        # reporting that as success is the one failure mode worse than a
+        # reported failure.
+        return EXIT_COMPILE
+
+    if args.json:
+        payload = report.as_json()
+        payload["strict_failures"] = report.strict_failures
+        print(json.dumps(payload, indent=2))
+    else:
+        print(report.render())
+        if report.failures:
+            print(f"\n{len(report.failures)} claim(s) failed")
+        elif args.strict and report.strict_failures:
+            print(f"\n--strict: {len(report.strict_failures)} thing(s) this "
+                  f"toolchain does not fully evidence:")
+            for reason in report.strict_failures:
+                print(f"  {reason}")
+
+    if report.failures:
+        return EXIT_COMPILE
+    if args.strict and report.strict_failures:
+        return EXIT_TEST
+    return EXIT_OK
 
 
 def cmd_explain(args: argparse.Namespace) -> int:
@@ -1334,6 +1407,7 @@ def cmd_bench(args: argparse.Namespace) -> int:
 
 
 COMMANDS = {
+    "conform": cmd_conform,
     "bench": cmd_bench,
     "gpm": cmd_gpm,
     "manifest": cmd_manifest,

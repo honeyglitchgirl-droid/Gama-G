@@ -1,0 +1,6 @@
+// Spec section 1.2 and section 6: "strict type checking".  Adding a Text to an
+// I64 has no meaning, so it is a compile-time diagnostic, never a runtime
+// surprise.
+fn main() -> Unit
+    io
+    print(1 + "a")

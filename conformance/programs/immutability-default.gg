@@ -1,0 +1,7 @@
+// Spec section 1.2: "immutable data by default".  A `let` binding is the
+// immutable form, so assigning to one must be refused.
+fn main() -> Unit
+    io
+    let total = 42
+    total = 43
+    print(total)

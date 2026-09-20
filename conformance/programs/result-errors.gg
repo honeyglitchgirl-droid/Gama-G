@@ -1,0 +1,15 @@
+// Spec section 19: "Normal recoverable errors use Result."
+fn halve(n: I64) -> Result<I64, Text>
+    pure
+    if n % 2 == 0
+        return ok(n / 2)
+    return fail("odd")
+
+fn main() -> Unit
+    io
+    match halve(10)
+        ok(v) => print("ok", v)
+        fail(e) => print("fail", e)
+    match halve(7)
+        ok(v) => print("ok", v)
+        fail(e) => print("fail", e)

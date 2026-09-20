@@ -1,0 +1,18 @@
+// Spec section 1.3: "Critical medical, financial, audit, and compliance
+// computations can request deterministic execution and reproducible results."
+//
+// The deterministic work happens in a function that declares it, because a
+// `deterministic` function may not perform `io` -- printing is the part that is
+// allowed not to be reproducible.  The claim is that the values are the same on
+// two runs, which is why this case runs more than once.
+fn rolls() -> I64
+    deterministic
+    crypto
+    let first = crypto.random_int(1, 1000000)
+    let second = crypto.random_int(1, 1000000)
+    return first * 1000000 + second
+
+fn main() -> Unit
+    io
+    crypto
+    print(rolls())

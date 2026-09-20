@@ -1,0 +1,126 @@
+{
+  "note": [
+    "Section 33's v1.0 checklist, answered item by item. `status` is one of:",
+    "",
+    "  evidenced    -- demonstrated by a command a reader can run, named here",
+    "  partial      -- true for some of what the item asks and not the rest;",
+    "                  the reason says which part, and the reason is required",
+    "  not-claimed  -- the toolchain does not claim this, and the reason says",
+    "                  what is missing",
+    "",
+    "`ggc conform` requires all twenty items to be answered and requires a",
+    "reason on anything that is not `evidenced`. `ggc conform --strict` fails on",
+    "`partial` and `not-claimed` too, which is the bar a production release",
+    "would have to clear.",
+    "",
+    "This file is the reason the checklist exists: an item silently dropped is a",
+    "failure to the runner, so the list cannot quietly shrink."
+  ],
+  "requirements": {
+    "1": {
+      "status": "evidenced",
+      "evidence": "the specification is versioned (SPEC_VERSION 1.0) and shipped in the repository; `ggc --version` reports the specification version it was built against, and `ggc conform` refuses to report on a document that is not the one it expects.",
+      "command": "ggc --version"
+    },
+    "2": {
+      "status": "evidenced",
+      "evidence": "two compilations of the same source are compared byte for byte by the `compilation-is-deterministic` claim, and `ggc manifest` can build the same package twice and compare the manifests.",
+      "command": "ggc conform -k compilation-is-deterministic"
+    },
+    "3": {
+      "status": "evidenced",
+      "evidence": "the type system is implemented and exercised by the suite and by the `types-section-5` claim, which reads section 5's own list of type names.",
+      "command": "ggc conform -k types-section-5"
+    },
+    "4": {
+      "status": "evidenced",
+      "evidence": "memory safety is tested rather than asserted: the arena's release path is measured with the runtime's counters (`tests/test_backends.py`), tests cover the no-double-free and no-use-after-free cases, and `docs/DESIGN_v0_4.md` states which properties are proven and which are only checked.",
+      "command": "python -m unittest discover -s tests -t tests -q"
+    },
+    "5": {
+      "status": "partial",
+      "evidence": "section 9 sketches three concurrency models; two of them are implemented in-language (`parallel` regions, `agent` declarations) and the two decisions the sketch left open are recorded.",
+      "reason": "the semantics are not fully specified: `docs/SPEC_DECISIONS.md` records the choices made (unique operation names, and no observable effects inside a parallel task) because the specification did not make them, and parallel regions run under CPython's GIL, so they do not speed up CPU-bound work.",
+      "command": "ggc explain gaps"
+    },
+    "6": {
+      "status": "evidenced",
+      "evidence": "GIR has its own version (1.0), reported by `ggc --version`, and the IR is documented in `docs/DESIGN_v0_3.md` including which invariants are proven and which are only checked.",
+      "command": "ggc --version"
+    },
+    "7": {
+      "status": "partial",
+      "evidence": "a native backend exists, emits C, compiles it, and is checked against the interpreter by differential testing rather than by inspection.",
+      "reason": "`mature` is the word that has to be answered, and the honest answer is no: the backend compiles 4 of the 16 shipped examples and refuses the other 12 with a reason. It is a backend that has never miscompiled a program it accepted; it is not a backend that covers the language.",
+      "command": "ggc difftest examples/*.gg examples/core/*.gg"
+    },
+    "8": {
+      "status": "partial",
+      "evidence": "the WebAssembly encoder emits a module for the numeric subset and the module is verified structurally by decoding it back.",
+      "reason": "there is no WebAssembly runtime in this environment, so no module this toolchain has emitted has ever been executed. What is claimed is conformance of the encoding, and `ggc wasm` says so when it writes one.",
+      "command": "ggc wasm examples/hello.gg"
+    },
+    "9": {
+      "status": "evidenced",
+      "evidence": "package resolution is pinned by `gama.lock`, verified against it, and audited against advisories; signing uses Ed25519 and verification re-computes the content hashes.",
+      "command": "ggc gpm verify"
+    },
+    "10": {
+      "status": "not-claimed",
+      "reason": "no independent party has reviewed the security model. The audits in this repository were written by the same effort that built the toolchain, and calling that independent review would be exactly the kind of claim section 43 forbids.",
+      "command": "ls *.txt"
+    },
+    "11": {
+      "status": "not-claimed",
+      "reason": "the standard library surface is enumerated and documented (`ggc explain modules`, `ggc explain builtins`), but no API stability policy exists: nothing states which changes are breaking, so a user cannot rely on a module surviving an upgrade.",
+      "command": "ggc explain modules"
+    },
+    "12": {
+      "status": "evidenced",
+      "evidence": "the fuzzer generates and corrupts programs looking for contract violations, and its own checks are tested for their ability to fail (`tools/fuzz_selfcheck.py`), because a fuzzer that cannot fail proves nothing.",
+      "command": "python tools/fuzz_selfcheck.py"
+    },
+    "13": {
+      "status": "not-claimed",
+      "reason": "no bootstrap strategy is documented. The compiler is written in Python and compiles Gama-G; there is no self-hosting path, and no plan for one is written down.",
+      "command": "ls docs/"
+    },
+    "14": {
+      "status": "partial",
+      "evidence": "`ggc bench` measures a program and reports the conditions of the measurement, and `docs/COMPARISON.md` records a cross-language measurement with its machine, commands and run counts.",
+      "reason": "there is no benchmark *suite* in the repository: the profiling harness needs four other language runtimes installed, so it is described rather than shipped, and no baseline is regenerated on a schedule.",
+      "command": "ggc bench examples/hello.gg"
+    },
+    "15": {
+      "status": "evidenced",
+      "evidence": "the suite runs on every push and pull request across Python 3.9-3.13, with separate jobs for the installed package, the differential backend test and the fuzzer's self-check.",
+      "command": "python -m unittest discover -s tests -t tests -q"
+    },
+    "16": {
+      "status": "not-claimed",
+      "reason": "the documentation covers what is built, what is proven, and what is not; it does not cover the specification: there is no language reference, no standard library reference and no migration guide. `docs/PRODUCTION_GAPS.md` is the list of what is missing, and it is longer than this file.",
+      "command": "ls docs/"
+    },
+    "17": {
+      "status": "evidenced",
+      "evidence": "the versioning and migration policy is written down in `docs/RELEASES.md`, including what makes a change major, and the version is stated once and checked to agree everywhere.",
+      "command": "cat docs/RELEASES.md"
+    },
+    "18": {
+      "status": "not-claimed",
+      "reason": "no incident-response process exists: no security contact, no disclosure policy, no severity classification. Shipping a language without one is a gap, and naming it here is the first step of closing it.",
+      "command": "ls SECURITY.md 2>&1 || true"
+    },
+    "19": {
+      "status": "partial",
+      "evidence": "supply-chain primitives are implemented: content hashes, pinned lock files, advisory auditing, Ed25519-signed packages and signed build manifests.",
+      "reason": "there is no key distribution or trust policy -- a signature proves the holder of a key signed something, and nothing here says whose key to trust -- and no provenance attestation from the build environment.",
+      "command": "ggc manifest --sign-key KEY --sign -o out.json examples/hello.gg"
+    },
+    "20": {
+      "status": "evidenced",
+      "evidence": "medical functionality is scoped explicitly and refuses to over-claim: the dosing module carries its own guard conditions, the interoperability module states in its own documentation that it is not a conformance-tested FHIR implementation, and no regulatory claim is made anywhere.",
+      "command": "ggc explain gaps"
+    }
+  }
+}

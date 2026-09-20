@@ -1,0 +1,7 @@
+// Spec section 19: "Unrecoverable defects enter a fault domain."  The overflow
+// is unrecoverable, so it stops the program with a named fault.
+fn main() -> Unit
+    io
+    var small: I8 = 127
+    small = small + 1
+    print(small)

@@ -1,0 +1,119 @@
+{
+  "specification": "Gama-G_v1.0_Production_Specification.txt",
+  "spec_version": "1.0",
+  "note": [
+    "Every claim below cites a section of the specification and either reads",
+    "that section's own enumerations out of the document at run time, or runs a",
+    "program the section's text implies. `ggc conform` is the runner; see",
+    "conformance/README.md. A claim whose expectation is wrong fails loudly,",
+    "and a claim about the toolkit failing to meet the document is either a",
+    "failure or an entry in deviations.json -- never silence."
+  ],
+  "claims": [
+    {
+      "id": "types-section-5",
+      "kind": "type-surface",
+      "spec": "§5",
+      "claim": "every type name section 5 lists can be used as written",
+      "why": "Section 5 lists the primitive, compound and domain types by name. Reading that list out of the document and declaring a parameter of each is the difference between checking the specification and checking the compiler's own idea of what it implements."
+    },
+    {
+      "id": "pipeline-section-22",
+      "kind": "pipeline",
+      "spec": "§22",
+      "claim": "every compilation stage is implemented or explained",
+      "why": "Section 22 names fourteen stages. Each is either performed by a named part of this compiler, or recorded as not implemented with a reason; a stage that is neither is a silent gap."
+    },
+    {
+      "id": "requirements-section-33",
+      "kind": "requirements",
+      "spec": "§33",
+      "claim": "every v1.0 requirement is evidenced or not claimed",
+      "why": "Section 33 is what stops a release from claiming more than it has. Each of its twenty items has to be answered -- with a command a reader can run, or with an explicit refusal to claim -- and an item that disappears from the checklist is a failure."
+    },
+    {
+      "id": "syntax-examples-section-4",
+      "kind": "program",
+      "spec": "§4",
+      "claim": "the syntax section's own examples are accepted and mean what they say",
+      "program": "programs/syntax-section-4.gg",
+      "expect_stdout": "ok 5\n42 0 9.0",
+      "expect_status": 0
+    },
+    {
+      "id": "immutability-by-default",
+      "kind": "refused",
+      "spec": "§1.2",
+      "claim": "`let` is immutable, so assigning to one is refused",
+      "program": "programs/immutability-default.gg",
+      "expect_code": "E-immutable"
+    },
+    {
+      "id": "strict-typing-at-compile-time",
+      "kind": "refused",
+      "spec": "§1.2",
+      "claim": "adding Text to I64 is a compile-time diagnostic, not a runtime surprise",
+      "program": "programs/strict-typing.gg",
+      "expect_code": "E-binop-type"
+    },
+    {
+      "id": "pure-function-cannot-perform-io",
+      "kind": "refused",
+      "spec": "§7",
+      "claim": "a `pure` function that writes a file is refused for that reason",
+      "program": "programs/pure-cannot-write.gg",
+      "expect_code": "E-effect-pure"
+    },
+    {
+      "id": "no-ambient-filesystem-access",
+      "kind": "refused",
+      "spec": "§12",
+      "claim": "a program that reads a file without the capability does not read it",
+      "program": "programs/capability-required.gg",
+      "expect_code": "E-capability-missing"
+    },
+    {
+      "id": "secrets-are-not-printable",
+      "kind": "refused",
+      "spec": "§12",
+      "claim": "a secret cannot be printed through ordinary output",
+      "program": "programs/secret-not-printable.gg",
+      "expect_code": "E-secret-leak"
+    },
+    {
+      "id": "recoverable-errors-use-result",
+      "kind": "program",
+      "spec": "§19",
+      "claim": "an error that is not a defect travels as a Result value",
+      "program": "programs/result-errors.gg",
+      "expect_stdout": "ok 5\nfail odd",
+      "expect_status": 0
+    },
+    {
+      "id": "faults-are-named",
+      "kind": "fault",
+      "spec": "§19",
+      "claim": "an unrecoverable defect stops the program with a named fault",
+      "program": "programs/fault-domain.gg",
+      "expect_fault": "IntegerOverflow",
+      "expect_status": 2
+    },
+    {
+      "id": "deterministic-execution-is-reproducible",
+      "kind": "program",
+      "spec": "§1.3",
+      "claim": "a function that declares `deterministic` gives the same answer twice",
+      "program": "programs/deterministic-result.gg",
+      "expect_stdout": "885441403959",
+      "expect_status": 0,
+      "repeat": 2
+    },
+    {
+      "id": "compilation-is-deterministic",
+      "kind": "deterministic",
+      "spec": "§22.14",
+      "claim": "the same source compiles to the same output twice",
+      "program": "programs/syntax-section-4.gg"
+    }
+  ]
+}

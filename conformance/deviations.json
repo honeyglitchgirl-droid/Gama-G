@@ -1,0 +1,31 @@
+{
+  "note": [
+    "Places where the toolchain knowingly differs from the specification.",
+    "An entry here is not an excuse: it is the record that the difference is",
+    "deliberate or understood. `ggc conform` fails on any difference that is",
+    "*not* in this file, and `ggc conform --strict` fails on these as well.",
+    "Each entry states what the specification says, what the toolchain does,",
+    "and -- where there is one -- the spelling that does work, which the",
+    "runner checks, so a deviation cannot rot into a false statement."
+  ],
+  "type-surface": [
+    {
+      "item": "Record",
+      "spec": "§5",
+      "reason": "introduced by declaration (`record Point`) rather than used as a bare type name",
+      "alternative": "record Point\n    x : F64\n    y : F64\n\nfn takes(p: Point) -> Unit\n    return"
+    },
+    {
+      "item": "Enum",
+      "spec": "§5",
+      "reason": "introduced by declaration (`enum Colour`) rather than used as a bare type name",
+      "alternative": "enum Colour\n    red\n    blue\n\nfn takes(c: Colour) -> Unit\n    return"
+    },
+    {
+      "item": "Matrix",
+      "spec": "§5",
+      "reason": "the shape is a bracketed list here, not positional arguments: `Matrix<T, [Rows, Cols]>` rather than `Matrix<T, Rows, Cols>`. The same shapes are expressible; the written signature in section 5 is not the one this compiler parses.",
+      "alternative": "Matrix<F64, [2, 2]>"
+    }
+  ]
+}

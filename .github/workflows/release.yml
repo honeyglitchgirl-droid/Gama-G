@@ -1,0 +1,162 @@
+name: Release
+
+# A release is a promise, so this workflow is where the promise is either
+# backed or refused.  Pushing a tag does not publish anything on its own: the
+# publish job waits for the conformance job, and the conformance job runs the
+# suite that checks this toolchain against the specification document rather
+# than against itself.  See docs/RELEASES.md for the policy this implements.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "tag to release (must match VERSION)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  conformance:
+    name: what this version does and does not evidence
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # The tag is the one thing a person can get wrong by hand, and a release
+      # whose tag disagrees with the version inside it is a lie that outlives
+      # everyone who could correct it.
+      - name: The tag matches VERSION
+        if: github.event_name == 'push'
+        run: |
+          version="$(cat VERSION)"
+          if [ "v${version}" != "${GITHUB_REF_NAME}" ]; then
+            echo "tag ${GITHUB_REF_NAME} does not match VERSION ${version}" >&2
+            exit 1
+          fi
+          echo "releasing ${version}"
+
+      - name: The suite
+        run: python -m unittest discover -s tests -t tests -q
+
+      - name: Conformance against the specification
+        run: ./tools/bin/ggc conform --json > conformance.json
+
+      # Not a gate, and deliberately: the version stays Alpha while this lists
+      # anything, and a release that hid the list would be claiming more than
+      # it has.  Attached to the release so the claim travels with it.
+      - name: What is not fully evidenced
+        run: |
+          { ./tools/bin/ggc conform --strict || true; } > strict.txt
+          cat strict.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: conformance
+          path: |
+            conformance.json
+            strict.txt
+
+  artifacts:
+    name: the files the release contains
+    needs: conformance
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: python -m pip install --upgrade pip build
+
+      - name: Build the distributions
+        run: python -m build --outdir dist
+
+      # The wheel is installed into a clean environment and made to compile a
+      # program, because the C runtime is not a Python module and setuptools
+      # silently leaves it out unless it is declared.
+      - name: The wheel works when installed
+        run: |
+          python -m venv /tmp/wheelcheck
+          /tmp/wheelcheck/bin/pip install dist/*.whl
+          cd /tmp
+          /tmp/wheelcheck/bin/ggc --version
+          /tmp/wheelcheck/bin/ggc run "${GITHUB_WORKSPACE}/examples/hello.gg"
+          /tmp/wheelcheck/bin/ggc native "${GITHUB_WORKSPACE}/examples/hello.gg"
+
+      # Signed only when the repository holds a key for it.  An ephemeral key
+      # would produce a signed manifest that attributes the build to nobody,
+      # which is worse than an unsigned one that says it is unsigned -- so
+      # there is no fallback key, and the release notes report which of the two
+      # happened by reading the manifest rather than assuming.
+      - name: Build manifest, checked reproducible
+        env:
+          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+        run: |
+          if [ -n "$RELEASE_SIGNING_KEY" ]; then
+            umask 077
+            printf '%s\n' "$RELEASE_SIGNING_KEY" > "$RUNNER_TEMP/release.key"
+            sign="--sign-key $RUNNER_TEMP/release.key"
+          else
+            sign=""
+            echo "no RELEASE_SIGNING_KEY secret, so this manifest is unsigned"
+          fi
+          # shellcheck disable=SC2086
+          ./tools/bin/ggc manifest --check-reproducible 2 $sign \
+            -o dist/build-manifest.json examples/hello.gg
+          rm -f "$RUNNER_TEMP/release.key"
+
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum ./* > SHA256SUMS
+          cat SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: distributions
+          path: dist/*
+
+  publish:
+    name: publish
+    needs: [conformance, artifacts]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: downloaded
+
+      - name: Assemble the release body
+        run: |
+          python3 tools/release_notes.py "$(cat VERSION)" \
+            --conformance downloaded/conformance/conformance.json \
+            --strict downloaded/conformance/strict.txt \
+            --checksums downloaded/distributions/SHA256SUMS \
+            --manifest downloaded/distributions/build-manifest.json \
+            --sha "${GITHUB_SHA}" \
+            -o release-notes.md
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${{ inputs.tag || github.ref_name }}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            # A re-run of an existing tag replaces the files rather than
+            # failing, so a release can be corrected without deleting it.
+            gh release upload "$tag" downloaded/distributions/* --clobber
+          else
+            gh release create "$tag" \
+              --title "Gama-G $(cat VERSION)" \
+              --notes-file release-notes.md \
+              downloaded/distributions/*
+          fi

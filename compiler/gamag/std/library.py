@@ -60,6 +60,22 @@ class Builtin:
     doc: str = ""
 
     @property
+    def hidden(self) -> bool:
+        """Whether this is a lowering target rather than something to list.
+
+        The `__`-prefixed builtins are what the compiler lowers constructs to
+        -- `__range` for `a..b`, `__transaction_begin` for a `transaction`
+        block.  A program can call them, but they are not the language's
+        surface, so `ggc explain builtins` leaves them out.
+
+        This is a property rather than a field because both call sites in the
+        CLI read `b.hidden` on every builtin, and a field would have to be set
+        in every one of the 266 declarations -- where a forgotten one would be
+        the same defect again, silently.
+        """
+        return self.name.startswith("__")
+
+    @property
     def arity(self) -> Optional[int]:
         if self.variadic:
             return None

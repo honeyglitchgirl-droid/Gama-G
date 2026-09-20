@@ -47,6 +47,20 @@ jobs:
           ./tools/bin/ggc run examples/hello.gg
           ./tools/bin/ggc check examples/*.gg examples/core/*.gg
 
+      # Every other job here compares the toolchain with itself.  This one
+      # compares it with the specification document: section 5's types,
+      # section 22's stages, section 33's requirements, and the programs the
+      # prose implies.  A claim that fails is a finding, not a flaky test.
+      - name: Conformance against the specification
+        run: ./tools/bin/ggc conform
+
+      # Runs on one interpreter only, and never fails the build.  It is here so
+      # the distance to the production bar is visible in every run instead of
+      # being rediscovered at release time.
+      - name: What is not fully evidenced (informational)
+        if: matrix.python == '3.12'
+        run: ./tools/bin/ggc conform --strict || true
+
       - name: The fuzzer's own checks can still fail
         run: python tools/fuzz_selfcheck.py
 

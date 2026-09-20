@@ -1,0 +1,16 @@
+// Spec section 7: "A pure function cannot silently perform network access or
+// modify persistent state."
+//
+// FileWrite is granted, so the capability checker is satisfied and the effect
+// checker is the one that has to refuse this.  Without the grant the program
+// would be refused for the wrong reason -- the capability -- and the claim
+// would pass without the effect system being exercised at all.
+grant FileWrite
+
+fn save(path: Text, body: Text) -> Unit
+    pure
+    io.write_file(path, body)
+
+fn main() -> Unit
+    io
+    save("/tmp/gama-conformance.txt", "x")

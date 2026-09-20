@@ -1,0 +1,6 @@
+// Spec section 12: "no ambient filesystem access".  This module never declares
+// FileRead and the caller grants nothing, so the read must not happen.
+fn main() -> Unit
+    io
+    let body = io.read_file("/etc/hostname")
+    print(len(body))

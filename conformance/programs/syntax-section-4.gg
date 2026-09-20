@@ -1,0 +1,19 @@
+// The specification's own section 4 examples, as one program.
+// Every construct below appears verbatim in "4. BASIC SYNTAX".
+fn add(a: I64, b: I64) -> I64
+    return a + b
+
+fn square(x: F64) -> F64
+    return x * x
+
+fn main() -> Unit
+    io
+    let total = 42
+    var count = 0
+    if count > 10
+        count = 0
+    var result = ok(add(2, 3))
+    match result
+        ok(value) => print("ok", value)
+        fail(err) => print("fail", err)
+    print(total, count, square(3.0))

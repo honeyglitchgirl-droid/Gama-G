@@ -398,5 +398,68 @@ class Totality(unittest.TestCase):
                         f"{description} was rejected with no diagnostic")
 
 
+class EverySubcommandRuns(unittest.TestCase):
+    """Every entry point the CLI advertises has to survive being called.
+
+    `ggc explain builtins` and `ggc explain capabilities` raised
+    `AttributeError: 'Builtin' object has no attribute 'hidden'` for as long as
+    a `hidden` field was absent from the dataclass -- the call sites were
+    written against a field that no longer existed, and nothing invoked them.
+    A toolchain whose front page promises that no input produces a Python
+    traceback should not have two topics that produce one on a valid command.
+
+    So this walks the CLI's own parser rather than a list written here: a
+    subcommand added tomorrow is covered tomorrow.
+    """
+
+    def ggc(self, *args):
+        import subprocess
+        proc = subprocess.run(
+            [sys.executable, os.path.join(S.REPO_ROOT, "tools", "bin", "ggc")]
+            + list(args),
+            capture_output=True, text=True, timeout=120)
+        combined = proc.stdout + proc.stderr
+        self.assertNotIn("Traceback (most recent call last)", combined,
+                         f"`ggc {' '.join(args)}` raised:\n{combined}")
+        return proc
+
+    def test_every_subcommand_has_help(self):
+        from gamag.cli import main as cli
+        parser = cli.build_parser()
+        for action in parser._subparsers._group_actions:
+            for name in sorted(action.choices):
+                with self.subTest(subcommand=name):
+                    self.assertEqual(self.ggc(name, "--help").returncode, 0)
+
+    def test_every_explain_topic_runs(self):
+        from gamag.cli.main import EXPLAIN_TOPICS
+        self.assertTrue(EXPLAIN_TOPICS,
+                        "there should be topics to check, not an empty set")
+        for topic in sorted(EXPLAIN_TOPICS):
+            with self.subTest(topic=topic):
+                proc = self.ggc("explain", topic)
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertTrue(proc.stdout.strip(),
+                                f"`ggc explain {topic}` printed nothing")
+
+    def test_every_explain_topic_answers_json(self):
+        """`--json` is a promise to a caller that parses it, and `capabilities`
+        fell over in a different place on that path."""
+        import json
+        from gamag.cli.main import EXPLAIN_TOPICS
+        for topic in sorted(EXPLAIN_TOPICS):
+            with self.subTest(topic=topic):
+                proc = self.ggc("explain", topic, "--json")
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                json.loads(proc.stdout)
+
+    def test_the_internal_builtins_are_the_underscore_ones(self):
+        from gamag.std import library as L
+        hidden = {n for n, b in L.BUILTINS.items() if b.hidden}
+        self.assertEqual(hidden, {n for n in L.BUILTINS
+                                  if n.startswith("__")})
+        self.assertTrue(hidden, "the list would be vacuous if it were empty")
+
+
 if __name__ == "__main__":       # pragma: no cover
     unittest.main()

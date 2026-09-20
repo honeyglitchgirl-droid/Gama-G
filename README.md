@@ -293,13 +293,34 @@ GIR the same machine serves the reference interpreter, a native CPU backend that
 emits C and compiles it to machine code, a WebAssembly encoder, and an
 accelerator layer.
 
-**591 tests pass**, and CI runs them on every push and pull request across
+Those tests compare the toolchain with itself.  `ggc conform` compares it with
+the blueprint: it reads `Gama-G_v1.0_Production_Specification.txt` at run time
+and checks section 5's type names, section 22's fourteen pipeline stages,
+section 33's twenty v1.0 requirements, and programs the prose implies.  It
+passes 13 claims and reports 3 places where the toolchain knowingly differs
+from the document (`conformance/deviations.json`); `ggc conform --strict`
+reports those three plus the ten requirements that are `partial` or
+`not-claimed`, and is the bar `docs/RELEASES.md` sets for leaving Alpha.  A
+deviation that is not recorded is a failure, so the gap can only get smaller by
+being closed or larger by being written down -- never by being forgotten.
+
+**641 tests pass**, and CI runs them on every push and pull request across
 Python 3.9 - 3.13 (`.github/workflows/ci.yml`).  The native backend is
 validated by *differential testing*:
 the same program is run on the interpreter and on the compiled binary, and their
 stdout, exit status and fault kind are compared.  Where the two could differ --
 integer range checks, float formatting, variadic output -- the C runtime
 reproduces the interpreter rather than approximating it.
+
+**The release path exists; no release has been cut with it.**  `VERSION`,
+`pyproject.toml` and the package agree on `1.2.0`, and pushing a `v1.2.0` tag
+runs `.github/workflows/release.yml`: the tag is checked against `VERSION`, the
+suite and the conformance suite must pass, the wheel is installed into a clean
+environment and made to compile a native program, a reproducible signed manifest
+and checksums are attached, and the release notes are *generated from the
+conformance run they describe* rather than written beside it.  That the path is
+built is not the same as it having run, and `docs/RELEASES.md` says what a
+version number here does and does not promise.
 
 What is not: **the native and WebAssembly backends cover a subset.**  Programs
 using the audit chain, capabilities, transactions, checkpoints, tensors,
@@ -373,6 +394,8 @@ cd Gama-G
 ./tools/bin/ggc gir --fn main examples/hello.gg # inspect the IR
 
 python3 -m unittest discover -s tests           # the compiler's own suite
+./tools/bin/ggc conform                         # the specification's own suite
+./tools/bin/ggc conform --strict                # what is not evidenced yet
 .venv/bin/python -m pytest tests/ -q            # the same suite under pytest
 ```
 
@@ -591,6 +614,13 @@ Gama-G_Detailed_Audit_and_Verification_Report.txt   the first audit
 Gama-G_Complete_Originality_and_Technical_Audit.txt  the audit v0.3 answers
 LICENSE                                      Apache-2.0
 VERSION pyproject.toml                       the version, stated once
+conformance/                                 claims against the specification,
+  claims.json deviations.json                each citing its section, with the
+  stage-mapping.json requirements.json       stages and requirements that are
+  programs/*.gg README.md                    not met written down as findings
+.github/workflows/{ci,release}.yml           tests on every push; a tag builds
+                                             a wheel, checks it, and publishes
+                                             with the conformance report
 compiler/gamag/
   core/{mir,parser,graph,native}.py        the language core and its own IR
   core/{memory,capability,recovery}.py     the three v0.4 models
@@ -601,13 +631,15 @@ compiler/gamag/
   gir/{ir,builder,optimizer}.py            the IR, lowering, optimization
   runtime/{vm,context,values,tensor,       the reference interpreter and
            recovery,audit,checkpoint,ops}.py  its subsystems
-  std/library.py                           215 builtins
+  std/library.py                           266 builtins
   methods.py                               one method table, shared by checker and VM
   cli/main.py driver.py                    ggc
 tools/bin/{ggc,ggtest}                     entry points
+tools/release_notes.py                     release notes, generated from the
+                                           conformance run they describe
 examples/core/                             eight core programs
 examples/                                  eight v0.1 programs
-tests/                                     591 tests
+tests/                                     641 tests
 docs/DESIGN_v0_4.md                        the memory, capability and recovery
                                            models, and what each one proves
 docs/DESIGN_v0_3.md                        the native IR, the five graphs, and
@@ -619,6 +651,9 @@ docs/SPEC_DECISIONS.md                     what the specification left
                                            open, and what was decided
 docs/COMPARISON.md                         what compiling to native code
                                            bought, measured, before and after
+docs/RELEASES.md                           what a version number promises, the
+                                           bar for leaving Alpha, how to tag
+docs/PRODUCTION_GAPS.md                    where this is not production grade
 ```
 
 ## Layout of the tests
@@ -644,6 +679,16 @@ tests/test_formal_semantics.py
                              on both sides of the compile/run boundary, recovery
                              levels, named checkpoints, transactions
 tests/test_examples.py       all sixteen examples, end to end
+tests/test_conformance.py    that the conformance suite can *fail*: it mutates
+                             copies of the suite and requires the runner to
+                             refuse an unrecorded deviation, a stale one, an
+                             alternative that does not compile, an invented
+                             stage, a dropped requirement, a wrong expectation
+tests/test_release.py        that the release policy and the measurement agree:
+                             the classifier may not claim more than
+                             `ggc conform --strict` supports, and the workflow
+                             may not pass the release script a flag it does not
+                             accept
 ```
 
 The vocabulary and example suites read the blueprint out of the repository at
