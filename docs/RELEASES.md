@@ -86,9 +86,25 @@ for a release and the independent review that section 33 item 10 asks for has
 happened.  That item is currently `not-claimed`, so production/stable is not
 reachable today, and no release of this toolchain may claim it.
 
-As of 1.2.0, `--strict` lists 13 things: three recorded deviations and ten
+As of 1.2.1, `--strict` lists 13 things: three recorded deviations and ten
 requirements answered `partial` or `not-claimed`.  The release notes reproduce
 that list, so a user can see the distance rather than infer it.
+
+### What the first release exposed
+
+`v1.2.0` was published by the first version of this workflow, and it is kept
+rather than rewritten.  It has four assets, because the publish step uploaded
+only the built distributions: `conformance.json` and `strict.txt` were left in
+the run's artifacts, which expire -- while this document said they were part of
+the release.  Two further defects were on the by-hand path only: dispatching the
+workflow for an older tag checked the *branch* out rather than the tag, and the
+tag-and-`VERSION` gate was skipped for anything that was not a tag push.
+
+All three are fixed, and `tests/test_release.py` reads the workflow rather than
+trusting it, because each of them was a claim in this document that the
+workflow did not implement.  `v1.2.1` is the first release produced by the fixed
+workflow; `v1.2.0` remains as it was published, and this paragraph is the record
+of why it looks different.
 
 ## 4. What a version does *not* promise
 
@@ -112,8 +128,8 @@ that list, so a user can see the distance rather than infer it.
 ```sh
 # 1. the version, in one place
 echo 1.3.0 > VERSION
-sed -i 's/^version = "1.2.0"$/version = "1.3.0"/' pyproject.toml
-sed -i 's/    return "1.2.0"/    return "1.3.0"/' compiler/gamag/__init__.py
+sed -i 's/^version = "1.2.1"$/version = "1.3.0"/' pyproject.toml
+sed -i 's/    return "1.2.1"/    return "1.3.0"/' compiler/gamag/__init__.py
 
 # 2. everything that can be checked locally, checked locally
 python3 -m unittest discover -s tests -t tests -q

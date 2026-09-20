@@ -641,14 +641,25 @@ GValue g_compare(const char *op, GValue a, GValue b, const char *pos)
     if ((a.tag == GV_BOOL) != (b.tag == GV_BOOL))
         g_raise("TypeFault", pos, "cannot order a Bool against a non-Bool");
     int r;
+    /* A NaN is ordered with nothing, including itself, so `<`, `<=`, `>` and
+       `>=` are all false for it.  Collapsing the comparison to a sign loses
+       that: a NaN compares neither less nor greater, so the sign says "equal",
+       and `<=` and `>=` come back true.  The interpreter -- and IEEE 754, and
+       the C operators the unboxed emitter uses -- say false, so the sign is
+       only trusted when both operands are ordered.  `math.nan` is a builtin
+       constant, so a program can reach this; nothing in the example corpus
+       did, which is why it survived until a corpus that compares a NaN was
+       written. */
+    int unordered = 0;
     if (is_numeric(a) && is_numeric(b)) {
-        double x = a.tag == GV_INT ? (double)a.u.i : a.u.f;
-        double y = b.tag == GV_INT ? (double)b.u.i : b.u.f;
-        /* Integer-versus-integer must not lose precision through double. */
         if (a.tag == GV_INT && b.tag == GV_INT) {
+            /* Integer-versus-integer must not lose precision through double. */
             r = a.u.i < b.u.i ? -1 : (a.u.i > b.u.i ? 1 : 0);
         } else {
+            double x = a.tag == GV_INT ? (double)a.u.i : a.u.f;
+            double y = b.tag == GV_INT ? (double)b.u.i : b.u.f;
             r = x < y ? -1 : (x > y ? 1 : 0);
+            unordered = isnan(x) || isnan(y);
         }
     } else if (a.tag == GV_TEXT && b.tag == GV_TEXT) {
         size_t n = a.u.s->len < b.u.s->len ? a.u.s->len : b.u.s->len;
@@ -660,10 +671,10 @@ GValue g_compare(const char *op, GValue a, GValue b, const char *pos)
                 g_type_name(a), g_type_name(b));
         return g_unit();
     }
-    if (!strcmp(op, "<"))  return g_bool(r < 0);
-    if (!strcmp(op, ">"))  return g_bool(r > 0);
-    if (!strcmp(op, "<=")) return g_bool(r <= 0);
-    return g_bool(r >= 0);
+    if (!strcmp(op, "<"))  return g_bool(!unordered && r < 0);
+    if (!strcmp(op, ">"))  return g_bool(!unordered && r > 0);
+    if (!strcmp(op, "<=")) return g_bool(!unordered && r <= 0);
+    return g_bool(!unordered && r >= 0);
 }
 
 /* A result too large for the exact arithmetic the interpreter performs. */

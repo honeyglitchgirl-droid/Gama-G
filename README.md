@@ -304,7 +304,7 @@ reports those three plus the ten requirements that are `partial` or
 deviation that is not recorded is a failure, so the gap can only get smaller by
 being closed or larger by being written down -- never by being forgotten.
 
-**644 tests pass**, and CI runs them on every push and pull request across
+**646 tests pass**, and CI runs them on every push and pull request across
 Python 3.9 - 3.13 (`.github/workflows/ci.yml`).  The native backend is
 validated by *differential testing*:
 the same program is run on the interpreter and on the compiled binary, and their
@@ -312,18 +312,20 @@ stdout, exit status and fault kind are compared.  Where the two could differ --
 integer range checks, float formatting, variadic output -- the C runtime
 reproduces the interpreter rather than approximating it.
 
-**The first release is out: [`v1.2.0`](https://github.com/honeyglitchgirl-droid/Gama-G/releases/tag/v1.2.0).**
-Pushing the tag ran `.github/workflows/release.yml`, which checks that the tag
-matches `VERSION`, that the suite passes and that every conformance claim
-passes, installs the built wheel into a clean environment and makes it compile a
-native program, and publishes the wheel, the source distribution, a reproducible
-build manifest and checksums -- with the conformance report and the `--strict`
-list attached, so what the release does not evidence travels with it instead of
-expiring with a CI log.  The release notes are generated from that run by
-`tools/release_notes.py` rather than written beside it.  `docs/RELEASES.md` says
-what a version number here does and does not promise, including that the
-manifest is `unsigned` until the repository holds a signing key -- it says so
-rather than generating a throwaway one.
+**Releases exist, and they say what they do not prove.**  Pushing a `v*` tag
+runs `.github/workflows/release.yml`, which checks that the tag matches
+`VERSION`, that the suite passes and that every conformance claim passes,
+installs the built wheel into a clean environment and makes it compile a native
+program, and publishes the wheel, the source distribution, a reproducible build
+manifest, checksums, the conformance report and the `--strict` list -- so what a
+release does not evidence travels with it instead of expiring in a CI log.  The
+release notes are generated from that run by `tools/release_notes.py` rather
+than written beside it.  [`v1.2.1`](https://github.com/honeyglitchgirl-droid/Gama-G/releases/tag/v1.2.1)
+is the current release; `v1.2.0`, the first, is kept as published and has four
+assets rather than six, because the publish step it ran under uploaded only the
+distributions -- `docs/RELEASES.md` records what the first release exposed.
+The manifest reports itself as `unsigned` until the repository holds a signing
+key, rather than generating a throwaway one.
 
 What is not: **the native and WebAssembly backends cover a subset.**  Programs
 using the audit chain, capabilities, transactions, checkpoints, tensors,
@@ -642,7 +644,7 @@ tools/release_notes.py                     release notes, generated from the
                                            conformance run they describe
 examples/core/                             eight core programs
 examples/                                  eight v0.1 programs
-tests/                                     644 tests
+tests/                                     646 tests
 docs/DESIGN_v0_4.md                        the memory, capability and recovery
                                            models, and what each one proves
 docs/DESIGN_v0_3.md                        the native IR, the five graphs, and

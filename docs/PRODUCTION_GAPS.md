@@ -16,7 +16,7 @@ nowhere outside this file.  What follows is where it lacks.
 ## 1. What is built
 
 All eleven remaining audit priorities (P3 - P16) plus the version merge: one
-language, one pipeline, four ways to run it, 644 tests and a conformance suite
+language, one pipeline, four ways to run it, 646 tests and a conformance suite
 that checks the toolchain against the specification document rather than
 against itself.  The native CPU backend
 emits C and compiles it; the WebAssembly encoder emits a module; the
@@ -124,6 +124,48 @@ That file is not a Python module, so setuptools left it out of the wheel and
 from a checkout.  Declared as package data, and the CI packaging job now runs
 `ggc native` after `pip install .`, so the two cannot drift apart again.
 
+### 2.6 A NaN compared as equal in the compiled binary (fixed)
+
+The C runtime collapsed a float comparison into a three-way sign -- less,
+equal, greater -- and then answered `<=` and `>=` from that sign.  A NaN is
+neither less than nor greater than anything, including itself, so it came out
+as "equal" and both comparisons returned **true**:
+
+```
+fn le(x: F64) -> Bool
+    pure
+    return x <= 1.0
+
+fn main() -> Unit
+    io
+    print(le(math.nan))
+```
+
+Before the fix, `ggc run` printed `false` (the interpreter is Python, which
+follows IEEE 754) and `ggc native` printed `true`.  `!=` was right, `==` and
+`<` were right, and `<=`/`>=` were wrong, in every compiled program that
+compared a NaN -- and `math.nan` is a builtin constant, so any program could.
+
+Nothing in the example corpus compares a NaN, and `0.0 / 0.0` is a fault here
+rather than a NaN, so `ggc difftest` over `examples/` never produced one.  It
+surfaced the first time a corpus entry compared `math.nan`: the entry exists
+because the unboxed emitter was being checked against the boxed one, and the
+two *disagreed* -- which is a bug in one of them, and the interpreter said
+which.  The sign is now only trusted when both operands are ordered.
+
+```sh
+# both should print the same six values: true is only `!=`
+printf 'fn le(x: F64) -> Bool\n    pure\n    return x <= 1.0\n\nfn main() -> Unit\n    io\n    print(le(math.nan))\n' > /tmp/nan.gg
+./tools/bin/ggc run /tmp/nan.gg        # false
+./tools/bin/ggc native /tmp/nan.gg && ./.ggbuild/nan   # false, since the fix
+```
+
+The same corpus entry found a smaller thing: three of the sixteen examples
+printed a `-Wall` warning at the user -- an unused `static int g_initialized`
+in generated code -- which is now marked as possibly unused.  Generated code
+that warns is generated code that looks unfinished, and the warning is in a file
+nobody wrote.
+
 ---
 
 ## 3. Scope limits that block production use
@@ -188,17 +230,21 @@ one is already stated in `docs/DESIGN_v1_0.md` section 5.
   a checked-in benchmark set that runs the same way on another machine, so
   section 33 item 14 is answered `partial` and `ggc conform --strict` lists it.
   A number in a document is not a baseline.
-- **There is a release, and it is Alpha.**  `v1.2.0` is tagged and published
-  from `78e8a51`, with the wheel, source distribution, a reproducible build
-  manifest, checksums, and the conformance report and `--strict` list attached.
-  The digest of the manifest was `ecd0e756b5097f80b95d825c946368d039a02814de372c591d7a48b6ed40ab40`
-  on the runner and the manifest is `signed: no`, because the repository has no
-  `RELEASE_SIGNING_KEY`; the release notes say exactly that rather than
-  implying provenance.  The metadata bar for leaving Alpha is stated in
-  `docs/RELEASES.md` and is the same command as everything else --
-  `ggc conform --strict` -- which currently lists 13 things.  So the release
-  exists, and it says it is not production grade, which is the arrangement
-  spec section 43 asks for.
+- **Releases exist, and they are Alpha.**  `v1.2.1` is the current release,
+  built and published by `.github/workflows/release.yml` from a tag, with the
+  wheel, source distribution, a reproducible build manifest, checksums, the
+  conformance report and the `--strict` list attached.  `v1.2.0`, the first
+  release, has four assets rather than six: the publish step it ran under
+  uploaded only the distributions and left the conformance report in an
+  expiring artifact, which is the one thing `docs/RELEASES.md` says must not
+  happen.  It is kept as it was published rather than rewritten, and the
+  workflow that produced it no longer exists.  Every manifest so far is
+  `signed: no`, because the repository has no `RELEASE_SIGNING_KEY`; the notes
+  say exactly that rather than implying provenance.  The metadata bar for
+  leaving Alpha is stated in `docs/RELEASES.md` and is the same command as
+  everything else -- `ggc conform --strict` -- which currently lists 13 things.
+  So the releases exist, and they state that they are not production grade,
+  which is the arrangement spec section 43 asks for.
 
 ---
 
@@ -221,7 +267,7 @@ In rough order of return on effort:
    someone who did not write it.
 5. Constant-time crypto, or removal of crypto from the shipped surface.
 6. A published benchmark suite, not just published measurements.
-7. ~~Releases, and the metadata to match~~ -- **done**: `v1.2.0` is published
+7. ~~Releases, and the metadata to match~~ -- **done**: `v1.2.1` is published
    with its conformance report attached, and a release now has to pass the
    suite, the tag check and the conformance suite before it can exist.  What
    remains is signing: the manifest is reproducible but `signed: no` until a
@@ -235,7 +281,7 @@ about its edges, and this file is how that honesty is kept checkable.
 ## 6. How to check any of this yourself
 
 ```
-python -m unittest discover -s tests -t tests -q      # 644 tests
+python -m unittest discover -s tests -t tests -q      # 646 tests
 python tools/fuzz_selfcheck.py                        # the checks can fail
 ./tools/bin/ggc difftest examples/*.gg examples/core/*.gg
 

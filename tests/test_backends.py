@@ -1020,7 +1020,90 @@ SCALAR_CORPUS = {
         'print(f(4))',
     "text_printed_from_a_specialized_function":
         'fn f(i: I64, x: F64, b: Bool) { print(i, x, b, "text") }\nf(1, 2.5, true)',
+    # NaN is reachable (`math.nan` is a builtin constant), and it is where C
+    # and Python most easily disagree: a comparison against NaN is unordered,
+    # so `<`, `<=`, `==` and `>=` are all false and `!=` is true.  The
+    # specialised emitter lowers comparisons to the same C operators the
+    # generic emitter's `g_compare` implements, so the two agree by
+    # construction -- but "by construction" is what a corpus entry is for.
+    # Only the boundary can deliver a NaN to a specialised function: a read of
+    # `math.nan` inside one is a global, which the plan declines.
+    "nan_through_the_boxed_boundary":
+        'fn lt(x: F64) -> Bool { return x < 1.0 }\n'
+        'fn le(x: F64) -> Bool { return x <= 1.0 }\n'
+        'fn eq(x: F64) -> Bool { return x == 1.0 }\n'
+        'fn ne(x: F64) -> Bool { return x != 1.0 }\n'
+        'fn ge(x: F64) -> Bool { return x >= 1.0 }\n'
+        'fn plus(x: F64) -> F64 { return x + 1.0 }\n'
+        'print(lt(math.nan), le(math.nan), eq(math.nan), ne(math.nan),'
+        ' ge(math.nan), plus(math.nan))',
 }
+
+
+class NaNIsOrderedWithNothing(TempBuild):
+    """`math.nan` is reachable, and a comparison against it is unordered.
+
+    IEEE 754 says `<`, `<=`, `>` and `>=` are all false for a NaN and `!=` is
+    true.  The interpreter has always done that -- it is Python -- and the
+    unboxed emitter does it because it lowers comparisons to the same C
+    operators.  The *boxed* C runtime did not: it collapsed a float comparison
+    into a three-way sign, and a NaN -- which is neither less nor greater --
+    came out as "equal", so `<=` and `>=` returned true.
+
+    The example corpus never produced a NaN, so the differential tester never
+    saw it.  A program comparing one is enough, and the expected values are
+    written out here rather than compared against another implementation,
+    because two implementations agreeing is not the same as either being right.
+    """
+
+    PROGRAM = (
+        'fn lt(x: F64) -> Bool { return x < 1.0 }\n'
+        'fn le(x: F64) -> Bool { return x <= 1.0 }\n'
+        'fn gt(x: F64) -> Bool { return x > 1.0 }\n'
+        'fn ge(x: F64) -> Bool { return x >= 1.0 }\n'
+        'fn eq(x: F64) -> Bool { return x == 1.0 }\n'
+        'fn ne(x: F64) -> Bool { return x != 1.0 }\n'
+        'fn arith(x: F64) -> F64 { return x + 1.0 }\n'
+        'print(lt(math.nan), le(math.nan), gt(math.nan), ge(math.nan),'
+        ' eq(math.nan), ne(math.nan), arith(math.nan))\n'
+    )
+
+    EXPECTED = "false false false false false true nan"
+
+    def test_the_interpreter_says_what_ieee_says(self):
+        outcome = S.run(self.PROGRAM)
+        self.assertNotIn("E-", " ".join(outcome.codes()))
+        self.assertIn(self.EXPECTED, outcome.output)
+
+    def test_both_native_emitters_say_the_same(self):
+        program = compiled_program(self.PROGRAM, "<nan>")
+        outputs = []
+        for specialize in (True, False):
+            plan = cgen.scalar_plan(program) if specialize else {}
+            real = cgen.scalar_plan
+            if not specialize:
+                cgen.scalar_plan = lambda program: {}
+            try:
+                build = native.build(program, "nan.gg",
+                                     build_dir=os.path.join(self.build_dir,
+                                                            str(specialize)))
+            finally:
+                cgen.scalar_plan = real
+            if not build.ok:
+                self.skipTest("the backend declined: "
+                              + "; ".join(p.render() for p in build.problems))
+            noise = [line for line in build.stderr.splitlines()
+                     if "warning" in line or "error" in line]
+            self.assertEqual(noise, [],
+                             "the C compiler had something to say")
+            if specialize:
+                self.assertTrue(plan, "this program should be specialized")
+            run = native.run(build.exe_path)
+            self.assertEqual(run.returncode, 0, run.stderr)
+            outputs.append(run.stdout)
+        for text in outputs:
+            self.assertIn(self.EXPECTED, text)
+        self.assertEqual(outputs[0], outputs[1])
 
 
 class ScalarSpecialisation(TempBuild):

@@ -264,12 +264,21 @@ them because the way each was caught is more useful than the fix:
 | the prototype block emitted two declarations on one line, so the second was parsed as parameters | the existing test suite, immediately | -- |
 | the plan filed a function's eligibility under the *builtin's* name (a shadowed loop variable) | printing the plan for the three benchmark programs | it made the function silently not specialized, never wrong |
 | the plan refused every function ending in a bare `return`, because a Unit return carries a placeholder operand | the benchmark got *slower* than the baseline | it was a performance bug with no wrong answer to find |
+| a NaN compared as equal by the **boxed** runtime, so `<=` and `>=` returned true (this one was already wrong before the optimization; the two emitters merely disagreed) | a new corpus entry that compares `math.nan`, from the same harness -- and the interpreter settled which emitter was right | no example produces a NaN: `0.0 / 0.0` faults here, and `math.nan` has to be spelled out |
 
 The third row is the one worth keeping: no exit code, no fault kind and no test
 assertion distinguishes `"division by zero"` from `"division by zero: 1 / 0"`.
 Only comparing the two emitters' output does.  That harness is now
 `ScalarSpecialisation` in `tests/test_backends.py`, over a corpus of one program
 per property, and it is the reason the optimization can be trusted at all.
+
+The last row is the one that is not about this optimization at all: the boxed
+runtime had been wrong about NaN since before it, and nothing looked.  A corpus
+that compares two emitters finds a bug in whichever one is wrong; it does not
+find a bug they *share*.  That is why `NaNIsOrderedWithNothing` asserts the
+IEEE answer directly -- `false false false false false true` -- rather than
+asserting that the two emitters agree, and why the fix is recorded in
+`docs/PRODUCTION_GAPS.md` section 2.6 rather than here.
 
 ---
 

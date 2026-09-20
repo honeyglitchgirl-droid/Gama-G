@@ -559,7 +559,11 @@ class CGenerator:
         self.emit("                 g_declared_grants_n);")
         self.emit("}")
         self.emit()
-        self.emit("static int g_initialized = 0;")
+        # `G_MAYBE_UNUSED` because a program whose module initializer is empty
+        # never reads it, and an unused `static int` in generated code makes
+        # `-Wall` print a warning at the user for something they did not write.
+        # Three of the sixteen examples did exactly that.
+        self.emit("static G_MAYBE_UNUSED int g_initialized = 0;")
         self.emit()
         self.emit("GValue g_main(int argc, char **argv)")
         self.emit("{")
