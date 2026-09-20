@@ -30,7 +30,7 @@ RecoveryGraph can enumerate a number for every loop the program contains.
 from __future__ import annotations
 
 import re
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from ..diagnostics import DiagnosticBag, Phase
 from . import capability as CAP
@@ -95,7 +95,42 @@ class ModelBuilder:
     # ------------------------------------------------------------------
     def _collect(self) -> None:
         graph = self.model.operations
+        #: Which node claimed each name.  Spec section 9 describes a program as
+        #: a graph of operations, and the name is the identity of a node in it:
+        #: diagnostics, `ggc graph`, the audit trail and the provenance record
+        #: all refer to an operation by name.  Two nodes sharing one name made
+        #: those references ambiguous -- and, because the graph is a dict keyed
+        #: by name, made one of the two vanish from it while its binding stayed
+        #: in `producers_of`, so the graph disagreed with itself.
+        #: `source` and `state` are identified by the binding they produce, not
+        #: by their own name -- a `source` is named after its binding, and the
+        #: "is this produced twice?" rule below is the specific one for them.
+        #: Claiming their names here would report the generic error first and
+        #: hide the more precise `E-duplicate-binding`.
+        BINDING_KEYED = ("source", "state")
+        named: Dict[str, Any] = {}
         for node in self.s.nodes:
+            # A duplicate is reported but the node is otherwise processed as
+            # usual, minus its entry in the graph.  Dropping it entirely would
+            # leave its binding unproduced and turn one mistake into a cascade
+            # of "cannot find" errors about a binding the author did write.
+            duplicate = False
+            if node.name and node.kind not in BINDING_KEYED:
+                previous = named.get(node.name)
+                if previous is not None:
+                    self.error(
+                        f"`{node.name}` is declared more than once "
+                        f"({previous.kind} and {node.kind}); a name identifies "
+                        f"one node in the operation graph",
+                        node.pos, code="E-duplicate-operation",
+                        help_text=(
+                            "rename one of them.  A choice is not made by "
+                            "reusing a name: several operations yielding the "
+                            "*same binding* are the alternatives, and they "
+                            "carry distinct names and `when` guards"))
+                    duplicate = True
+                else:
+                    named[node.name] = node
             if node.kind == "source":
                 if node.produces in self.produced_by:
                     self.error(f"`{node.produces}` is produced more than once",
@@ -132,7 +167,8 @@ class ModelBuilder:
                         code="E-transition-target",
                         help_text="only `state` resources may change; bindings "
                                   "produced by operations are single-assignment")
-                graph.nodes[node.name] = node
+                if not duplicate:
+                    graph.nodes[node.name] = node
             else:
                 if not node.produces:
                     self.error(
@@ -152,7 +188,8 @@ class ModelBuilder:
                     continue
                 self.produced_by.setdefault(node.produces, node.kind)
                 producers.append(node.name)
-                graph.nodes[node.name] = node
+                if not duplicate:
+                    graph.nodes[node.name] = node
 
     # ------------------------------------------------------------------
     def _shapes(self) -> None:

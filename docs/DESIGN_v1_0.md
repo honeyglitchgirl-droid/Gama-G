@@ -93,7 +93,7 @@ Every row names the evidence, because a feature list without one is a wish.
 
 | Area | Where | How it is checked |
 |---|---|---|
-| Language surface | `parser.py`, `core/parser.py` | 536 tests; the spec vocabulary tests read the specification's own enumerations at run time |
+| Language surface | `parser.py`, `core/parser.py` | 548 tests; the spec vocabulary tests read the specification's own enumerations at run time |
 | Types | `semantic/checker.py` | spec types 208-236, each inhabited by a compiling program |
 | Effects | `semantic/checker.py` | declared-versus-inferred comparison; `unsafe` is a declared effect |
 | Capabilities | `capabilities.py` | one algebra shared by compiler and runtime; attenuation only |
@@ -248,7 +248,16 @@ something.
     `compile_source` a Python string, which has already decoded, so the file
     path where 11 lived was never exercised.  A new invariant writes bytes to
     disk and calls `compile_file`; it is tested for its ability to fail.
-15. **The wheel omitted the C runtime.**  `gamag_rt.c` is not a Python module,
+15. **Two rules the specification never stated** had to be settled before they
+    could be fixed: whether two declarations may share a name, and whether a
+    `parallel` task may perform an effect.  Both were answered by their owner
+    and are recorded, with the measurements behind them, in
+    [`SPEC_DECISIONS.md`](SPEC_DECISIONS.md) (D-1 and D-2).  Fixing them found
+    two more defects: a duplicate `fn` was reported as `E-ice: internal
+    compiler error`, and the first implementation of the parallel rule was
+    blind to an effect that the enclosing function had already performed before
+    the region.
+16. **The wheel omitted the C runtime.**  `gamag_rt.c` is not a Python module,
     so setuptools left it out and `ggc native` would have failed on every
     installed copy while working from a checkout.  Found while writing the CI
     packaging job, which now runs `ggc native` after installing.
@@ -262,7 +271,7 @@ something.
 ./tools/bin/ggc difftest examples/hello.gg     # interpreter vs native
 ./tools/bin/ggc fuzz --rounds 500              # try to break it
 python3 tools/fuzz_selfcheck.py                # prove the fuzzer can fail
-python3 -m unittest discover -s tests -t tests # 536 tests
+python3 -m unittest discover -s tests -t tests # 548 tests
 ./tools/bin/ggc manifest examples/hello.gg --check-reproducible 3
 ./tools/bin/ggc bench examples/hello.gg --repeats 20
 ./tools/bin/ggc device                         # is there an accelerator? no

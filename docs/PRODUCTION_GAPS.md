@@ -16,7 +16,7 @@ nowhere outside this file.  What follows is where it lacks.
 ## 1. What is built
 
 All eleven remaining audit priorities (P3 - P16) plus the version merge: one
-language, one pipeline, four ways to run it, 536 tests.  The native CPU backend
+language, one pipeline, four ways to run it, 548 tests.  The native CPU backend
 emits C and compiles it; the WebAssembly encoder emits a module; the
 accelerator layer detects devices and refuses rather than falling back
 silently; the fuzzer finds real bugs; there is a package manager, a signing
@@ -190,7 +190,7 @@ about its edges, and this file is how that honesty is kept checkable.
 ## 6. How to check any of this yourself
 
 ```
-python -m unittest discover -s tests -t tests -q      # 536 tests
+python -m unittest discover -s tests -t tests -q      # 548 tests
 python tools/fuzz_selfcheck.py                        # the checks can fail
 ./tools/bin/ggc difftest examples/*.gg examples/core/*.gg
 

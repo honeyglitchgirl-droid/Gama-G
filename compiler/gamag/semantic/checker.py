@@ -128,6 +128,11 @@ class Checker:
         self.imports: Set[str] = set()
         self.current_fn: Optional[FunctionInfo] = None
         self.used_results: Set[int] = set()
+        #: How deep inside `parallel` regions the check currently is, and the
+        #: effects discovered while there (see _note_effect).  A region's
+        #: entries are drained when it ends, so nesting works.
+        self.parallel_depth: int = 0
+        self.region_effects: List[Tuple[str, Any]] = []
         self.secret_flows: List[Tuple[SourcePos, str]] = []
         # name/member resolution results, keyed by AST node identity, so the
         # GIR builder does not have to repeat scope resolution.
@@ -220,7 +225,59 @@ class Checker:
     # ------------------------------------------------------------------
     # declaration collection (pass 1: names before bodies)
     # ------------------------------------------------------------------
+    #: The declaration kinds that share the module's name namespace, with the
+    #: word to use when telling the user which two of them collided.  Tests are
+    #: not here: a test is never referred to by name from code, so it cannot be
+    #: ambiguous.
+    DECLARED_NAMES: Tuple[Tuple[type, str], ...] = (
+        (A.FnDecl, "function"),
+        (A.RecordDecl, "record"),
+        (A.EnumDecl, "enum"),
+        (A.PipelineDecl, "pipeline"),
+        (A.ModelDecl, "model"),
+        (A.ServiceDecl, "service"),
+        (A.PolicyDecl, "policy"),
+        (A.AgentDecl, "agent"),
+        (A.FaultDecl, "fault"),
+        (A.TransactionDecl, "transaction"),
+    )
+
+    def _claim_declaration_names(self) -> None:
+        """One namespace, one name.
+
+        Every declaration is referred to by name -- in diagnostics, in
+        `ggc graph`, in the audit trail, in provenance -- so two declarations
+        sharing one name make all of those ambiguous.  It was worse than
+        ambiguous before this check: a duplicate record or enum was accepted in
+        silence, the second definition quietly replacing the first, and a
+        duplicate function surfaced as ``E-ice: internal compiler error``
+        during lowering -- the compiler blaming itself for a user error, and
+        doing it three phases after the mistake was made.
+        """
+        seen: Dict[str, Tuple[str, Any]] = {}
+        for decl in self.module.decls:
+            name = getattr(decl, "name", None)
+            if not name or name == "<module>":
+                continue
+            kind = next((word for cls, word in self.DECLARED_NAMES
+                         if isinstance(decl, cls)), None)
+            if kind is None:
+                continue
+            previous = seen.get(name)
+            if previous is not None:
+                self.error(
+                    f"`{name}` is declared more than once: a {previous[0]} "
+                    f"and a {kind}",
+                    decl.pos, phase=Phase.RESOLVE,
+                    code="E-duplicate-declaration",
+                    help_text="a module has one namespace, so the second "
+                              "declaration makes every mention of the name "
+                              "ambiguous; rename one of them")
+                continue
+            seen[name] = (kind, decl)
+
     def collect_declarations(self) -> None:
+        self._claim_declaration_names()
         for decl in self.module.decls:
             if isinstance(decl, A.RecordDecl):
                 fields = tuple((f.name, self.resolve_type(f.type))
@@ -584,7 +641,8 @@ class Checker:
                           phase=Phase.TYPE, code="W-recovery-target")
         self.current_fn = previous
         if decl.audit_all:
-            info.effects.add("audit")
+            info.effects.add("audit")   # a declaration, not a statement:
+            # it cannot be inside a region, so no _note_effect here.
 
     def check_agent(self, decl: A.AgentDecl) -> None:
         scope = self.globals.child(f"agent:{decl.name}")
@@ -1033,17 +1091,93 @@ class Checker:
         # Spec section 7 lists pure/io/network/storage/crypto/model/medical/
         # audit/unsafe as the effect vocabulary.  Concurrency is a scheduling
         # property the compiler derives from the operation graph (section 3),
-        # not an effect a function declares, so a `parallel` region adds none.
+        # not an effect a function declares, so a `parallel` region adds none
+        # *of its own* -- but the effects of the calls it makes are a different
+        # question, and the one that matters here.
         inner = scope.child("parallel")
         for sym_name, sym in scope.symbols.items():
             inner.symbols.setdefault(sym_name, sym)
-        if st.body:
-            self._declare_parallel_outputs(st.body.stmts, inner)
-            for body_stmt in st.body.stmts:
-                self.check_stmt(body_stmt, inner)
+        self.parallel_depth += 1
+        mark = len(self.region_effects)
+        try:
+            if st.body:
+                self._declare_parallel_outputs(st.body.stmts, inner)
+                for body_stmt in st.body.stmts:
+                    self.check_stmt(body_stmt, inner)
+        finally:
+            self.parallel_depth -= 1
+        found = self.region_effects[mark:]
+        del self.region_effects[mark:]
+        if found:
+            self._refuse_parallel_effects(st, found)
         for name, sym in inner.symbols.items():
             if name not in scope.symbols:
                 scope.define(sym)
+
+    #: What a parallel task may not do.  `pure` is the absence of an effect, so
+    #: it is not listed.  Anything here either produces output whose *order*
+    #: matters, or mutates something outside the task, and the scheduler is
+    #: free to run independent tasks in any order.
+    PARALLEL_FORBIDDEN = ("io", "network", "storage", "crypto", "model",
+                          "medical", "audit", "unsafe")
+
+    def _note_effect(self, eff: str, pos: Optional[SourcePos] = None) -> None:
+        """Record that the function under check performs `eff`.
+
+        Effects are recorded exactly where they are discovered, so the region
+        below can tell which of them were discovered *inside* it.  Comparing
+        the effect set before and after the body would not be enough: a
+        function that already printed before the region would show no change
+        when a task printed inside it, and the racy region would be accepted.
+        """
+        if eff == "pure":
+            return
+        if self.current_fn is not None:
+            self.current_fn.effects.add(eff)
+        if self.parallel_depth:
+            self.region_effects.append((eff, pos))
+
+    def _refuse_parallel_effects(self, st: A.Parallel,
+                                 found: List[Tuple[str, Any]]) -> None:
+        """A parallel task computes its outputs; it does not act on the world.
+
+        Spec section 9C says the compiler "may execute independent operations
+        concurrently" and commits writes in program order.  That makes the
+        *state* committed by a region deterministic -- and it was measured to
+        be -- but it says nothing about the order in which the tasks reach the
+        outside world.  It is not deterministic, and it cannot be made so by
+        scheduling, because the whole point of the region is to choose the
+        schedule at run time: three tasks printing `alpha`, `beta`, `gamma` and
+        given deliberately unequal work printed
+
+            gamma, beta, alpha        beta, gamma, alpha        gamma, beta, alpha
+
+        on three consecutive runs of one unchanged program.  A program whose
+        observable output depends on the schedule is a program with a race in
+        it, so the region is refused at check time rather than left to be
+        discovered later.  Determinism then holds by construction: every task
+        is pure, so any interleaving computes the same values.
+        """
+        # One diagnostic per distinct effect, at the first place it was found,
+        # rather than one per call: a task calling three io functions should
+        # not read as three separate mistakes.
+        first: Dict[str, Any] = {}
+        for eff, pos in found:
+            if eff in self.PARALLEL_FORBIDDEN and eff not in first:
+                first[eff] = pos
+        for eff in sorted(first):
+            self.error(
+                f"`{eff}` is not allowed in a `parallel` task",
+                first[eff] or st.pos,
+                phase=Phase.TYPE, code="E-parallel-effect",
+                help_text=(
+                    "tasks in a region may run in any order, so an effect "
+                    "inside one makes the program's output depend on the "
+                    f"schedule.  Move the `{eff}` work out of the region -- "
+                    "before it to gather inputs, after it to report the "
+                    "results -- and keep the region to computation that "
+                    "produces its outputs; spec section 9C"))
+
 
     def _declare_parallel_outputs(self, stmts: List[A.Stmt],
                                   inner: Scope) -> None:
@@ -1080,8 +1214,7 @@ class Checker:
             self._quiet = previous
 
     def stmt_AuditRecord(self, st: A.AuditRecord, scope: Scope) -> None:
-        if self.current_fn is not None:
-            self.current_fn.effects.add("audit")
+        self._note_effect("audit", st.pos)
         seen: Set[str] = set()
         for key, expr in st.fields:
             if key in seen:
@@ -1155,8 +1288,7 @@ class Checker:
             self.infer(st.expr, scope)
 
     def stmt_AuditDirective(self, st: A.AuditDirective, scope: Scope) -> None:
-        if self.current_fn is not None:
-            self.current_fn.effects.add("audit")
+        self._note_effect("audit", st.pos)
 
     def _declare_pipeline_stages(self, statements: List[A.Stmt], scope: Scope,
                                  info: "FunctionInfo") -> None:
@@ -1468,11 +1600,10 @@ class Checker:
         if self.current_fn is None:
             return
         for eff in b.effects:
-            if eff != "pure":
-                self.current_fn.effects.add(eff)
+            self._note_effect(eff, e.pos)
         if b.name.startswith(("medical.", "model.")):
-            self.current_fn.effects.add(
-                "medical" if b.name.startswith("medical.") else "model")
+            self._note_effect(
+                "medical" if b.name.startswith("medical.") else "model", e.pos)
 
     def check_fn_call(self, ftype: T.FnType, arg_types: List[T.Type],
                       e: A.Call) -> T.Type:
@@ -1496,9 +1627,9 @@ class Checker:
         if self.current_fn is not None:
             for eff in ftype.effects:
                 # `pure` marks the absence of effects; propagating it would
-                # wrongly taint callers (spec section 7).
-                if eff != "pure":
-                    self.current_fn.effects.add(eff)
+                # wrongly taint callers (spec section 7) -- _note_effect drops
+                # it for the same reason.
+                self._note_effect(eff, e.pos)
         target = self.functions.get(ftype.name)
         if target is not None:
             if self.current_fn is not None:

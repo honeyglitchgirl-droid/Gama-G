@@ -1,12 +1,22 @@
 // Operation graphs and data parallelism (spec sections 3 and 9C).
 //
-// `parallel` is not a thread pragma: the compiler builds a graph of typed
-// operations, finds the dependencies between them, and only runs
-// independent operations concurrently.  Results are committed in program
-// order, so the outcome never depends on the schedule.
-//
 //   ggc run examples/parallel_pipeline.gg
 //   ggc gir --fn "main$par$t2" examples/parallel_pipeline.gg
+//
+// `parallel` is not a thread pragma: the compiler builds a graph of typed
+// operations, finds the dependencies between them, and only runs independent
+// operations concurrently.  Results are committed in program order, so the
+// *values* a region produces never depend on the schedule.
+//
+// A region is also required to be pure.  Committing writes in program order
+// orders the state a region leaves behind, but it cannot order what its tasks
+// say to the outside world: three tasks printing in one region, given
+// deliberately unequal work, printed `gamma, beta, alpha` and then
+// `beta, gamma, alpha` on separate runs of the same program.  So an effect
+// inside a region is refused with `E-parallel-effect`, and every effect
+// happens outside it -- before the region to gather inputs, after it to
+// report results.  That is why the loads below are not in the region: they
+// print.  What is left in the region is computation, which cannot race.
 
 fn loadVitals(patient: Text) -> List<F64>
     io
@@ -49,11 +59,19 @@ pipeline patientRisk {
 
 fn main() -> Unit
     io
-    print("independent loads run concurrently; the summary waits for all three")
+    print("the loads happen first, outside the region: they perform io")
+    let rawVitals = loadVitals("P-1")
+    let rawLabs = loadLabs("P-1")
+    let visits = loadHistory("P-1")
+
+    // These four statements are pure, so they may run in any order: `summary`
+    // waits for the other three because it depends on them, and everything
+    // else is independent.
+    print("")
+    print("independent computations run concurrently; the summary waits")
     parallel
-        vitals = mean(loadVitals("P-1"))
-        labs = mean(loadLabs("P-1"))
-        visits = loadHistory("P-1")
+        vitals = mean(rawVitals)
+        labs = mean(rawLabs)
         summary = summarise(vitals, labs, visits)
 
     print("vitals :", vitals)

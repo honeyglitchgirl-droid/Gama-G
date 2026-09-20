@@ -247,6 +247,73 @@ outcome a
 """)
         out.assert_rejected(self, "E-duplicate-binding")
 
+    def test_two_operations_with_one_name_are_refused(self):
+        """A name identifies one node in the operation graph (spec section 9).
+
+        Before this rule the graph -- a dict keyed by name -- silently kept
+        whichever operation came last, so `ggc graph` showed one `Calc` where
+        the program declared two, while `producers_of` still listed both.  The
+        graph disagreed with itself and nothing said so.
+        """
+        out = S.run(core("""
+source weight : F64 from 2.0
+operation Calc
+    uses     weight
+    yields   first : F64
+    effect   pure
+    computes weight + 1.0
+operation Calc
+    uses     weight
+    yields   second : F64
+    effect   pure
+    computes weight + 2.0
+outcome first
+"""))
+        out.assert_rejected(self, "E-duplicate-operation")
+
+    def test_a_duplicate_name_is_reported_once_and_does_not_cascade(self):
+        """The refused operation keeps its binding, so the author sees one
+        mistake rather than a page of "cannot find" errors about a binding
+        they did write."""
+        out = S.run(core("""
+source weight : F64 from 2.0
+operation Calc
+    uses     weight
+    yields   first : F64
+    effect   pure
+    computes weight + 1.0
+operation Calc
+    uses     weight
+    yields   second : F64
+    effect   pure
+    computes weight + 2.0
+outcome second
+"""))
+        self.assertNotIn("E-unresolved", out.messages())
+        self.assertNotIn("E-ice", out.messages())
+
+    def test_selection_needs_no_duplicate_names(self):
+        """Several operations may yield one binding (that is how a choice is
+        written); it is the *name* that must be unique, and the shipped
+        selection example names its alternatives distinctly."""
+        out = S.run(core("""
+source temperature : F64 from 39.0
+operation Urgent
+    uses     temperature
+    yields   action : Text
+    effect   pure
+    when     temperature > 38.0
+    computes "treat"
+operation Routine
+    uses     temperature
+    yields   action : Text
+    effect   pure
+    when     temperature <= 38.0
+    computes "wait"
+outcome action
+"""))
+        out.assert_compiled(self)
+
 
 class Selection(unittest.TestCase):
     """Guards replace `if`: several operations, one binding."""

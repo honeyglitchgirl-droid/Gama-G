@@ -293,7 +293,7 @@ GIR the same machine serves the reference interpreter, a native CPU backend that
 emits C and compiles it to machine code, a WebAssembly encoder, and an
 accelerator layer.
 
-**536 tests pass**, and CI runs them on every push and pull request across
+**548 tests pass**, and CI runs them on every push and pull request across
 Python 3.9 - 3.13 (`.github/workflows/ci.yml`).  The native backend is
 validated by *differential testing*:
 the same program is run on the interpreter and on the compiled binary, and their
@@ -581,7 +581,7 @@ compiler/gamag/
 tools/bin/{ggc,ggtest}                     entry points
 examples/core/                             eight core programs
 examples/                                  eight v0.1 programs
-tests/                                     316 tests
+tests/                                     548 tests
 docs/DESIGN_v0_4.md                        the memory, capability and recovery
                                            models, and what each one proves
 docs/DESIGN_v0_3.md                        the native IR, the five graphs, and
@@ -589,6 +589,8 @@ docs/DESIGN_v0_3.md                        the native IR, the five graphs, and
 docs/DESIGN_v0_2.md                        the language design, and the first
                                            audit's ten originality questions
 docs/IMPLEMENTATION.md                     honest status, section by section
+docs/SPEC_DECISIONS.md                     what the specification left
+                                           open, and what was decided
 ```
 
 ## Layout of the tests

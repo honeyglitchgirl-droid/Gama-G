@@ -439,19 +439,98 @@ class ParallelRegions(unittest.TestCase):
 
     def test_independent_tasks_all_complete(self):
         outcome = S.run("""
-fn load(x: I64) -> I64
-    io
+fn double(x: I64) -> I64
+    pure
     return x * 2
 
 fn main() -> Unit
     io
     parallel
-        a = load(1)
-        b = load(2)
-        c = load(3)
+        a = double(1)
+        b = double(2)
+        c = double(3)
     print(a, b, c)
 """)
         outcome.assert_output_contains(self, "2 4 6")
+
+    def test_a_task_may_not_perform_an_effect(self):
+        """Spec section 9C: a region computes its outputs and nothing else.
+
+        Committing writes in program order orders the state a region leaves
+        behind; it cannot order what its tasks say to the outside world, so an
+        effect inside a region would make the program's output depend on the
+        schedule.  Measured before the rule existed: three printing tasks of
+        deliberately unequal cost produced `gamma, beta, alpha` once and
+        `beta, gamma, alpha` another time, on separate runs of one unchanged
+        program.
+        """
+        outcome = S.run("""
+fn loud(x: I64) -> I64
+    io
+    print("computing", x)
+    return x * 2
+
+fn main() -> Unit
+    io
+    parallel
+        a = loud(1)
+        b = loud(2)
+    print(a, b)
+""")
+        outcome.assert_rejected(self, "E-parallel-effect")
+
+    def test_an_effect_is_refused_even_when_the_region_writes_state(self):
+        """A second witness for the same rule, through a different statement.
+
+        `audit.record` is an effect too, and it is refused inside a region for
+        the same reason `print` is.
+        """
+        outcome = S.run("""
+fn main() -> Unit
+    io
+    audit
+    parallel
+        a = 1
+        b = 2
+        audit.record { actor: "x", action: "y" }
+    print(a + b)
+""")
+        outcome.assert_rejected(self, "E-parallel-effect")
+
+    def test_an_effect_before_the_region_does_not_mask_one_inside_it(self):
+        """Regression: the first implementation compared the effect set before
+        and after the region, so an `io` call before the region hid an `io`
+        call inside it and a racy region was accepted."""
+        outcome = S.run("""
+fn loud(x: I64) -> I64
+    io
+    return x * 2
+
+fn main() -> Unit
+    io
+    print("start")
+    parallel
+        a = loud(1)
+        b = loud(2)
+    print(a, b)
+""")
+        outcome.assert_rejected(self, "E-parallel-effect")
+
+    def test_a_pure_region_that_reads_the_results_before_it_is_accepted(self):
+        """The shape the rule pushes programs towards: gather, compute, report."""
+        outcome = S.run("""
+fn double(x: I64) -> I64
+    pure
+    return x * 2
+
+fn main() -> Unit
+    io
+    let raw = 21
+    parallel
+        a = double(raw)
+    print(a)
+""")
+        outcome.assert_output_contains(self, "42")
 
     def test_dependent_tasks_are_ordered(self):
         outcome = S.run("""
@@ -479,6 +558,96 @@ fn main() -> Unit
     print(p, q, r, s)
 """)
         outcome.assert_output_contains(self, "1 2 3 4")
+
+
+class DeclarationNames(unittest.TestCase):
+    """One module, one namespace: a name identifies one declaration.
+
+    Nothing in the specification has ever permitted two declarations to share
+    a name, and three different things used to happen depending on the kind.
+    A duplicate record or enum was accepted in silence, the second definition
+    quietly replacing the first.  A duplicate function surfaced as ``E-ice:
+    internal compiler error ... a later definition would silently replace
+    it`` -- the compiler reporting a plain user error as its own bug, three
+    phases after the mistake, with a message that named no line of source.
+    """
+
+    def test_a_duplicate_function_is_a_name_resolution_error(self):
+        outcome = S.run("""
+fn calc(x: I64) -> I64
+    pure
+    return x + 1
+
+fn calc(x: I64) -> I64
+    pure
+    return x + 2
+
+fn main() -> Unit
+    io
+    print(calc(1))
+""")
+        outcome.assert_rejected(self, "E-duplicate-declaration")
+        self.assertNotIn("E-ice", outcome.messages())
+
+    def test_a_duplicate_record_is_refused(self):
+        outcome = S.run("""
+record Point
+    x: I64
+
+record Point
+    y: I64
+
+fn main() -> Unit
+    io
+    print(1)
+""")
+        outcome.assert_rejected(self, "E-duplicate-declaration")
+
+    def test_a_duplicate_enum_is_refused(self):
+        outcome = S.run("""
+enum Colour
+    Red
+
+enum Colour
+    Blue
+
+fn main() -> Unit
+    io
+    print(1)
+""")
+        outcome.assert_rejected(self, "E-duplicate-declaration")
+
+    def test_the_namespace_is_shared_across_kinds(self):
+        """A function and a record cannot both be `Widget` either."""
+        outcome = S.run("""
+record Widget
+    x: I64
+
+fn Widget(x: I64) -> I64
+    pure
+    return x
+
+fn main() -> Unit
+    io
+    print(1)
+""")
+        outcome.assert_rejected(self, "E-duplicate-declaration")
+
+    def test_a_function_may_still_shadow_a_builtin(self):
+        """The rule is about the module's own namespace.  A user function named
+        after a builtin is a deliberate, already-tested feature, and it stays:
+        `print` here is the user's, not the prelude's."""
+        outcome = S.run("""
+fn print(a: I64) -> I64
+    pure
+    return a + 1
+
+fn main() -> Unit
+    io
+    let plain = print(1)
+    println(plain)
+""")
+        self.assertTrue(outcome.compiled, outcome.messages())
 
 
 class GirAndOptimizer(unittest.TestCase):
