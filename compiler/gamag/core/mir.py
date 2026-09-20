@@ -311,6 +311,9 @@ class Selection:
     proven_exclusive: bool = False
     proven_exhaustive: bool = False
     fallback_fault: str = "NoActiveAlternative"
+    #: how the proof was obtained, when it was: the syntactic complement or
+    #: the guard prover's exact interval decision, in one line
+    proof: str = ""
 
 
 # ==========================================================================
@@ -611,6 +614,8 @@ class SemanticModel:
                 proof.append("exhaustive")
             verdict = ("proven " + " and ".join(proof)) if proof else \
                 "not provable statically; a NoActiveAlternative check runs"
+            if sel.proof and proof:
+                verdict += f" ({sel.proof})"
             parts.append("")
             parts.append(f"selection of `{binding}` from "
                          f"{', '.join(sel.members)}: {verdict}")

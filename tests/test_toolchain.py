@@ -294,6 +294,101 @@ class Resolution(PackageTree):
         self.assertEqual(result.resolved, {},
                          "a failed resolution must not half-apply")
 
+    def test_a_graph_satisfiable_only_below_the_highest_version_resolves(self):
+        """The gap the bounded backtracking search was built to close.
+
+        Greedily, `a` takes 2.0.0, and 2.0.0 demands `c ^2.0.0` while `b`
+        demands `c ^1.0.0` -- no `c` exists that can please both.  Before
+        backtracking this was reported as a conflict; the satisfiable graph
+        was a *lie of omission*, because lowering `a` to 1.0.0 frees `c`.
+        Failing to find an existing answer is a resolver defect, and this
+        test is the difference between "fail closed" and "fail open".
+        """
+        self.make("a", "1.0.0")
+        self.make("a", "2.0.0", {"c": "^2.0.0"})
+        self.make("b", "1.0.0", {"c": "^1.0.0"})
+        self.make("c", "1.0.0")
+        self.make("c", "2.0.0")
+        result = gpm.resolve(self.root("app", "0.1.0",
+                                       {"a": ">=1.0.0", "b": "^1.0.0"}),
+                             self.registry())
+        self.assertTrue(result.ok, f"problems: {result.problems}")
+        self.assertEqual(result.resolved["a"].version, Version.parse("1.0.0"),
+                         "the search must lower the greedy choice")
+        self.assertEqual(result.resolved["c"].version, Version.parse("1.0.0"))
+        self.assertEqual(result.resolved["b"].version, Version.parse("1.0.0"))
+
+    def test_the_backtracking_search_is_deterministic(self):
+        """The same graph resolves to the same lock on every run.
+
+        Sorted packages, descending versions, first solution wins: the search
+        has no order left that a hash seed could perturb, because a lock file
+        that differs between machines is worse than a resolver that gave up.
+        """
+        self.make("a", "1.0.0")
+        self.make("a", "1.1.0", {"c": "^2.0.0"})
+        self.make("a", "1.2.0", {"c": "^3.0.0"})
+        self.make("b", "1.0.0", {"c": "^1.0.0"})
+        for v in ("1.0.0", "2.0.0", "3.0.0"):
+            self.make("c", v)
+        root = self.root("app", "0.1.0", {"a": ">=1.0.0", "b": "^1.0.0"})
+        runs = []
+        for _ in range(3):
+            result = gpm.resolve(root, self.registry())
+            self.assertTrue(result.ok, f"problems: {result.problems}")
+            runs.append({name: str(entry.version)
+                         for name, entry in result.resolved.items()})
+        self.assertEqual(runs[0], runs[1])
+        self.assertEqual(runs[1], runs[2])
+        # 1.2.0 is tried first (descending), conflicts on c, then 1.1.0,
+        # then 1.0.0 satisfies b's `^1.0.0` demand on c.
+        self.assertEqual(runs[0], {"a": "1.0.0", "b": "1.0.0",
+                                   "c": "1.0.0"})
+
+    def test_an_exhausted_search_budget_is_reported_not_guessed(self):
+        """Past the budget the answer is still a named conflict.
+
+        Dependency solving is NP-complete in general; the honest behaviour
+        when the bound is hit is to say so and exit nonzero, never to
+        present an unverified graph as resolved.
+        """
+        self.make("a", "1.0.0")
+        self.make("a", "2.0.0", {"c": "^2.0.0"})
+        self.make("b", "1.0.0", {"c": "^1.0.0"})
+        self.make("c", "1.0.0")
+        self.make("c", "2.0.0")
+        root = self.root("app", "0.1.0", {"a": ">=1.0.0", "b": "^1.0.0"})
+        original = gpm.MAX_SEARCH_NODES
+        gpm.MAX_SEARCH_NODES = 0
+        try:
+            result = gpm.resolve(root, self.registry())
+        finally:
+            gpm.MAX_SEARCH_NODES = original
+        self.assertFalse(result.ok,
+                         "with no search budget, the conflict must return")
+        self.assertEqual(result.resolved, {})
+        self.assertTrue(any("budget" in problem for problem in result.problems),
+                        f"the report should name the budget, got "
+                        f"{result.problems}")
+
+    def test_the_solution_is_the_highest_graph_wide_choice(self):
+        """Backtracking lowers a package only when the fixed point fails.
+
+        Where the greedy answer is already correct, nothing moves: `a` keeps
+        its highest acceptable version, and the resolver does not silently
+        downgrade a package to satisfy a constraint that was never in the
+        way.
+        """
+        self.make("a", "1.0.0")
+        self.make("a", "2.0.0", {"c": "^1.0.0"})
+        self.make("b", "1.0.0", {"c": "^1.0.0"})
+        self.make("c", "1.0.0")
+        result = gpm.resolve(self.root("app", "0.1.0",
+                                       {"a": ">=1.0.0", "b": "^1.0.0"}),
+                             self.registry())
+        self.assertTrue(result.ok, f"problems: {result.problems}")
+        self.assertEqual(result.resolved["a"].version, Version.parse("2.0.0"))
+
     def test_a_missing_package_is_named(self):
         result = gpm.resolve(self.root("app", "0.1.0", {"absent": "^1.0.0"}),
                              self.registry())

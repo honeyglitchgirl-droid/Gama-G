@@ -34,6 +34,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from ..diagnostics import DiagnosticBag, Phase
 from . import capability as CAP
+from . import guardproof
 from . import mir as M
 from . import recovery as REC
 from .parser import CoreSyntax
@@ -501,6 +502,38 @@ class ModelBuilder:
                                                    members[1].when.text):
                 selection.proven_exclusive = True
                 selection.proven_exhaustive = True
+            else:
+                # The syntactic complement test covers one shape; the guard
+                # prover (`core/guardproof.py`) decides the decidable
+                # fragment -- boolean combinations of comparisons of one
+                # sized-integer binding against integer constants -- exactly.
+                # Anything outside that fragment stays `unprovable`, which is
+                # what the runtime fault covers.
+
+                def declared_type(binding: str) -> Optional[str]:
+                    """The type a guard subject is declared with.
+
+                    Looked up where a binding's type actually lives: an
+                    input's own annotation, else the `yields` annotation of
+                    the single operation that produces it.
+                    """
+                    node = (graph.inputs.get(binding)
+                            or graph.resources.get(binding)
+                            or graph.nodes.get(binding))
+                    if node is not None and node.type is not None:
+                        return node.type.name
+                    producers = graph.producers_of.get(binding) or []
+                    names = {graph.nodes[p].type.name for p in producers
+                             if p in graph.nodes
+                             and graph.nodes[p].type is not None}
+                    return names.pop() if len(names) == 1 else None
+
+                proof = guardproof.prove_selection(
+                    [m.when for m in members], declared_type)
+                if proof is not None:
+                    selection.proven_exhaustive = proof.exhaustive
+                    selection.proven_exclusive = proof.exclusive
+                    selection.proof = proof.note
             graph.selections[binding] = selection
 
         # transitions form the commit phase, after every derivation of data

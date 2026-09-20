@@ -577,8 +577,14 @@ class Execution:
 
 def execute(compilation: Compilation, *, entry: str = "main",
             args: Sequence[Any] = (), context: Optional[Context] = None,
-            grants: Sequence[str] = ()) -> Execution:
-    """Run a compiled program on the GAEM reference interpreter."""
+            grants: Sequence[str] = (),
+            profile: bool = False) -> Execution:
+    """Run a compiled program on the GAEM reference interpreter.
+
+    `profile` turns on the interpreter's per-function counters; the rows are
+    read back from ``result.vm.profile_rows()``.  Profiling observes the run,
+    it does not change it: the same instructions execute either way.
+    """
     if compilation.program is None:
         raise ValueError("cannot execute a compilation that produced no GIR")
     # Deterministic by default, matching `ggc run`.  Spec section 1.3 makes
@@ -592,6 +598,8 @@ def execute(compilation: Compilation, *, entry: str = "main",
         grants=program_grants(compilation, grants),
         program_version=GIR_VERSION)
     vm = VM(compilation.program, ctx, compilation.checker)
+    if profile:
+        vm.enable_profile()
     result = Execution(context=ctx, vm=vm)
     t0 = time.perf_counter()
     try:

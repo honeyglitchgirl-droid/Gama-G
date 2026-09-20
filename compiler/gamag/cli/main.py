@@ -67,6 +67,22 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("check", help="type-check and report diagnostics")
     add_common(p)
 
+    p = sub.add_parser(
+        "format",
+        help="print, check, or apply the canonical formatting of sources")
+    p.add_argument("files", nargs="+", metavar="FILE.gg",
+                   help="Gama-G source files")
+    p.add_argument("--write", action="store_true",
+                   help="rewrite each file in place (the default prints)")
+    p.add_argument("--check", action="store_true",
+                   help="exit 1 when any file is not already canonical")
+    p.add_argument("--diff", action="store_true",
+                   help="show a unified diff of what would change")
+    p.add_argument("--no-verify", action="store_true",
+                   help="skip the same-GIR safety check (not recommended)")
+    p.add_argument("--json", action="store_true",
+                   help="machine-readable result per file")
+
     p = sub.add_parser("build", help="compile to GIR")
     add_common(p)
     p.add_argument("-o", "--output", metavar="PATH",
@@ -266,6 +282,55 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--module", metavar="NAME",
                    help="with `builtins`, restrict to one module")
     p.add_argument("--json", action="store_true")
+
+    p = sub.add_parser(
+        "profile",
+        help="run a program with the interpreter's per-function counters")
+    add_common(p)
+    p.add_argument("--entry", metavar="NAME", default="main",
+                   help="function to call (default: main)")
+    p.add_argument("--top", type=int, default=24, metavar="N",
+                   help="how many functions to print (default: 24)")
+    p.add_argument("--strict-authority", action="store_true",
+                   help="grant only what --grant names")
+
+    p = sub.add_parser(
+        "doc",
+        help="generate markdown documentation for a source file or the "
+             "standard library")
+    p.add_argument("files", nargs="*", metavar="FILE.gg",
+                   help="Gama-G source files (omit with --stdlib)")
+    p.add_argument("--stdlib", action="store_true",
+                   help="document the standard library instead of a file")
+    p.add_argument("--module", metavar="NAME",
+                   help="with --stdlib, one module only")
+    p.add_argument("-o", "--output", metavar="PATH",
+                   help="write the markdown here instead of stdout")
+    p.add_argument("--profile", choices=PROFILES, default="strict")
+    p.add_argument("--no-color", action="store_true",
+                   help="plain diagnostics, no ANSI escapes")
+    p.add_argument("--json", action="store_true",
+                   help="the same facts as data, for editors and sites")
+
+    p = sub.add_parser(
+        "audit",
+        help="verify and inspect a written audit trail (spec section 13)")
+    audit_sub = p.add_subparsers(dest="audit_command", metavar="SUBCOMMAND")
+    action = audit_sub.add_parser(
+        "verify", help="re-check chain linkage and digests of a trail file")
+    action.add_argument("trail", metavar="TRAIL.jsonl")
+    action.add_argument("--key", metavar="HEX",
+                        help="also check the HMAC signatures against this "
+                             "deployment key (hex)")
+    action.add_argument("--json", action="store_true")
+    action = audit_sub.add_parser(
+        "show", help="print the trail in reading order")
+    action.add_argument("trail", metavar="TRAIL.jsonl")
+    action.add_argument("--action", metavar="PREFIX",
+                        help="only records whose action starts with this")
+    action.add_argument("--tail", type=int, default=0, metavar="N",
+                        help="only the last N records")
+    action.add_argument("--json", action="store_true")
 
     return parser
 
@@ -469,7 +534,8 @@ def cmd_graph(args: argparse.Namespace) -> int:
                 "selections": {
                     binding: {"alternatives": sel.members,
                               "proven_exhaustive": sel.proven_exhaustive,
-                              "proven_exclusive": sel.proven_exclusive}
+                              "proven_exclusive": sel.proven_exclusive,
+                              "proof": sel.proof}
                     for binding, sel in sorted(graph.selections.items())},
                 "constraints": [
                     {"kind": c.kind, "text": c.text, "node": c.node,
@@ -568,6 +634,85 @@ def cmd_memory(args: argparse.Namespace) -> int:
             # rather than a runtime one.
             return EXIT_COMPILE
     return EXIT_OK
+
+
+def cmd_format(args: argparse.Namespace) -> int:
+    """Print, check, or apply the canonical formatting of a source file.
+
+    The formatter's contract is the compiler's: formatting is whitespace, and
+    whitespace is not meaning -- except where it is, in an indentation-based
+    language.  So every rewrite is checked: both versions are compiled and
+    their GIR compared apart from positions.  A file whose formatting would
+    change its program is reported and refused, never rewritten.
+    """
+    import difflib
+
+    from ..driver import read_source
+    from ..formatter import FormatError, format_source, verify_same_program
+
+    status = EXIT_OK
+    reports = []
+    for path in args.files:
+        if not os.path.exists(path):
+            print(f"ggc: no such file: {path}", file=sys.stderr)
+            status = EXIT_USAGE
+            continue
+        source, error = read_source(path)
+        if error is not None:
+            print(f"{path}: {error}", file=sys.stderr)
+            status = EXIT_COMPILE
+            continue
+        try:
+            formatted = format_source(source, path)
+        except FormatError as exc:
+            print(f"{path}:{exc.line}: cannot format: {exc}", file=sys.stderr)
+            status = EXIT_COMPILE
+            reports.append({"path": path, "ok": False,
+                            "problem": f"{exc} (line {exc.line})"})
+            continue
+        if not args.no_verify:
+            divergence = verify_same_program(source, formatted)
+            if divergence is not None:
+                print(f"{path}: {divergence}", file=sys.stderr)
+                status = EXIT_COMPILE
+                reports.append({"path": path, "ok": False,
+                                "problem": divergence})
+                continue
+        changed = formatted != source
+        if changed and status == EXIT_OK:
+            status = EXIT_COMPILE if args.check else status
+        reports.append({"path": path, "ok": True, "changed": changed,
+                        "problem": None})
+        if args.check:
+            if changed:
+                print(f"{path}: not canonical")
+        elif args.write:
+            if changed:
+                with open(path, "w", encoding="utf-8") as handle:
+                    handle.write(formatted)
+                print(f"{path}: formatted")
+            else:
+                print(f"{path}: unchanged")
+        elif args.diff and changed:
+            sys.stdout.writelines(difflib.unified_diff(
+                source.splitlines(keepends=True),
+                formatted.splitlines(keepends=True),
+                fromfile=path, tofile=path + " (formatted)"))
+        elif changed:
+            # printing mode: `ggc format FILE > FILE.new` must yield valid
+            # source, so only the formatted text goes to stdout -- headers and
+            # notes about the rewrite go to stderr, where they cannot corrupt
+            # a redirect.
+            if len(args.files) > 1:
+                print(f"// {path}", file=sys.stderr)
+            sys.stdout.write(formatted)
+
+    if args.json:
+        print(json.dumps(reports, indent=2))
+        if not any(not r["ok"] for r in reports):
+            status = EXIT_COMPILE if (args.check and any(
+                r.get("changed") for r in reports)) else EXIT_OK
+    return status
 
 
 def cmd_run(args: argparse.Namespace) -> int:
@@ -784,6 +929,220 @@ def cmd_explain(args: argparse.Namespace) -> int:
           + "".join(f"  {m:<18} {L.UNIMPLEMENTED_MODULES[m]}\n"
                     for m in gaps["not_implemented_modules"]))
     return EXIT_OK
+
+
+def cmd_profile(args: argparse.Namespace) -> int:
+    """Run the program with the interpreter's counters on, and report.
+
+    The counts of calls and instructions are exact: they come from the same
+    dispatch loop that executes the program.  The milliseconds are inclusive
+    wall time attributed at block boundaries -- one measurement of this
+    machine, not a property of the language, and reported as such.  The
+    profile goes to stderr and the program's own output to stdout, so
+    `ggc profile prog.gg 2>/dev/null` runs the program and nothing else.
+    """
+    compilations, status = _compile(args.files, args)
+    if status != EXIT_OK:
+        for compilation in compilations:
+            _report(compilation, not args.no_color, args.json)
+        return status
+    from ..runtime.context import Context
+    exit_code = EXIT_OK
+    json_rows = []
+    for compilation in compilations:
+        entry = find_entry(compilation, args.entry)
+        if entry is None:
+            print(f"{compilation.path}: no `{args.entry}` function to run",
+                  file=sys.stderr)
+            exit_code = EXIT_USAGE
+            continue
+        ctx = Context(deterministic=True,
+                      grants=_authority(compilation, args),
+                      program_version=__version__)
+        result = execute(compilation, entry=entry, context=ctx, profile=True)
+        rows = result.vm.profile_rows() if result.vm is not None else []
+        total_instrs = sum(r[2] for r in rows) or 1
+        if not result.ok:
+            exit_code = EXIT_RUNTIME
+            if not args.json:
+                fault = result.fault
+                kind = getattr(fault, "kind", type(fault).__name__)
+                message = getattr(fault, "message", str(fault))
+                print(f"runtime fault [{kind}]: {message} -- profiled up to "
+                      f"the fault", file=sys.stderr)
+        if not args.json:
+            print("profile (inclusive time; instruction counts exact):",
+                  file=sys.stderr)
+            print(f"  {'function':<38}{'calls':>8}{'instrs':>10}{'share':>8}"
+                  f"{'incl ms':>10}", file=sys.stderr)
+            for name, calls, instrs, ms in rows[:max(1, args.top)]:
+                share = 100.0 * instrs / total_instrs
+                print(f"  {name:<38}{calls:>8}{instrs:>10}"
+                      f"{share:>7.1f}%{ms:>10.2f}", file=sys.stderr)
+            hidden = len(rows) - max(1, args.top)
+            if hidden > 0:
+                print(f"  ... {hidden} more function(s)", file=sys.stderr)
+            print(f"  total {total_instrs} instructions over "
+                  f"{len(rows)} function(s) that ran", file=sys.stderr)
+        else:
+            json_rows.append({
+                "path": compilation.path, "entry": entry, "ok": result.ok,
+                "total_instructions": total_instrs,
+                "functions": [{"name": n, "calls": c, "instructions": ins,
+                               "inclusive_ms": round(ms, 3)}
+                              for n, c, ins, ms in rows],
+            })
+    if args.json:
+        print(json.dumps(json_rows, indent=2))
+    return exit_code
+
+
+def cmd_doc(args: argparse.Namespace) -> int:
+    """Generate markdown documentation -- for a program, or the stdlib.
+
+    The stdlib mode reads the registration table the checker itself consults,
+    so a builtin that exists in the documentation but not in the compiler is
+    a test failure rather than a broken promise.  The program mode documents
+    what the checker *derived*, not only what was written: for a core file
+    that includes the derived level of every operation and which selection
+    proofs succeeded.
+    """
+    from ..toolchain import docgen
+
+    if args.stdlib or args.module:
+        text = docgen.render_stdlib_markdown(args.module)
+        if args.output:
+            with open(args.output, "w", encoding="utf-8") as handle:
+                handle.write(text)
+            print(f"wrote {args.output}")
+        else:
+            print(text, end="")
+        return EXIT_OK
+
+    if not args.files:
+        print("name at least one FILE.gg, or pass --stdlib", file=sys.stderr)
+        return EXIT_USAGE
+
+    exit_code = EXIT_OK
+    for path in args.files:
+        if not os.path.exists(path):
+            print(f"ggc: no such file: {path}", file=sys.stderr)
+            exit_code = EXIT_USAGE
+            continue
+        compilation = compile_file(path, profile=args.profile)
+        if not compilation.ok:
+            # diagnostics do not block documentation: a half-written program
+            # still has declarations worth reading.  They go to stderr so a
+            # redirected document stays clean.
+            print(compilation.diagnostics_text(not args.no_color),
+                  file=sys.stderr)
+            print(f"{path}: documented as far as the compiler got",
+                  file=sys.stderr)
+        if args.json:
+            print(json.dumps(docgen.doc_dict(compilation), indent=2))
+            continue
+        text = docgen.render_markdown(compilation)
+        if args.output:
+            with open(args.output, "w", encoding="utf-8") as handle:
+                handle.write(text)
+            print(f"wrote {args.output}")
+        else:
+            print(text, end="")
+    return exit_code
+
+
+def cmd_audit(args: argparse.Namespace) -> int:
+    """Verify and inspect a written audit trail (spec section 13).
+
+    `ggc run --audit PATH` writes the chain; this command is the other half:
+    a reviewer holding the file, not the process that produced it.  Linkage
+    and digests are always recomputed -- they need no secret.  Signatures bind
+    the trail to a deployment key, which deliberately does not live inside
+    the trail, so they are checked only when `--key` supplies it, and the
+    output says which mode ran.  A tampered record -- an edited field, an
+    edited action, a deleted middle link -- breaks the recomputation at that
+    record, and `verify` names it.
+    """
+    from ..runtime import audit as audit_mod
+
+    command = getattr(args, "audit_command", None)
+    if command not in ("verify", "show"):
+        print("usage: ggc audit verify TRAIL.jsonl | ggc audit show "
+              "TRAIL.jsonl", file=sys.stderr)
+        return EXIT_USAGE
+    try:
+        with open(args.trail, "r", encoding="utf-8") as handle:
+            text = handle.read()
+    except UnicodeDecodeError:
+        print(f"ggc: {args.trail} is not valid UTF-8 text", file=sys.stderr)
+        return EXIT_USAGE
+    except OSError as exc:
+        print(f"ggc: cannot read {args.trail}: {exc.strerror or exc}",
+              file=sys.stderr)
+        return EXIT_USAGE
+
+    if command == "verify":
+        key = None
+        if getattr(args, "key", None):
+            try:
+                key = bytes.fromhex(args.key)
+            except ValueError:
+                print("ggc: --key must be hex (as `keygen` and signing "
+                      "tools emit it)", file=sys.stderr)
+                return EXIT_USAGE
+        try:
+            ok, problems, summary = audit_mod.verify_trail(text, key)
+        except ValueError as exc:
+            print(f"{args.trail}: not a trail this toolchain wrote: {exc}",
+                  file=sys.stderr)
+            return EXIT_USAGE
+        if args.json:
+            print(json.dumps({"ok": ok, "problems": problems,
+                              "summary": summary}, indent=2))
+            return EXIT_OK if ok else EXIT_COMPILE
+        print(f"{args.trail}: {summary['records']} record(s)")
+        print(f"  chain head: {summary['head_hash']}")
+        print(f"  signatures: "
+              + ("verified against the supplied key" if key is not None
+                 else "not checked (pass --key to check them)"))
+        if problems:
+            print("  TAMPERING OR CORRUPTION DETECTED:")
+            for problem in problems:
+                print(f"    - {problem}")
+            return EXIT_COMPILE
+        print("  every digest recomputes and every link matches -- the "
+              "trail is intact as written")
+        return EXIT_OK
+
+    try:
+        log = audit_mod.AuditLog.from_jsonl(text)
+    except ValueError as exc:
+        print(f"{args.trail}: not a trail this toolchain wrote: {exc}",
+              file=sys.stderr)
+        return EXIT_USAGE
+    records = list(log.records)
+    if getattr(args, "action", None):
+        records = [r for r in records
+                   if r.action.startswith(args.action)]
+    if getattr(args, "tail", 0):
+        records = records[-args.tail:]
+    if args.json:
+        print(json.dumps([r.to_dict() for r in records], indent=2))
+        return EXIT_OK
+    for rec in records:
+        where = f"  [{rec.level}]" if rec.level != "info" else ""
+        print(f"  {rec.seq:>4}  {rec.action:<22} actor={rec.actor}"
+              + (f" object={rec.object}" if rec.object else "")
+              + (f" reason={rec.reason!r}" if rec.reason else "") + where)
+    print(f"  {len(records)} record(s) shown of {len(log.records)}")
+    # `verify_trail` without a key: digests and links only, because a log
+    # loaded from disk cannot re-derive the runtime's signing key and
+    # `log.verify()` would report the missing key as tampering.
+    ok, problems, _ = audit_mod.verify_trail(text)
+    print("  chain as loaded: "
+          + ("valid digests and links" if ok
+             else "BROKEN: " + problems[0]))
+    return EXIT_OK if ok else EXIT_COMPILE
 
 
 def cmd_native(args: argparse.Namespace) -> int:
@@ -1324,6 +1683,7 @@ COMMANDS = {
     "gpm": cmd_gpm,
     "manifest": cmd_manifest,
     "check": cmd_check,
+    "format": cmd_format,
     "native": cmd_native,
     "difftest": cmd_difftest,
     "wasm": cmd_wasm,
@@ -1336,6 +1696,9 @@ COMMANDS = {
     "run": cmd_run,
     "test": cmd_test,
     "explain": cmd_explain,
+    "profile": cmd_profile,
+    "doc": cmd_doc,
+    "audit": cmd_audit,
 }
 
 

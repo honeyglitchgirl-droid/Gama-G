@@ -155,6 +155,13 @@ class VM:
         self._since_poll = 0
         # Whether the `<main>` module initializer has run yet.
         self._initialized = False
+        #: Per-function profiling counters, filled only when enabled.  The
+        #: loop checks one boolean per *block transition*, not per
+        #: instruction, so a run with profiling off pays nothing measurable;
+        #: `ggc profile` turns it on and `driver.execute(profile=True)`
+        #: forwards the flag.
+        self.prof_enabled = False
+        self.prof: Dict[str, Dict[str, int]] = {}
         self.dispatch = {
             Op.CONST: self.op_const, Op.COPY: self.op_copy,
             Op.LOAD_GLOBAL: self.op_load_global,
@@ -182,6 +189,35 @@ class VM:
         self.ctx.state_provider = self.capture_state
         self.ctx.state_applier = self.restore_state
         self._install_globals()
+
+    # ------------------------------------------------------------------
+    # profiling -- `ggc profile`
+    # ------------------------------------------------------------------
+    def enable_profile(self) -> None:
+        """Start counting calls, instructions and time per function.
+
+        Off by default: `run_from` reads one boolean per block transition to
+        decide whether to attribute, and an uninstrumented run takes the same
+        branches it always did.  Turning this on observes the execution; it
+        does not change it.
+        """
+        self.prof = {}
+        self.prof_enabled = True
+
+    def profile_rows(self) -> List[Tuple[str, int, int, float]]:
+        """``(function, calls, instructions, inclusive_ms)`` sorted hot first.
+
+        Inclusive time: a caller's figure contains the callees it waited on,
+        which is what "where does the wall clock go" means without a sampling
+        profiler.  Instruction counts are exact and do not depend on machine
+        load; the times are one measurement of one machine, nothing more.
+        """
+        rows = []
+        for name, rec in self.prof.items():
+            rows.append((name, rec["calls"], rec["instrs"],
+                         rec["ns"] / 1_000_000.0))
+        rows.sort(key=lambda r: (-r[2], r[0]))
+        return rows
 
     # ------------------------------------------------------------------
     # global installation
@@ -418,6 +454,11 @@ class VM:
             value = args[i] if i < len(args) else default_for(fn.slots[slot].type)
             self.store(act, slot, value)
         self.ctx.stats.calls += 1
+        if self.prof_enabled:
+            rec = self.prof.get(fn.name)
+            if rec is None:
+                rec = self.prof[fn.name] = {"calls": 0, "instrs": 0, "ns": 0}
+            rec["calls"] += 1
         stack.append(act)
         return act
 
@@ -486,96 +527,111 @@ class VM:
         instrs = block.instrs
         i = act.pc
         n = len(instrs)
-        while i < n:
-            instr = instrs[i]
-            if instr.dead:
-                i += 1
-                continue
-            self.ctx.step()
-            self._since_poll += 1
-            if self._since_poll >= self.CHECKPOINT_POLL_INSTRS:
-                self._since_poll = 0
-                self._poll_armed_checkpoint()
-            op = instr.op
-            if op is Op.JUMP:
-                act.bid = instr.meta["target"]
-                act.pc = 0
-                act.steps += 1
-                if act.steps > self.MAX_BLOCK_TRANSITIONS:
+        prof = self.prof if self.prof_enabled else None
+        if prof is not None:
+            prof_rec = prof.setdefault(fn.name,
+                                       {"calls": 0, "instrs": 0, "ns": 0})
+            prof_from = i
+            prof_t0 = time.perf_counter_ns()
+        try:
+            while i < n:
+                instr = instrs[i]
+                if instr.dead:
+                    i += 1
+                    continue
+                self.ctx.step()
+                self._since_poll += 1
+                if self._since_poll >= self.CHECKPOINT_POLL_INSTRS:
+                    self._since_poll = 0
+                    self._poll_armed_checkpoint()
+                op = instr.op
+                if op is Op.JUMP:
+                    act.bid = instr.meta["target"]
+                    act.pc = 0
+                    act.steps += 1
+                    if act.steps > self.MAX_BLOCK_TRANSITIONS:
+                        raise GamaRuntimeFault(
+                            "RunawayLoop",
+                            f"`{fn.name}` exceeded the basic-block step budget")
+                    return _JUMPED
+                if op is Op.JUMP_IF:
+                    cond = truthy(self.resolve(act, instr.args[0]))
+                    target = instr.meta["target"] if cond else \
+                        instr.meta.get("target_false")
+                    act.pc = 0
+                    if target is None:
+                        return _ENDED
+                    act.bid = target
+                    act.steps += 1
+                    if act.steps > self.MAX_BLOCK_TRANSITIONS:
+                        raise GamaRuntimeFault(
+                            "RunawayLoop",
+                            f"`{fn.name}` exceeded the basic-block step budget")
+                    return _JUMPED
+                if op is Op.RETURN:
+                    value = self.resolve(act, instr.args[0]) \
+                        if instr.args else UNIT
+                    return "return", value
+                if op is Op.FAULT:
                     raise GamaRuntimeFault(
-                        "RunawayLoop",
-                        f"`{fn.name}` exceeded the basic-block step budget")
-                return _JUMPED
-            if op is Op.JUMP_IF:
-                cond = truthy(self.resolve(act, instr.args[0]))
-                target = instr.meta["target"] if cond else \
-                    instr.meta.get("target_false")
-                act.pc = 0
-                if target is None:
-                    return _ENDED
-                act.bid = target
-                act.steps += 1
-                if act.steps > self.MAX_BLOCK_TRANSITIONS:
+                        str(instr.meta.get("kind", "Fault")),
+                        str(instr.meta.get("message", "")), instr.pos)
+                if op is Op.MATCH_FAIL:
+                    value = self.resolve(act, instr.args[0]) \
+                        if instr.args else None
                     raise GamaRuntimeFault(
-                        "RunawayLoop",
-                        f"`{fn.name}` exceeded the basic-block step budget")
-                return _JUMPED
-            if op is Op.RETURN:
-                value = self.resolve(act, instr.args[0]) \
-                    if instr.args else UNIT
-                return "return", value
-            if op is Op.FAULT:
-                raise GamaRuntimeFault(
-                    str(instr.meta.get("kind", "Fault")),
-                    str(instr.meta.get("message", "")), instr.pos)
-            if op is Op.MATCH_FAIL:
-                value = self.resolve(act, instr.args[0]) \
-                    if instr.args else None
-                raise GamaRuntimeFault(
-                    "MatchError",
-                    f"no match arm accepted a value of type {type_name(value)}",
-                    instr.pos, context={"value": display(value)})
-            # Suspension points.  A call saves the resume point and returns to
-            # the trampoline, which pushes the new activation; the interpreter
-            # never calls itself, so call depth is a number this class owns.
-            if op is Op.CALL:
-                call_args = [self.resolve(act, a) for a in instr.args]
-                act.pc = i + 1
-                return "call", (self._callee(instr.meta["callee"], instr.pos),
-                                call_args, instr.dst, instr.pos)
-            if op is Op.CALL_INDIRECT:
-                callee = self.resolve(act, instr.args[0])
-                call_args = [self.resolve(act, a)
-                             for a in instr.args[1:]]
-                kind, target = self._indirect_callee(callee, call_args, instr.pos)
-                if kind == "gir":
+                        "MatchError",
+                        f"no match arm accepted a value of type {type_name(value)}",
+                        instr.pos, context={"value": display(value)})
+                # Suspension points.  A call saves the resume point and returns to
+                # the trampoline, which pushes the new activation; the interpreter
+                # never calls itself, so call depth is a number this class owns.
+                if op is Op.CALL:
+                    call_args = [self.resolve(act, a) for a in instr.args]
                     act.pc = i + 1
-                    return "call", (target, call_args, instr.dst, instr.pos)
-                if instr.dst >= 0:
-                    self.store(act, instr.dst, target)
+                    return "call", (self._callee(instr.meta["callee"], instr.pos),
+                                    call_args, instr.dst, instr.pos)
+                if op is Op.CALL_INDIRECT:
+                    callee = self.resolve(act, instr.args[0])
+                    call_args = [self.resolve(act, a)
+                                 for a in instr.args[1:]]
+                    kind, target = self._indirect_callee(callee, call_args, instr.pos)
+                    if kind == "gir":
+                        act.pc = i + 1
+                        return "call", (target, call_args, instr.dst, instr.pos)
+                    if instr.dst >= 0:
+                        self.store(act, instr.dst, target)
+                    i += 1
+                    continue
+                if op is Op.METHOD_CALL:
+                    obj = self.resolve(act, instr.args[0])
+                    call_args = [self.resolve(act, a)
+                                 for a in instr.args[1:]]
+                    target = self._method_callee(obj, instr.meta["method"])
+                    if target is not None:
+                        act.pc = i + 1
+                        return "call", (target, call_args, instr.dst, instr.pos)
+                    value = self.dispatch_method(obj, instr.meta["method"],
+                                                 call_args, instr.pos)
+                    if instr.dst >= 0:
+                        self.store(act, instr.dst, value)
+                    i += 1
+                    continue
+                handler = self.dispatch.get(op)
+                if handler is None:
+                    raise GamaRuntimeFault("UnsupportedGIR",
+                                           f"the reference interpreter cannot "
+                                           f"execute `{op.value}`", instr.pos)
+                handler(act, instr)
                 i += 1
-                continue
-            if op is Op.METHOD_CALL:
-                obj = self.resolve(act, instr.args[0])
-                call_args = [self.resolve(act, a)
-                             for a in instr.args[1:]]
-                target = self._method_callee(obj, instr.meta["method"])
-                if target is not None:
-                    act.pc = i + 1
-                    return "call", (target, call_args, instr.dst, instr.pos)
-                value = self.dispatch_method(obj, instr.meta["method"],
-                                             call_args, instr.pos)
-                if instr.dst >= 0:
-                    self.store(act, instr.dst, value)
-                i += 1
-                continue
-            handler = self.dispatch.get(op)
-            if handler is None:
-                raise GamaRuntimeFault("UnsupportedGIR",
-                                       f"the reference interpreter cannot "
-                                       f"execute `{op.value}`", instr.pos)
-            handler(act, instr)
-            i += 1
+        finally:
+            if prof is not None:
+                # instructions executed in this block visit: `i` points at
+                # the instruction that ended it (a jump, a call, a return,
+                # a fault), or one past the block when it fell through
+                prof_rec["instrs"] += (i - prof_from + 1) if i < n \
+                    else (n - prof_from)
+                prof_rec["ns"] += time.perf_counter_ns() - prof_t0
         act.pc = 0
         return _ENDED
 

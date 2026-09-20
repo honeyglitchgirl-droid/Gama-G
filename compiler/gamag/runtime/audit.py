@@ -231,3 +231,62 @@ class AuditLog:
             "by_level": by_level,
             "verified": self.verify()[0],
         }
+
+
+# ---------------------------------------------------------------------------
+# offline verification -- what `ggc audit verify` runs
+# ---------------------------------------------------------------------------
+def verify_trail(text: str,
+                 key: Optional[bytes] = None) -> Tuple[bool, List[str],
+                                                        Dict[str, Any]]:
+    """Verify a trail as written, without the runtime that produced it.
+
+    Two checks never need a key and are therefore always run: the recomputed
+    SHA-256 digest of every record, and the `prev_hash` linkage that makes the
+    trail a chain rather than a list.  The HMAC signature binds the chain to
+    the deployment's key, which deliberately does not live in the file; it is
+    checked only when a key is supplied, and the summary says which mode ran,
+    because "signatures not checked" is information a reviewer needs.
+
+    Returns ``(ok, problems, summary)``.
+    """
+    log = AuditLog.from_jsonl(text)
+    problems: List[str] = []
+    prev = GENESIS_HASH
+    for i, rec in enumerate(log.records):
+        if rec.seq != i:
+            problems.append(f"record {i}: seq is {rec.seq}, expected {i}")
+        if rec.prev_hash != prev:
+            problems.append(
+                f"record {i} ({rec.action}): prev_hash "
+                f"{rec.prev_hash[:12]}... does not match the previous record "
+                f"hash {prev[:12]}... -- the chain is broken here")
+        expected = log.compute_hash(rec)
+        if rec.hash != expected:
+            problems.append(
+                f"record {i} ({rec.action}): stored hash "
+                f"{rec.hash[:12]}... does not match the recomputed digest "
+                f"{expected[:12]}... -- the record contents were modified")
+        if key is not None:
+            expected_sig = hmac.new(key, rec.hash.encode("utf-8"),
+                                    hashlib.sha256).hexdigest()
+            if not hmac.compare_digest(rec.signature, expected_sig):
+                problems.append(
+                    f"record {i} ({rec.action}): signature does not verify "
+                    f"against the supplied key")
+        prev = rec.hash
+    by_action: Dict[str, int] = {}
+    by_level: Dict[str, int] = {}
+    for rec in log.records:
+        by_action[rec.action] = by_action.get(rec.action, 0) + 1
+        by_level[rec.level] = by_level.get(rec.level, 0) + 1
+    summary = {
+        "records": len(log.records),
+        "head_hash": log.head_hash,
+        "by_action": by_action,
+        "by_level": by_level,
+        "signatures_checked": key is not None,
+        "first_timestamp": (log.records[0].timestamp if log.records else None),
+        "last_timestamp": (log.records[-1].timestamp if log.records else None),
+    }
+    return (not problems), problems, summary

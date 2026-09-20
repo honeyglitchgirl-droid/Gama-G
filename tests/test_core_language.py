@@ -1299,6 +1299,200 @@ outcome b
         self.assertEqual(model.authority.unmet(), [])
 
 
+class GuardProofs(unittest.TestCase):
+    """`core/guardproof.py`: the selection proof beyond two complementary
+    guards.
+
+    v0.2 proved one shape; this is a decision procedure over a decidable
+    fragment -- boolean combinations of comparisons of one sized-integer
+    binding against integer constants -- and the tests below fix both sides
+    of the line: what becomes `proven`, and what must honestly stay
+    `unprovable` with its runtime fault.
+    """
+
+    def model(self, body: str, head: str = HEAD):
+        return S.compile_only(core(body, head)).assert_compiled(
+            self).compilation.core_model
+
+    THREE_WAY = """
+operation Severe
+    uses     a
+    yields   band : Text
+    effect   pure
+    when     a >= 90
+    computes "severe"
+operation Urgent
+    uses     a
+    yields   band : Text
+    effect   pure
+    when     a >= 75 and a < 90
+    computes "urgent"
+operation Routine
+    uses     a
+    yields   band : Text
+    effect   pure
+    when     a < 75
+    computes "routine"
+outcome band
+"""
+
+    def test_three_integer_alternatives_are_proven_both_ways(self):
+        model = self.model(self.THREE_WAY)
+        sel = model.operations.selections["band"]
+        self.assertTrue(sel.proven_exhaustive)
+        self.assertTrue(sel.proven_exclusive)
+        self.assertIn("exact interval partition", sel.proof)
+
+    def test_the_proven_selection_is_discharged_as_proven(self):
+        from gamag.core import mir as MIR
+        model = self.model(self.THREE_WAY)
+        kinds = {c.kind: c.discharge for c in model.constraints.constraints}
+        self.assertEqual(kinds["exclusive"], MIR.DISCHARGE_PROVEN)
+        # and the recovery graph holds no selection obligation: there is
+        # nothing left for the runtime to police
+        self.assertEqual([o for o in model.recovery.obligations
+                          if o.kind == "selection"], [])
+
+    def test_the_proof_changes_nothing_about_the_derived_order(self):
+        """A proof informs the record; it must not reorder the program."""
+        model = self.model(self.THREE_WAY)
+        levels = model.operations.levels
+        self.assertEqual(sorted(name for level in levels for name in level),
+                         sorted(["Severe", "Urgent", "Routine"]))
+        self.assertTrue(all(len(level) == 3 for level in levels),
+                        "all three are independent; one level, any order")
+
+    def test_arithmetic_complements_are_proven_though_not_spelled_alike(self):
+        # `not (a >= 3)` and `a < 3` are complements in value but not in
+        # text: the syntactic test cannot see it, the prover decides it.
+        model = self.model("""
+operation High
+    uses     a
+    yields   s : I64
+    effect   pure
+    when     a >= 3
+    computes 1
+operation Low
+    uses     a
+    yields   s : I64
+    effect   pure
+    when     a < 3
+    computes 2
+outcome s
+""")
+        sel = model.operations.selections["s"]
+        self.assertTrue(sel.proven_exhaustive and sel.proven_exclusive)
+
+    def test_a_selection_over_floats_stays_unprovable(self):
+        """NaN makes interval coverage a lie over the reals, so the prover
+        refuses: the runtime fault stays exactly where it belongs."""
+        from gamag.core import mir as MIR
+        head = "gama core 0.2\nintent T\nsource a : F64 from 5.0\n"
+        body = self.THREE_WAY.replace("a >= 90", "a >= 90.0") \
+                            .replace("a >= 75 and a < 90",
+                                     "a >= 75.0 and a < 90.0") \
+                            .replace("a < 75", "a < 75.0")
+        model = S.compile_only(core(body, head)).assert_compiled(
+            self).compilation.core_model
+        sel = model.operations.selections["band"]
+        self.assertFalse(sel.proven_exhaustive)
+        self.assertFalse(sel.proven_exclusive)
+        obligations = [o for o in model.recovery.obligations
+                       if o.kind == "selection"]
+        self.assertEqual(len(obligations), 1)
+        kinds = {c.kind: c.discharge for c in model.constraints.constraints}
+        self.assertEqual(kinds["exclusive"], MIR.DISCHARGE_UNPROVABLE)
+
+    def test_exclusive_but_not_exhaustive_keeps_the_runtime_fault_live(self):
+        """A definite *negative* is still a fact: nothing claims these two
+        cover everything, and with a value in the gap the run faults."""
+        model = self.model("""
+operation Small
+    uses     a
+    yields   s : I64
+    effect   pure
+    when     a < 1
+    computes 1
+operation Large
+    uses     a
+    yields   s : I64
+    effect   pure
+    when     a > 10
+    computes 2
+outcome s
+""")
+        sel = model.operations.selections["s"]
+        self.assertFalse(sel.proven_exhaustive)
+        self.assertTrue(sel.proven_exclusive)   # the gap is real, and so is
+        # the disjointness
+        out = S.run(core("""
+operation Small
+    uses     a
+    yields   s : I64
+    effect   pure
+    when     a < 1
+    computes 1
+operation Large
+    uses     a
+    yields   s : I64
+    effect   pure
+    when     a > 10
+    computes 2
+outcome s
+"""))
+        out.assert_faulted(self, kind="NoActiveAlternative")
+
+    def test_constant_guards_are_decided(self):
+        model = self.model("""
+operation Always
+    uses     a
+    yields   s : I64
+    effect   pure
+    when     true
+    computes 1
+operation Never
+    uses     a
+    yields   s : I64
+    effect   pure
+    when     false
+    computes 2
+outcome s
+""")
+        sel = model.operations.selections["s"]
+        self.assertTrue(sel.proven_exhaustive)
+        self.assertTrue(sel.proven_exclusive)
+
+    def test_guards_over_two_bindings_are_outside_the_fragment(self):
+        head = ("gama core 0.2\nintent T\nsource a : I64 from 5\n"
+                "source b : I64 from 2\n")
+        out = S.compile_only(core("""
+operation Left
+    uses     a, b
+    yields   s : I64
+    effect   pure
+    when     a > 0
+    computes 1
+operation Right
+    uses     b
+    yields   s : I64
+    effect   pure
+    when     b > 0
+    computes 2
+outcome s
+""", head))
+        model = out.assert_compiled(self).compilation.core_model
+        sel = model.operations.selections["s"]
+        self.assertFalse(sel.proven_exhaustive)
+        self.assertFalse(sel.proven_exclusive)
+        self.assertEqual(sel.proof, "")
+
+    def test_the_proof_reaches_the_graph_render(self):
+        model = self.model(self.THREE_WAY)
+        text = model.render()
+        self.assertIn("proven mutually exclusive and exhaustive", text)
+        self.assertIn("exact interval partition", text)
+
+
 class ProvenanceEvidence(unittest.TestCase):
     """What would be needed to support an originality claim -- and what is not.
 

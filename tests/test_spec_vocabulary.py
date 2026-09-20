@@ -311,18 +311,17 @@ class ToolchainVocabulary(unittest.TestCase):
             self.assertIn(command, choices,
                           f"`ggc {command}` is not implemented")
 
-    #: Commands the specification describes and this toolchain does not have.
-    #: Spec section 43 forbids claiming capability the toolchain lacks, so each
-    #: must be absent rather than present-and-pretending.
-    ROADMAP_COMMANDS = ("profile", "format", "doc")
+    #: Commands a future revision may declare before building.  Spec section
+    #: 43 forbids claiming capability the toolchain lacks, so a command on
+    #: this list must be absent from the parser rather than present and
+    #: pretending.  The list emptied as `bench`, `profile`, `format`, `doc`
+    #: and `audit` were built; it stays as the guard for the next one, and a
+    #: command *leaving* it is the signal that its documentation and roadmap
+    #: entry need updating too.
+    ROADMAP_COMMANDS = ()
 
     def test_roadmap_commands_are_declared_as_unimplemented(self):
-        """A command that does not exist must not appear to.
-
-        `bench` was on this list until audit priority 8 implemented it; a
-        command leaving this list is the signal that its documentation and
-        roadmap entry need updating too.
-        """
+        """A command that does not exist must not appear to."""
         from gamag.cli.main import build_parser
         choices = set(
             {a.dest: a for a in build_parser()._actions}["command"].choices)
@@ -332,6 +331,21 @@ class ToolchainVocabulary(unittest.TestCase):
                 f"`ggc {command}` now exists; move it out of the roadmap list "
                 f"in docs/IMPLEMENTATION.md")
 
+    def test_the_specification_nine_are_all_present(self):
+        """Every command spec lines 949-957 lists now exists.
+
+        The list is read from the specification at run time, so this asserts
+        against the blueprint rather than against a copy of it.
+        """
+        from gamag.cli.main import build_parser
+        listed = S.SpecList.load("commands", 949, 957).items
+        wanted = {name.split()[-1] for name in listed}
+        choices = set(
+            {a.dest: a for a in build_parser()._actions}["command"].choices)
+        missing = sorted(wanted - choices)
+        self.assertEqual(missing, [],
+                         "spec section 31 commands the toolchain still lacks")
+
     def test_the_commands_that_do_exist_are_all_reachable(self):
         # The other half of the check above: a command that has been built must
         # actually be wired in, not left as a parser with no handler.
@@ -340,7 +354,8 @@ class ToolchainVocabulary(unittest.TestCase):
             {a.dest: a for a in build_parser()._actions}["command"].choices)
         for command in ("check", "build", "gir", "graph", "memory", "run",
                         "test", "explain", "native", "difftest", "wasm",
-                        "device", "fuzz", "gpm", "manifest", "bench"):
+                        "device", "fuzz", "gpm", "manifest", "bench",
+                        "format", "profile", "doc", "audit"):
             self.assertIn(command, choices, f"`ggc {command}` is missing")
             self.assertIn(command, COMMANDS,
                           f"`ggc {command}` has no handler")

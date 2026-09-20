@@ -371,34 +371,56 @@ def _manifest_dependencies(directory: str) -> Dict[str, Constraint]:
         return {}
 
 
+#: A bound on the backtracking search, so that a pathological graph becomes
+#: a named conflict rather than a hang.  Exhausting it is reported as such:
+#: the resolver fails closed, exactly as it did before backtracking existed.
+MAX_SEARCH_NODES = 4096
+#: How deep the search may lower earlier choices.  Together with the node
+#: budget this turns "NP-complete in general" into a bounded, reported fact.
+MAX_SEARCH_DEPTH = 32
+
+
 def resolve(root_manifest: PackageManifest, registry: Registry,
             root_directory: str = "") -> Resolution:
     """Resolve `root_manifest`'s dependencies against `registry`.
 
-    **The algorithm is a fixed point, not a single pass.**  A one-pass resolver
-    that visits dependencies in sorted order picks `aa` before `b` has
-    contributed its constraint when `aa` happens to sort first, and then keeps
-    that choice even though `b` forbids it -- reporting success while installing
-    a version a constraint excludes.  That bug was written, caught by a test
-    with the alphabet reversed, and is the reason this loop exists.
+    **The algorithm is a fixed point with a bounded backtracking search
+    around it.**  A one-pass resolver that visits dependencies in sorted
+    order picks `aa` before `b` has contributed its constraint when `aa`
+    happens to sort first, and then keeps that choice even though `b`
+    forbids it -- reporting success while installing a version a constraint
+    excludes.  That bug was written, caught by a test with the alphabet
+    reversed, and is the reason this loop exists.
 
-    Each round derives the whole constraint set from the current choices and
-    re-picks the highest satisfying version for every package.  The round after
-    a change sees the constraints the new version brought with it, so a choice
-    that has become unacceptable is replaced.  Iteration stops when nothing
-    changes.
+    Each round of the fixed point derives the whole constraint set from the
+    current choices and re-picks the highest satisfying version for every
+    package.  The round after a change sees the constraints the new version
+    brought with it, so a choice that has become unacceptable is replaced.
+    Iteration stops when nothing changes.
 
-    Two deliberate limits, stated rather than discovered:
+    When the fixed point hits a package with no acceptable version, the
+    resolver no longer gives up on the spot: it tries *lowering* an earlier
+    choice, one package at a time in sorted order and descending version
+    order, and runs the fixed point again from there.  A graph satisfiable
+    only below the highest satisfying version of something now resolves;
+    before, it was reported as a conflict, which was honest but less honest
+    than the truth: the answer existed.
 
-    * No backtracking.  The highest satisfying version is chosen for each
-      package independently, so a graph that can only be satisfied by picking
-      *below* the highest satisfying version of something will not resolve.  It
-      reports the conflict and exits nonzero; it does not guess.  Failing closed
-      is the right direction for a package manager, and a full solver is a
-      larger piece of work than this.
-    * `MAX_ROUNDS` bounds the loop.  A fixed point over a finite constraint set
-      converges quickly, but a bound turns a hypothetical non-convergence into a
-      diagnostic instead of a hang.
+    Three deliberate limits, stated rather than discovered:
+
+    * Determinism.  Packages are examined in sorted order and versions in
+      descending order, so the first solution found is the same on every run
+      and every machine; the search never depends on dictionary or hash
+      order.
+    * `MAX_SEARCH_NODES` and `MAX_SEARCH_DEPTH` bound the search.
+      Dependency solving is NP-complete in general and no claim is made
+      beyond the budget: a graph whose only solution lies past it is
+      reported as a conflict, the same fail-closed outcome as before --
+      *unsat* and *not proved sat within the budget* both mean "I will not
+      guess", and both exit nonzero.
+    * `MAX_ROUNDS` bounds each fixed point.  Convergence is fast over a
+      finite constraint set, but a bound turns a hypothetical
+      non-convergence into a diagnostic instead of a hang.
     """
     out = Resolution()
     candidates_cache: Dict[str, List[Tuple[Version, str]]] = {}
@@ -416,13 +438,13 @@ def resolve(root_manifest: PackageManifest, registry: Registry,
             manifest_cache[directory] = PackageManifest.read(directory)
         return manifest_cache[directory]
 
-    #: name -> {(version, directory), ...} for the current round
-    chosen: Dict[str, Tuple[Version, str]] = {}
-    first_problems: List[str] = []
+    def constraint_round(chosen: Dict[str, Tuple[Version, str]]
+                         ) -> Dict[str, List[Tuple[str, Constraint]]]:
+        """The constraint set from the root plus the *current* choices.
 
-    for round_number in range(MAX_ROUNDS):
-        # Derive the constraint set from the root plus the *current* choices, so
-        # a constraint contributed by a version we no longer use disappears.
+        Deriving it fresh each round is what makes a constraint contributed
+        by a version we no longer use disappear.
+        """
         wanted: Dict[str, List[Tuple[str, Constraint]]] = {}
         for name, constraint in sorted(root_manifest.dependencies.items()):
             wanted.setdefault(name, []).append(("(this package)", constraint))
@@ -432,45 +454,122 @@ def resolve(root_manifest: PackageManifest, registry: Registry,
                     manifest_of(directory).dependencies.items()):
                 wanted.setdefault(child, []).append((f"{name} {version}",
                                                      constraint))
+        return wanted
 
-        problems: List[str] = []
-        new_choices: Dict[str, Tuple[Version, str]] = {}
-        for name in sorted(wanted):
-            constraints = wanted[name]
-            available = candidates(name)
-            if not available:
-                problems.append(
-                    f"no package named `{name}` in any registry "
-                    f"({', '.join(registry.roots) or 'none configured'})")
-                continue
-            acceptable = [(version, directory) for version, directory in available
-                          if all(constraint.accepts(version)
-                                 for _why, constraint in constraints)]
-            if not acceptable:
-                asking = "; ".join(f"{constraint} from {why}"
-                                   for why, constraint in constraints)
-                listed = ", ".join(str(v) for v, _ in available) or "nothing"
-                problems.append(
-                    f"`{name}` is required as {asking}, but the registry only "
-                    f"has {listed}")
-                continue
-            new_choices[name] = acceptable[0]      # candidates are sorted down
+    def _blurb(name: str,
+               constraints: List[Tuple[str, Constraint]],
+               available: List[Tuple[Version, str]]) -> str:
+        asking = "; ".join(f"{constraint} from {why}"
+                           for why, constraint in constraints)
+        listed = ", ".join(str(v) for v, _ in available) or "nothing"
+        return (f"`{name}` is required as {asking}, but the registry only "
+                f"has {listed}")
 
-        if problems:
-            # Report the first round's problems: a later round would be
-            # describing a resolution that was already known to be broken.
-            out.problems = first_problems or problems
-            return out
-        if new_choices == chosen and round_number > 0:
-            break
-        if not first_problems:
-            first_problems = []
-        chosen = new_choices
-    else:
-        out.problems.append(
-            f"resolution did not settle after {MAX_ROUNDS} rounds; this is a "
-            f"bug in gpm rather than a problem with the packages")
+    def settle(pinned: Dict[str, Tuple[Version, str]]
+               ) -> Tuple[Dict[str, Tuple[Version, str]], Optional[str],
+                          List[str]]:
+        """Iterate to a fixed point with `pinned` treated as immovable.
+
+        Returns ``(chosen, conflict, problems)``; `conflict` names the first
+        package that could not be satisfied, or is None when the fixed point
+        settled.
+        """
+        chosen = dict(pinned)
+        for round_number in range(MAX_ROUNDS):
+            wanted = constraint_round(chosen)
+            problems: List[str] = []
+            new_choices: Dict[str, Tuple[Version, str]] = {}
+            for name in sorted(wanted):
+                constraints = wanted[name]
+                available = candidates(name)
+                if not available:
+                    problems.append(
+                        f"no package named `{name}` in any registry "
+                        f"({', '.join(registry.roots) or 'none configured'})")
+                    return chosen, name, problems
+                if name in pinned:
+                    pinned_version, pinned_dir = pinned[name]
+                    if all(constraint.accepts(pinned_version)
+                           for _why, constraint in constraints):
+                        new_choices[name] = (pinned_version, pinned_dir)
+                        continue
+                    # A pinned version that has become unacceptable is the
+                    # reason this branch exists; report it as the conflict
+                    # and let the search move past this choice.
+                    asking = "; ".join(f"{constraint} from {why}"
+                                       for why, constraint in constraints)
+                    problems.append(
+                        f"`{name}` is required as {asking}, but the chosen "
+                        f"version `{pinned_version}` cannot move and does "
+                        f"not satisfy them")
+                    return chosen, name, problems
+                acceptable = [(version, directory)
+                              for version, directory in available
+                              if all(constraint.accepts(version)
+                                     for _why, constraint in constraints)]
+                if not acceptable:
+                    problems.append(_blurb(name, constraints, available))
+                    return chosen, name, problems
+                new_choices[name] = acceptable[0]     # sorted descending
+            if new_choices == chosen:
+                return chosen, None, []
+            chosen = new_choices
+        return chosen, "__diverged__", [
+            f"resolution did not settle after {MAX_ROUNDS} rounds; this is "
+            f"a bug in gpm rather than a problem with the packages"]
+
+    class BudgetExhausted(Exception):
+        pass
+
+    budget = [MAX_SEARCH_NODES]
+
+    def search(pinned: Dict[str, Tuple[Version, str]], depth: int
+               ) -> Optional[Dict[str, Tuple[Version, str]]]:
+        """Fixed point; on conflict, lower one earlier choice and retry."""
+        if budget[0] <= 0:
+            raise BudgetExhausted()
+        budget[0] -= 1
+        chosen, conflict, _problems = settle(pinned)
+        if conflict is None:
+            return chosen
+        if conflict == "__diverged__" or depth >= MAX_SEARCH_DEPTH:
+            return None
+        for name in sorted(chosen):
+            if name in pinned:
+                continue            # already lowered at an outer level
+            base_version = chosen[name][0]
+            for version, directory in candidates(name):
+                if version >= base_version:
+                    continue        # only ever *below* the greedy choice
+                attempt = search(
+                    dict(pinned, **{name: (version, directory)}), depth + 1)
+                if attempt is not None:
+                    return attempt
+        return None
+
+    settled, conflict, problems = settle({})
+    if conflict is None:
+        chosen = settled
+    elif conflict == "__diverged__":
+        out.problems = problems
         return out
+    else:
+        # The first problems -- from the unmodified fixed point -- are what a
+        # reader sees if the search finds nothing: a later round would be
+        # describing a resolution that was already known to be broken.
+        first_problems = list(problems)
+        try:
+            attempt = search({}, 0)
+        except BudgetExhausted:
+            attempt = None
+            first_problems.append(
+                f"a graph that satisfies every constraint may exist beyond "
+                f"gpm's search budget of {MAX_SEARCH_NODES} nodes; reported "
+                f"as a conflict rather than a guess")
+        if attempt is None:
+            out.problems = first_problems
+            return out
+        chosen = attempt
 
     for name in sorted(chosen):
         version, directory = chosen[name]
