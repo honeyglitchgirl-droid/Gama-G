@@ -179,7 +179,19 @@ def run_file(path: str, **kwargs: Any) -> Outcome:
 
 
 def example(name: str) -> str:
+    """The path of an example, given a name like ``core/dose.gg``."""
     return os.path.join(EXAMPLES_DIR, name)
+
+
+def example_file(name: str) -> str:
+    """The *source* of an example.
+
+    Distinct from :func:`example` on purpose: passing a path where source was
+    expected lexes the path as a program and produces a confusing failure in
+    whichever test made the mistake.
+    """
+    with open(example(name), "r", encoding="utf-8") as handle:
+        return handle.read()
 
 
 def example_names() -> List[str]:

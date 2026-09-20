@@ -21,3 +21,7 @@ htmlcov/
 .idea/
 .vscode/
 .venv/
+
+# native backend artifacts
+.ggbuild/
+*.wasm

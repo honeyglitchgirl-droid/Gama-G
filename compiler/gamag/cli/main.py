@@ -91,6 +91,55 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--slots", action="store_true",
                    help="list every slot and the bindings that occupied it")
 
+    p = sub.add_parser(
+        "native",
+        help="compile to machine code through the native backend")
+    add_common(p)
+    p.add_argument("-o", "--output", metavar="PATH",
+                   help="write the executable here (default: the build dir)")
+    p.add_argument("--build-dir", metavar="DIR", default=None,
+                   help="where to put generated C and the executable "
+                        "(default: .ggbuild)")
+    p.add_argument("--emit-c", metavar="PATH",
+                   help="write the generated C here and do not compile it")
+    p.add_argument("--keep-c", action="store_true",
+                   help="keep the generated C next to the executable")
+    p.add_argument("--cc-opt", dest="cc_opt", type=int, default=2,
+                   choices=(0, 1, 2, 3),
+                   help="optimisation level passed to the C compiler "
+                        "(default: 2). This is not `-O`, which optimises the GIR")
+    p.add_argument("--cc", metavar="PROG",
+                   help="the C compiler to use (default: $CC, cc, gcc, clang)")
+
+    p = sub.add_parser(
+        "difftest",
+        help="run a program on the interpreter and the native backend and "
+             "compare them")
+    add_common(p)
+    p.add_argument("--build-dir", metavar="DIR", default=None)
+    p.add_argument("--show-refused", action="store_true",
+                   help="also list what the backend declined to compile")
+
+    p = sub.add_parser(
+        "wasm",
+        help="emit a WebAssembly module for the numeric subset")
+    add_common(p)
+    p.add_argument("-o", "--output", metavar="PATH",
+                   help="write the .wasm module here")
+    p.add_argument("--disassemble", action="store_true",
+                   help="print the emitted instructions instead of writing")
+    p.add_argument("--analyze", action="store_true",
+                   help="report what can and cannot be expressed, and stop")
+
+    p = sub.add_parser(
+        "device",
+        help="report the accelerator devices present and the kernels available")
+    p.add_argument("--kernels", nargs="*", metavar="NAME",
+                   help="print these kernels (default: all)")
+    p.add_argument("--list", action="store_true",
+                   help="list the offloadable operations and stop")
+    p.add_argument("--json", action="store_true")
+
     p = sub.add_parser("run", help="compile and execute")
     add_common(p)
     p.add_argument("--entry", metavar="NAME", default="main",
@@ -588,8 +637,230 @@ def cmd_explain(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def cmd_native(args: argparse.Namespace) -> int:
+    """Compile to machine code, or say precisely why that is not possible.
+
+    The support analysis runs before any C is written: a backend that discovers
+    a gap halfway through emission has already promised the user an executable.
+    """
+    from ..backend import native as native_backend
+
+    build_dir = args.build_dir or native_backend.DEFAULT_BUILD_DIR
+    compilations, status = _compile(args.files, args)
+    if status != EXIT_OK:
+        for compilation in compilations:
+            _report(compilation, not args.no_color, args.json)
+        return status
+
+    failed = False
+    for compilation in compilations:
+        if compilation.program is None:
+            print(f"{compilation.path}: no GIR to compile", file=sys.stderr)
+            failed = True
+            continue
+        if args.emit_c:
+            from ..backend import cgen
+            support = cgen.unsupported(compilation.program)
+            if support.problems:
+                print(f"{compilation.path}:")
+                for problem in support.problems:
+                    print(f"  - {problem.render()}")
+                print("  it runs on the reference interpreter: "
+                      "`ggc run <file>`")
+                failed = True
+                continue
+            source = cgen.generate_c(compilation.program, compilation.path)
+            with open(args.emit_c, "w", encoding="utf-8") as handle:
+                handle.write(source)
+            print(f"wrote {source.count(chr(10)) + 1} lines of C to {args.emit_c}")
+            continue
+
+        result = native_backend.build(compilation.program, compilation.path,
+                                      build_dir=build_dir,
+                                      opt_level=args.cc_opt,
+                                      compiler=args.cc,
+                                      keep_c=args.keep_c)
+        if args.json:
+            print(json.dumps({
+                "path": compilation.path, "ok": result.ok,
+                "stage": result.stage, "c_lines": result.c_lines,
+                "exe": result.exe_path, "compiler": result.compiler,
+                "elapsed_ms": round(result.elapsed_ms, 2),
+                "problems": [p.render() for p in result.problems],
+                "stderr": result.stderr,
+            }, indent=2))
+            continue
+        for line in result.render():
+            print(line)
+        if not result.ok:
+            failed = True
+    return EXIT_COMPILE if failed else EXIT_OK
+
+
+def cmd_difftest(args: argparse.Namespace) -> int:
+    """Run both machines on the same program and report where they differ.
+
+    This is the only evidence that a backend is correct.  "It compiled" is not
+    evidence, and a fast backend that is occasionally wrong is worse than none.
+    """
+    from ..backend import differential, native as native_backend
+
+    build_dir = args.build_dir or native_backend.DEFAULT_BUILD_DIR
+    corpus = differential.Corpus()
+    for path in args.files:
+        with open(path, "r", encoding="utf-8") as handle:
+            source = handle.read()
+        corpus.comparisons.append(
+            differential.compare(source, path=path, build_dir=build_dir))
+
+    if args.json:
+        print(json.dumps([{
+            "path": c.path, "outcome": c.outcome, "reasons": c.reasons,
+            "first_difference": c.first_difference,
+            "interpreter_stdout": (c.interpreter.stdout if c.interpreter else ""),
+            "native_stdout": c.native_stdout,
+            "interpreter_status": (c.interpreter.exit_status
+                                   if c.interpreter else None),
+            "native_status": c.native_status,
+            "interpreter_fault": (c.interpreter.fault_kind
+                                  if c.interpreter else ""),
+            "native_fault": c.native_fault_kind,
+        } for c in corpus.comparisons], indent=2))
+        return EXIT_RUNTIME if corpus.diverged else EXIT_OK
+
+    for comparison in corpus.comparisons:
+        if comparison.outcome == "agreed":
+            print(f"  agreed    {comparison.path}")
+        elif comparison.outcome == "refused":
+            mark = "refused  " if args.show_refused else "refused  "
+            print(f"  {mark} {comparison.path}")
+            if args.show_refused:
+                for reason in comparison.reasons[:4]:
+                    print(f"              {reason}")
+        else:
+            print(f"  DIVERGED  {comparison.path}")
+            for line in comparison.render()[1:]:
+                print(f"          {line.strip()}")
+    print()
+    print(corpus.summary())
+    if not corpus.diverged:
+        print("no program the backend accepted disagreed with the interpreter")
+    return EXIT_RUNTIME if corpus.diverged else EXIT_OK
+
+
+def cmd_wasm(args: argparse.Namespace) -> int:
+    """Emit a WebAssembly module, or report what cannot be expressed.
+
+    The module has never been executed here -- there is no WASM runtime in this
+    repository's environment -- so the claim is structural conformance and
+    nothing more.  `--disassemble` prints the instructions so they can be read
+    against the GIR they came from.
+    """
+    from ..backend import wasm
+
+    compilations, status = _compile(args.files, args)
+    if status != EXIT_OK:
+        for compilation in compilations:
+            _report(compilation, not args.no_color, args.json)
+        return status
+
+    failed = False
+    for compilation in compilations:
+        if compilation.program is None:
+            print(f"{compilation.path}: no GIR to compile", file=sys.stderr)
+            failed = True
+            continue
+        analysis = wasm.analyze(compilation.program)
+        if args.analyze or not analysis.ok:
+            for line in analysis.render():
+                print(line)
+            if not analysis.ok:
+                print("nothing in this program can be expressed in the WASM "
+                      "subset, so no module was written")
+                failed = True
+            continue
+        blob = wasm.generate(compilation.program)
+        problems = wasm.validate(blob)
+        if args.disassemble:
+            print(f"{compilation.path}: {len(blob)} bytes, "
+                  f"{len(analysis.compilable)} function(s)")
+            for name, body in wasm.disassemble_module(blob).items():
+                print(f"  {name}:")
+                for line in body:
+                    print(f"    {line}")
+            if problems:
+                print("  structural problems: " + "; ".join(problems))
+                failed = True
+            continue
+        if problems:
+            print(f"{compilation.path}: the module failed structural checks:")
+            for problem in problems:
+                print(f"  - {problem}")
+            failed = True
+            continue
+        out_path = args.output or (compilation.path.rsplit(".", 1)[0] + ".wasm")
+        with open(out_path, "wb") as handle:
+            handle.write(blob)
+        print(f"wrote {len(blob)} bytes to {out_path}")
+        print(f"  exports: {', '.join(analysis.compilable)}")
+        print("  not executed: no WebAssembly runtime is present here, so this")
+        print("  is structural conformance, not verified behaviour")
+    return EXIT_COMPILE if failed else EXIT_OK
+
+
+def cmd_device(args: argparse.Namespace) -> int:
+    """Report the accelerator situation honestly.
+
+    There is no GPU in this repository's test environment.  Saying so, with the
+    reason, is the useful output; a command that printed nothing when no device
+    was present would leave the program unable to tell whether it ran on an
+    accelerator or not.
+    """
+    from ..backend import accelerator
+
+    if args.list:
+        for operation, kernel in sorted(accelerator.OFFLOADABLE.items()):
+            print(f"  {operation:22} -> kernel `gama_{kernel}`")
+        return EXIT_OK
+
+    if args.json:
+        print(json.dumps({
+            "devices": [{"kind": d.kind, "name": d.name,
+                         "available": d.available, "reason": d.reason}
+                        for d in accelerator.detect()],
+            "kernels": sorted(accelerator.KERNELS),
+            "offloadable": accelerator.OFFLOADABLE,
+            "kernel_problems": accelerator.check_all(),
+            "executed_anywhere": False,
+        }, indent=2))
+        return EXIT_OK
+
+    for line in accelerator.placement_report():
+        print(line)
+    print()
+    print("kernels available (OpenCL C, structurally checked, never run here):")
+    for name in sorted(accelerator.KERNELS):
+        problems = accelerator.check_kernel(
+            accelerator.Kernel(operation=name,
+                               source=accelerator.KERNELS[name],
+                               entry=f"gama_{name}"))
+        mark = "ok" if not problems else "PROBLEM"
+        print(f"  {mark:8} gama_{name}")
+        for problem in problems:
+            print(f"           {problem}")
+    if args.kernels:
+        print()
+        for line in accelerator.render_kernels(args.kernels):
+            print(line)
+    return EXIT_OK
+
+
 COMMANDS = {
     "check": cmd_check,
+    "native": cmd_native,
+    "difftest": cmd_difftest,
+    "wasm": cmd_wasm,
+    "device": cmd_device,
     "build": cmd_build,
     "gir": cmd_gir,
     "graph": cmd_graph,
