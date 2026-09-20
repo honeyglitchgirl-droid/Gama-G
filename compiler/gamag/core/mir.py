@@ -201,6 +201,10 @@ class Constraint:
     discharge: str = DISCHARGE_RUNTIME
     fault: str = "ContractViolation"
     pos: Optional[SourcePos] = None
+    #: How the status was obtained, in one line: what the prover established,
+    #: or the specific reason it declined.  `Selection.proof` is the same idea;
+    #: a status a reader cannot question is not worth recording.
+    proof: str = ""
 
 
 # ==========================================================================
@@ -444,7 +448,8 @@ class ConstraintGraph:
             lines.append(f"  {label}:")
             for c in group:
                 where = f" on {c.node}" if c.node else ""
-                lines.append(f"    {c.kind} `{c.text}`{where}")
+                why = f"  [{c.proof}]" if c.proof else ""
+                lines.append(f"    {c.kind} `{c.text}`{where}{why}")
         return lines
 
 

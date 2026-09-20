@@ -24,11 +24,11 @@ per target and computes no ratio between them.
 | | |
 |---|---|
 | date | 2026-09-20 |
-| toolchain | Gama-G 1.2.0 (GIR 1.0) |
+| toolchain | Gama-G 1.3.0 (GIR 1.0) |
 | host | x86_64, Linux sandbox, no other load reported |
 | interpreter | CPython 3.11.2 |
 | profile / optimization | strict, -O1 |
-| repeats | 5 measured after 1 warmup |
+| repeats | 9 measured after 1 warmup |
 | native backend | present for four of the sixteen programs; `cc -O2` |
 
 ## Reference interpreter
@@ -41,22 +41,29 @@ and identical across runs.
 
 | program | wall p50 (ms) | instructions |
 |---|---:|---:|
-| hello.gg | 0.54 | 214 |
-| medical_dosing.gg | 0.48 | 166 |
-| parallel_pipeline.gg | 0.81 | 140 |
-| policy_transaction_agent.gg | 1.88 | 223 |
-| property_tests.gg | 0.04 | 3 |
-| security_audit.gg | 0.52 | 96 |
-| self_healing_service.gg | 0.47 | 68 |
-| train_linear_model.gg | 60.37 | 6 097 |
-| core/classify.gg | 0.05 | 10 |
-| core/converge.gg | 0.17 | 80 |
-| core/custody.gg | 0.17 | 15 |
-| core/dose.gg | 0.09 | 15 |
-| core/ledger.gg | 0.21 | 14 |
-| core/recover.gg | 0.33 | 20 |
-| core/selection.gg | 0.08 | 12 |
-| core/traverse.gg | 0.11 | 43 |
+| hello.gg | 0.504 | 214 |
+| medical_dosing.gg | 0.423 | 166 |
+| parallel_pipeline.gg | 1.296 | 140 |
+| policy_transaction_agent.gg | 1.847 | 223 |
+| property_tests.gg | 0.056 | 3 |
+| security_audit.gg | 0.786 | 96 |
+| self_healing_service.gg | 0.420 | 68 |
+| train_linear_model.gg | 74.891 | 6 097 |
+| core/classify.gg | 0.041 | 10 |
+| core/converge.gg | 0.188 | 80 |
+| core/custody.gg | 0.170 | 15 |
+| core/dose.gg | 0.097 | 15 |
+| core/ledger.gg | 0.197 | 14 |
+| core/recover.gg | 0.323 | 20 |
+| core/selection.gg | 0.081 | 12 |
+| core/traverse.gg | 0.108 | 43 |
+
+**Every instruction count above is identical to the 1.2.0 baseline**, to the
+program, and that is the point of printing them: v1.3 added a build-time
+promise prover that discharges `holds` clauses, and the language it added
+instructions to is the compiler, not the program.  The wall column moved
+because it always moves; the instruction column is the one that would have
+caught a prover that decided to start optimising.
 
 (`property_tests.gg` reports the *entry* run only; `ggc test` executes its
 test functions separately, which is the `ggc test` path, not `main`.)
@@ -72,10 +79,10 @@ never divides them.
 
 | program | wall p50 (ms) | note |
 |---|---:|---|
-| hello.gg | 1.20 | compiled, ran, difftest-agreed |
-| core/classify.gg | 1.22 | compiled, ran, difftest-agreed |
-| core/converge.gg | 1.21 | compiled, ran, difftest-agreed |
-| core/traverse.gg | 1.19 | compiled, ran, difftest-agreed |
+| hello.gg | 1.302 | compiled, ran, difftest-agreed |
+| core/classify.gg | 1.231 | compiled, ran, difftest-agreed |
+| core/converge.gg | 1.198 | compiled, ran, difftest-agreed |
+| core/traverse.gg | 1.205 | compiled, ran, difftest-agreed |
 
 ## What a future baseline should measure instead
 

@@ -279,6 +279,50 @@ library modules.
 
 ---
 
+## v1.3: what the compiler can prove about a promise
+
+A `holds` clause used to be quoted when it broke and never consulted before the
+program ran.  `core/contractproof.py` now discharges the ones that need no run
+at all, by two arguments and nothing else:
+
+```sh
+$ ggc graph examples/core/recover.gg          # `holds checked > 0` — proven at compile time
+$ ggc check examples/core/dose.gg --smt dose.smt2
+```
+
+* **closed-form evaluation.**  A binding the graph gives exactly one value to
+  (`source reading : I64 from 72`, an operation that `computes reading`) has a
+  value the compiler knows, so `holds checked > 0` is *evaluated* — with the
+  runtime's own operators, on the values the runtime would have used;
+* **interval implication.**  Otherwise, one sized-integer binding under its
+  operation's `when` guard or under its type's own range: `holds u >= 0` for a
+  `U8` needs no analysis, and neither does `holds score > 0` under
+  `when score >= 75`.
+
+Division, standard-library calls, `state` bindings, refined bindings and float
+*ranges* are refused, each with the reason recorded next to the clause in
+`ggc graph`, in `--json`, and in `ggc doc`.  Floats are refused as ranges and
+accepted as values, which is the same distinction the guard prover draws: NaN
+destroys a covering argument and leaves an evaluation alone.  A clause the
+constants contradict earns a `W-contract-refuted` warning naming the value — and
+keeps its runtime check, because a proof is a reason to trust the program, not
+a reason to remove the boundary.
+
+What the prover leaves open, `ggc check --smt PATH` writes as SMT-LIB2
+obligations for a solver somebody else runs.  The toolchain never invokes a
+solver, never requires one, and treats an exported obligation as the unanswered
+question it is; clauses outside the Int/Bool fragment are emitted as comments
+saying they were not encoded rather than as guesses.
+
+The fuzzer was told.  `prover-is-sound` runs every generated program with a
+discharged promise and fails if that promise breaks; `proof-keeps-the-boundary`
+fails if a proof ever deletes its own `require`.  The core generator now emits
+`holds` clauses at all — without them both invariants would have been
+decoration, and `tools/fuzz_selfcheck.py` now catches seven injected bugs, two
+of them aimed at the prover.
+
+---
+
 ## v1.2: the developer surface
 
 A language is used through its tools, and the specification's section 31 lists
@@ -343,7 +387,7 @@ GIR the same machine serves the reference interpreter, a native CPU backend that
 emits C and compiles it to machine code, a WebAssembly encoder, and an
 accelerator layer.
 
-**628 tests pass**, and CI runs them on every push and pull request across
+**654 tests pass**, and CI runs them on every push and pull request across
 Python 3.9 - 3.13 (`.github/workflows/ci.yml`).  The native backend is
 validated by *differential testing*:
 the same program is run on the interpreter and on the compiled binary, and their
@@ -651,7 +695,7 @@ compiler/gamag/
 tools/bin/{ggc,ggtest}                     entry points
 examples/core/                             eight core programs
 examples/                                  eight v0.1 programs
-tests/                                     628 tests
+tests/                                     654 tests
 docs/ANALYSIS_AND_COMPARISON.md            what this is, against the languages
                                            it must compete with
 docs/BENCHMARK_BASELINE.md                 measured numbers, with their

@@ -48,6 +48,32 @@ BROKEN = [
     "match x\n",
 ]
 
+#: One core program carrying both halves of what the promise prover must get
+#: right: `k > 3` is true of the value the program fixes, and `b < 3` is false of
+#: it.  The compiler proves the first and refutes the second, and the runtime
+#: enforces both.  Those three facts are what the next two injections break.
+CONTRACTS = '''gama core 0.2
+intent Both
+    purpose   one promise kept and one broken
+
+source a : I64 from 5
+
+operation Kept
+    uses     a
+    yields   k : I64
+    effect   pure
+    holds    k > 3
+    computes a
+
+operation Broken
+    uses     a
+    yields   b : I64
+    effect   pure
+    holds    b < 3
+    computes a
+
+outcome k
+'''
 
 class Injection:
     """One deliberate bug, and the invariant that is supposed to catch it."""
@@ -207,6 +233,59 @@ def _inject_silent_rejection():
     return restore
 
 
+def _inject_prover_overclaims():
+    """The promise prover answers `proven` to everything.
+
+    This is the failure mode a static checker is feared for, and it is invisible
+    from outside: the program still compiles, still runs, and the only symptom is
+    that a fault the compiler had just certified is now a surprise.
+    `prover-is-sound` has to notice, because a discharged promise that breaks at
+    runtime is the definition of a wrong proof.
+    """
+    from gamag.core import contractproof
+    real = contractproof.prove
+
+    def trusting(expr, facts, **kwargs):
+        return contractproof.Verdict(
+            "proven", "injected: this prover believes any promise it is asked "
+                      "about")
+
+    contractproof.prove = trusting
+
+    def restore():
+        contractproof.prove = real
+    return restore
+
+
+def _inject_proof_removes_the_check():
+    """A discharged promise stops being enforced at run time.
+
+    The lowering is patched to skip the `Op.REQUIRE` for a `holds` the prover
+    established.  Nothing observable changes for a correct prover, which is what
+    makes this tempting and what makes it fatal: the day a proof is wrong, there
+    is no fault left to report.  `proof-keeps-the-boundary` is the invariant that
+    says a proof is a reason to trust the program, not a reason to remove the
+    boundary.
+    """
+    from gamag.core import mir as M
+    from gamag.core import native
+    real = native.Lowerer._constraints
+
+    def skipping(self, node):
+        kept = list(node.holds)
+        node.holds = [h for h in kept if h.discharge != M.DISCHARGE_PROVEN]
+        try:
+            return real(self, node)
+        finally:
+            node.holds = kept
+
+    native.Lowerer._constraints = skipping
+
+    def restore():
+        native.Lowerer._constraints = real
+    return restore
+
+
 INJECTIONS = [
     ("a diagnostic with no code", "diagnostic-has-a-code",
      ["broken"], _inject_missing_code),
@@ -218,6 +297,10 @@ INJECTIONS = [
      ["program"], _inject_crash),
     ("a rejection with no diagnostic", "compiles-or-explains",
      ["program"], _inject_silent_rejection),
+    ("a promise prover that believes everything", "prover-is-sound",
+     ["contracts"], _inject_prover_overclaims),
+    ("a proof that deletes its own runtime check", "proof-keeps-the-boundary",
+     ["contracts"], _inject_proof_removes_the_check),
 ]
 
 
@@ -227,6 +310,8 @@ def _sources(which):
         out.append((PROGRAM, "<injected-program>"))
     if "broken" in which:
         out.extend((text, "<injected-broken>") for text in BROKEN)
+    if "contracts" in which:
+        out.append((CONTRACTS, "<injected-contracts>"))
     return out
 
 
@@ -255,7 +340,7 @@ def main() -> int:
 
     # And the control: with nothing injected, the same inputs must be clean.
     clean = []
-    for source, origin in _sources(["program", "broken"]):
+    for source, origin in _sources(["program", "broken", "contracts"]):
         result = oracle.run_checks(source, path=origin, origin=origin, deep=True)
         for violation in result.violations:
             if violation.severity in ("crash", "wrong", "inconsistent"):

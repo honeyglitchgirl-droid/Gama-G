@@ -33,7 +33,7 @@ The per-milestone design notes remain as the record of how each part was built:
 honest status; `DESIGN_v1_0.md` is the consolidated design.
 
 Everything claimed below is exercised by the test suite (`python3 -m unittest
-discover -s tests`, **628 tests**) and demonstrated by a runnable example in
+discover -s tests`, **654 tests**) and demonstrated by a runnable example in
 `examples/` or `examples/core/`. Where a claim is partial, the missing part is
 named.
 
@@ -44,14 +44,14 @@ named.
 | | |
 |---|---|
 | Implementation language | Python 3.11+ (reference implementation) |
-| Compiler source | ~30,700 lines across 64 modules, plus a C runtime |
+| Compiler source | ~31,800 lines across 65 modules, plus a C runtime |
 | Standard library | 266 builtins across 27 modules |
 | Language surface | 23 hard keywords, 84 contextual keywords, 9 effects |
 | AST node types | 70 |
 | GIR operations | 41 |
-| Tests | 628 (all passing under `unittest discover`) |
+| Tests | 654 (all passing under `unittest discover`) |
 | Examples | 8 v0.1 + 8 core, each runnable with `ggc run` |
-| Language core | 8 modules, ~4,300 lines in `compiler/gamag/core/`; see §10–12 |
+| Language core | 10 modules, ~5,800 lines in `compiler/gamag/core/`; see §10–12 |
 | Formal models | memory · capability · recovery, one module each, plus a
   shared capability algebra; see §12 |
 | Licence | Apache-2.0 (`LICENSE`); version in `VERSION`, packaging in `pyproject.toml` |
@@ -164,7 +164,12 @@ Implemented and tested:
   the domain-less `for all x where …` form with deterministic sampling, and an
   optional `samples N`. `ggc test` exits non-zero on failure.
 - **§27 Contracts** — `requires`/`ensures` with the condition quoted verbatim in
-  the violation message.
+  the violation message.  For the **core**, a `holds` clause is now also
+  discharged at build time where the graph already entails it: closed-form
+  evaluation over constants, or interval implication over one sized-integer
+  binding (§10.4).  No obligation is removed by a proof, and the v0.1
+  `requires`/`ensures` are still checked at run time: discharging them means a
+  call-site pass, which is not built.
 - **§28 Standard library** — 27 modules, 266 builtins.
 
 ---
@@ -177,7 +182,7 @@ diff-testing).  The nine of spec section 31:
 
 | Command | Status |
 |---|---|
-| `ggc check` | **done** — diagnostics only, with `--profile` and `--json` |
+| `ggc check` | **done** — diagnostics only, with `--profile`, `--json`, and `--smt PATH` to write the obligations the promise prover could not settle as SMT-LIB2 (the toolchain never invokes a solver) |
 | `ggc build` | **done** — compiles to GIR, `--stats`, `-O0/1/2` |
 | `ggc run` | **done** — `--grant`, `--audit PATH`, `--entry`, `--lenient-runtime` |
 | `ggc test` | **done** — `--json`; exit code 4 on failure |
@@ -277,9 +282,14 @@ a pointer is not expressible, because a pointer Gama-G cannot verify is what
 database protocols beyond SQLite and a Python embedding API are not
 implemented.
 
-**Formal verification (§27) is contracts only.** `requires`/`ensures` are
-checked at run time and quoted in violations. There is no proof assistant, no
-SMT backend, no static verification of the contracts.
+**Formal verification (§27) is contracts only, and the contracts are verified
+only in part.** The core's `holds` clauses are discharged for two decidable
+shapes (§10.4) and exported as SMT-LIB2 text for everything else; the export is
+the only sense in which there is an "SMT backend" here, because no solver is
+invoked, required, or shipped, and an exported obligation is a question rather
+than a result. The v0.1 `requires`/`ensures` are still checked at run time and
+quoted in violations. There is no proof assistant, no interprocedural
+verification, and no static verification of the v0.1 surface.
 
 ---
 
@@ -505,6 +515,34 @@ float subjects, where NaN makes interval coverage a lie; guards reading more
 than one binding; function calls inside guards.  For those, the
 `NoActiveAlternative` fault still runs, which is precisely what recording
 `unprovable` promises.
+
+**The promise prover.**  Since v1.3 `core/contractproof.py` discharges a
+`holds` clause without running the program, by two exact arguments.
+*Closed-form evaluation*: a binding whose producer is a `source` with a literal
+origin or a single `computes` over such bindings has a known value, and a
+predicate over known values is evaluated with `runtime.ops`' own operators -- so
+floats are welcome here, because evaluating `72.0 > 0.0` makes no claim about
+the reals. *Interval implication*: otherwise, a clause over one sized-integer
+binding is compared against what the graph does fix for it -- the operation's
+`when` guard (the check is emitted inside the guarded block, so the guard is a
+legitimate assumption) and the binding's type bounds.
+Refused, and recorded as refused with the reason: `/`, `%`, `**` (the integer
+paths truncate, and a zero divisor faults), library calls, field and index
+reads, bindings with more than one producer, `state` bindings a `transition`
+may alter, refined bindings, and any *covering* argument over a float subject.
+A discharged clause keeps its `Op.REQUIRE`; a clause the constants contradict
+is reported as `W-contract-refuted` and still enforced. `ggc check --smt PATH`
+writes the unsettled obligations as SMT-LIB2 (`QF_LIA`) for a solver the user
+runs; the encoder covers sized integers and booleans and marks anything else
+`; not encoded`, because a solver handed a mis-encoded obligation answers it
+with confidence. Two fuzz invariants keep the prover honest: `prover-is-sound`
+(a discharged promise must not break at run time) and
+`proof-keeps-the-boundary` (a discharged promise must still have its check),
+and `tools/fuzz_selfcheck.py` injects a prover that believes everything and a
+lowering that trusts it.  It costs the compiler, not the program: one measure of
+one machine puts the whole pass at +0.15 ms per program over the sixteen
+examples, about 4% of a core compile -- a number that says nothing about your
+machine and is recorded only so that the cost of the feature is not a secret.
 
 **Not checked at all:** re-deriving an operation's declared `effect` from its
 own clauses rather than trusting the declaration.

@@ -20,7 +20,13 @@ then the v1.2 developer surface: all nine spec section 31 commands exist
 (`format`, `profile`, `doc` and `audit` joined the toolchain), the formatter
 carries a same-GIR safety proof, the package manager's resolver backtracks
 within a stated budget, and the core's selection guards are decided exactly
-inside a decidable fragment.  628 tests.  The native CPU backend emits C and
+inside a decidable fragment.  Then v1.3: `core/contractproof.py` discharges a
+`holds` promise at build time where the graph already entails it (constants, or
+one sized-integer binding under its guard), `ggc check --smt` exports the rest
+as SMT-LIB2 without ever invoking a solver, and the fuzzer gained two
+invariants that attack the prover -- `prover-is-sound` and
+`proof-keeps-the-boundary` -- with matching bug injections in the self-check.
+654 tests.  The native CPU backend emits C and
 compiles it; the WebAssembly encoder emits a module; the accelerator layer
 detects devices and refuses rather than falling back silently; the fuzzer
 finds real bugs and now holds a permanent formatter invariant; there is a

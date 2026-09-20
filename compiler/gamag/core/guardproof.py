@@ -179,6 +179,53 @@ def _covers_all(a: List[Interval], bounds: Tuple[int, int]) -> bool:
 
 
 # ----------------------------------------------------------------------
+# the same algebra, exposed: `contractproof.py` discharges promises with
+# these, so there is one interval implementation in the compiler and not two
+# ----------------------------------------------------------------------
+def region_of(expr: Optional[M.MExpr]) -> Optional[Tuple[Optional[str],
+                                                          List[Interval]]]:
+    """The exact region of a predicate, or None outside the fragment."""
+    return _region(expr)
+
+
+def intersect(a: List[Interval], b: List[Interval]) -> Optional[List[Interval]]:
+    """The intersection of two regions; None when this gives up (too many)."""
+    return _intersect_lists(a, b)
+
+
+def is_empty(region: List[Interval]) -> bool:
+    """True when a region contains no integer at all."""
+    merged = _merge(region)
+    return merged is not None and not merged
+
+
+def disjoint(a: List[Interval], b: List[Interval]) -> Optional[bool]:
+    """True when `a` and `b` share no integer; None when this gave up."""
+    inter = _intersect_lists(a, b)
+    return None if inter is None else not inter
+
+
+def within(a: List[Interval], b: List[Interval],
+           bounds: Tuple[int, int]) -> Optional[bool]:
+    """True when every integer of `a` is in `b`; None when this gave up.
+
+    Complement is taken over `bounds`, because that is the whole domain a
+    binding can hold: `x >= 0` does not contain `x > 0` over the integers, but
+    over U8 both sides mean the same set, and a proof needs the type.
+    """
+    outside = _complement(b, bounds)
+    if outside is None:
+        return None
+    inter = _intersect_lists(a, outside)
+    return None if inter is None else not inter
+
+
+def covers(a: List[Interval], bounds: Tuple[int, int]) -> bool:
+    """True when `a` contains every integer in `bounds`."""
+    return _covers_all(a, bounds)
+
+
+# ----------------------------------------------------------------------
 # expressions to regions
 # ----------------------------------------------------------------------
 def _lit_int(e: Optional[M.MExpr]) -> Optional[int]:

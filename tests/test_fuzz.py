@@ -268,21 +268,42 @@ class SelfCheck(unittest.TestCase):
     """The fuzzer must be able to fail.
 
     This is the test that keeps the other checks honest.  It runs the injection
-    harness, which breaks the product in five specific ways and asserts that
-    the corresponding invariant notices each one.  If any check is decoration,
+    harness, which breaks the product in one specific way per invariant and
+    asserts that the corresponding check notices.  If any check is decoration,
     this fails and says which.
     """
+
+    @staticmethod
+    def _declared_injections(script: str) -> int:
+        """How many bugs the harness says it injects, read from the harness.
+
+        Counting them here by hand would make this test fail for the wrong
+        reason the moment somebody adds an injection, and a test that fails for
+        the wrong reason is a test that gets ignored.
+        """
+        import ast
+        with open(script, encoding="utf-8") as handle:
+            tree = ast.parse(handle.read())
+        for node in tree.body:
+            if (isinstance(node, ast.Assign)
+                    and getattr(node.targets[0], "id", "") == "INJECTIONS"):
+                return len(node.value.elts)
+        raise AssertionError(f"no INJECTIONS list in {script}")
 
     def test_every_injected_bug_is_caught(self):
         script = os.path.join(REPO_ROOT, "tools", "fuzz_selfcheck.py")
         self.assertTrue(os.path.isfile(script), script)
+        count = self._declared_injections(script)
+        self.assertGreaterEqual(count, 5,
+                                "the harness has lost injections; each invariant "
+                                "needs a bug that would trip it")
         proc = subprocess.run([sys.executable, script], capture_output=True,
                               text=True, timeout=900)
         self.assertEqual(
             proc.returncode, 0,
             "the fuzzer failed to catch an injected bug:\n"
             + proc.stdout + proc.stderr)
-        self.assertIn("all 5 injected bugs were caught", proc.stdout)
+        self.assertIn(f"all {count} injected bugs were caught", proc.stdout)
         self.assertIn("control: nothing injected, nothing reported",
                       proc.stdout)
 

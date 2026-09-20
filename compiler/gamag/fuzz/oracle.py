@@ -538,6 +538,87 @@ def check_formatter_is_total(source: str, path: str = "<fuzz>",
     return out
 
 
+def check_prover_is_sound(source: str, path: str = "<fuzz>",
+                          origin: str = "", kind: str = "",
+                          max_steps: int = FUZZ_MAX_STEPS) -> List[Violation]:
+    """A promise the compiler discharged must not break when the program runs.
+
+    The contract prover records `proven` beside a `holds` clause it can
+    establish from the constants or the bounds the graph fixes.  That claim is
+    exact, which makes it checkable -- and a prover nobody attacks is a prover
+    nobody should trust.  Two directions are tested here:
+
+    * soundness: a run that fails with `ContractViolation` quoting a discharged
+      clause means the compiler proved something false;
+    * boundary: a discharged clause must still carry its `Op.REQUIRE`, because
+      the alternative is that a wrong proof turns a loud fault into a silent
+      wrong answer.  `native.capability_checks` says the rule -- a proof is a
+      reason to trust the program, not a reason to remove the check.
+    """
+    out: List[Violation] = []
+    try:
+        compilation = compile_source(source, path, profile="standard")
+    except BaseException:                            # noqa: BLE001
+        return out          # `compiles-or-explains` owns the crash report
+    if not compilation.ok:
+        return out
+    model = getattr(compilation, "core_model", None)
+    if model is None:
+        return out          # a v0.1 program carries no discharged promises
+    holds = [c for c in model.constraints.constraints if c.kind == "holds"]
+    proven = [c for c in holds if c.discharge == "proven"]
+    if not proven:
+        return out
+
+    emitted = set()
+    try:
+        for fn in compilation.program.functions.values():
+            for block in fn.blocks:
+                for instr in block.instrs:
+                    if str(instr.op).endswith("REQUIRE"):
+                        emitted.add(str(instr.meta.get("message", "")))
+    except BaseException as exc:                     # noqa: BLE001
+        out.append(Violation("proof-keeps-the-boundary", "crash",
+                             f"reading the emitted IR failed: "
+                             f"{type(exc).__name__}: {exc}", source, origin,
+                             kind, traceback=_tb(exc)))
+        return out
+    for clause in proven:
+        want = f"holds `{clause.text}`"
+        if want not in emitted:
+            out.append(Violation(
+                "proof-keeps-the-boundary", "wrong",
+                f"`{clause.node}` discharged `holds {clause.text}` and the "
+                f"check is no longer in the program: {clause.proof}",
+                source, origin, kind))
+
+    buffer = io.StringIO()
+    try:
+        context = Context(grants=program_grants(compilation), stdout=buffer,
+                          seed=0, deterministic=True, max_steps=max_steps)
+        execution = execute(compilation, entry=find_entry(compilation) or "main",
+                            context=context, grants=())
+    except BaseException:                            # noqa: BLE001
+        return out          # `runs-or-faults` owns this program's failure
+    fault = execution.fault
+    if fault is None or type(fault).__name__ != "ContractViolation":
+        return out
+    text = str(fault)
+    # ambiguous clause text is not a contradiction: two operations can promise
+    # the same words and only one of them is discharged
+    ambiguous = {c.text for c in holds if c.discharge != "proven"}
+    for clause in proven:
+        if clause.text in ambiguous:
+            continue
+        if clause.text in text:
+            out.append(Violation(
+                "prover-is-sound", "wrong",
+                f"the program broke a promise the compiler had discharged: "
+                f"`holds {clause.text}` on `{clause.node}` -- {clause.proof}",
+                source, origin, kind))
+    return out
+
+
 def run_checks(source: str, *, path: str = "<fuzz>", origin: str = "",
                kind: str = "", deep: bool = True,
                timeout: float = 10.0,
@@ -576,4 +657,6 @@ def run_checks(source: str, *, path: str = "<fuzz>", origin: str = "",
         out.extend(check_optimizer_preserves_behavior(source, path,
                                                       origin=origin, kind=kind,
                                                       max_steps=max_steps))
+        out.extend(check_prover_is_sound(source, path, origin=origin,
+                                        kind=kind, max_steps=max_steps))
     return RunResult(verdict, out)

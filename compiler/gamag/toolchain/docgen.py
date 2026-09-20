@@ -290,7 +290,9 @@ def _render_core(compilation: Any, docs: Dict[int, str],
             mark = ("proven at compile time"
                     if getattr(h, "discharge", "") == "proven"
                     else "checked at run time")
-            lines.append(f"- holds `{h.text}` ({mark})")
+            why = getattr(h, "proof", "")
+            lines.append(f"- holds `{h.text}` ({mark}"
+                         + (f": {why}" if why else "") + ")")
         if node.when is not None:
             lines.append(f"- when `{node.when.text}`")
         lines.append("")

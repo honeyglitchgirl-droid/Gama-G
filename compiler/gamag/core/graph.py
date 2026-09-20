@@ -34,6 +34,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from ..diagnostics import DiagnosticBag, Phase
 from . import capability as CAP
+from . import contractproof
 from . import guardproof
 from . import mir as M
 from . import recovery as REC
@@ -90,8 +91,21 @@ class ModelBuilder:
         if self.bag.ok:
             self._order()
         self._constraints()
+        if self.bag.ok:
+            self._discharge()
         self._recovery()
         return self.model
+
+    # ------------------------------------------------------------------
+    def _discharge(self) -> None:
+        """Ask whether each `holds` can be established without running.
+
+        Two exact arguments are available: evaluation of a clause whose leaves
+        are constants the graph fixes, and interval implication for one sized
+        integer binding under the operation's own `when`.  Anything else keeps
+        its runtime check, with the reason it was not proved written beside it.
+        """
+        contractproof.discharge(self.model, warn=self.warn)
 
     # ------------------------------------------------------------------
     def _collect(self) -> None:
@@ -578,6 +592,12 @@ class ModelBuilder:
                            if selection.proven_exhaustive
                            and selection.proven_exclusive
                            else M.DISCHARGE_UNPROVABLE),
+                proof=(selection.proof or
+                       "the two guards are written as complements of each other"
+                       if selection.proven_exhaustive and
+                       selection.proven_exclusive else
+                       "no argument here settles coverage or exclusivity, so "
+                       "the fault stays"),
                 fault=selection.fallback_fault,
                 pos=self.model.operations.nodes[selection.members[0]].pos))
 

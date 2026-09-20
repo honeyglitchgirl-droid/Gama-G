@@ -66,6 +66,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("check", help="type-check and report diagnostics")
     add_common(p)
+    p.add_argument("--smt", metavar="PATH",
+                   help="write the obligations this compiler could not settle "
+                        "to PATH as SMT-LIB2, for a solver you run yourself "
+                        "(ggc never invokes a solver)")
 
     p = sub.add_parser(
         "format",
@@ -440,6 +444,54 @@ def cmd_check(args: argparse.Namespace) -> int:
         else:
             print(f"{compilation.path}: {errors} error"
                   f"{'s' if errors != 1 else ''}", file=sys.stderr)
+    if getattr(args, "smt", None):
+        return _write_smt(compilations, args.smt, status)
+    return status
+
+
+def _write_smt(compilations: Sequence[Compilation], path: str,
+               status: int) -> int:
+    """Export the unsettled obligations of every core program compiled here.
+
+    One file when one program was checked, one per program otherwise: an
+    obligation belongs to a program, and concatenating them under one name
+    would invite a solver's answer to be read against the wrong question.
+    """
+    targets = [c for c in compilations
+               if c.ok and getattr(c, "core_model", None) is not None]
+    if not targets:
+        print("ggc: --smt writes the obligations of a core program, and none "
+              "of these compiled to one.  A v0.1 source carries its contracts "
+              "as clause text on its functions, which the export does not "
+              "interpret.", file=sys.stderr)
+        return status if status != EXIT_OK else EXIT_USAGE
+    from ..core import contractproof
+    root, ext = os.path.splitext(path)
+    total = skipped = 0
+    for compilation in targets:
+        text = contractproof.to_smtlib2(compilation.core_model)
+        skipped += text.count("; not encoded")
+        stem = os.path.splitext(os.path.basename(compilation.path))[0]
+        here = path if len(targets) == 1 else f"{root}-{stem}{ext or '.smt2'}"
+        try:
+            with open(here, "w", encoding="utf-8") as handle:
+                handle.write(text)
+        except OSError as exc:
+            print(f"ggc: cannot write {here}: {exc}", file=sys.stderr)
+            return EXIT_USAGE
+        asked = text.count("(check-sat)")
+        total += asked
+        print(f"{compilation.path}: {asked} verification condition(s) "
+              f"exported to {here}; {skipped} clause(s) outside the Int/Bool "
+              f"fragment are recorded as comments, not guesses")
+    if total == 0 and skipped == 0:
+        print("nothing to export: every `holds` in these programs was settled "
+              "by the prover -- a count of zero is not a proof of anything "
+              "beyond that")
+    elif total == 0:
+        print(f"no obligation could be encoded; {skipped} clause(s) sit outside "
+              f"the Int/Bool fragment, and a solver handed a clause it was "
+              f"never told the meaning of would answer with confidence")
     return status
 
 
@@ -539,7 +591,8 @@ def cmd_graph(args: argparse.Namespace) -> int:
                     for binding, sel in sorted(graph.selections.items())},
                 "constraints": [
                     {"kind": c.kind, "text": c.text, "node": c.node,
-                     "discharge": c.discharge, "fault": c.fault}
+                     "discharge": c.discharge, "fault": c.fault,
+                     **({"proof": c.proof} if getattr(c, "proof", "") else {})}
                     for c in model.constraints.constraints],
                 "authority": {
                     "held": model.authority.held,

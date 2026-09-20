@@ -28,7 +28,8 @@ Stripped to its architecture, Gama-G is four ideas stacked:
 4. **Verifiable artefacts.**  A hash-chained signed audit trail, reproducible
    signed builds, differential testing of every backend against the
    reference interpreter, and a fuzzer whose invariants are permanent tests
-   (`compiles-or-explains`, `file-path-is-total`, `formatter-is-total`, …).
+   (`compiles-or-explains`, `file-path-is-total`, `formatter-is-total`,
+   `prover-is-sound`, …).
 
 The whole is a **vertical slice of a specification** (`Gama-G_v1.0_Production_
 Specification.txt`, Phases 0-7) -- a complete front end, one native backend
@@ -49,7 +50,7 @@ offer:
 | One capability algebra on both sides of the compile/run boundary | seL4/capsicum capabilities are OS-level; language capability systems (Joe-E, E) are research | the *same function* (`capabilities.py::covers`) answers "may I prove this call" and "may this runtime check pass"; attenuation can never amplify |
 | Secrets as a type with custody states | no mainstream equivalent; `const`/private fields are visibility, not flow | `secret T` taints through computation; rendering needs `secrets.expose(value, reason)` under a granted `SecretExpose`, and the exposure is written to the trail |
 | Audited recovery as syntax | Erlang/OTP supervision: process-level, policy in `restart: temporary` atoms | six escalation levels, named checkpoints, policy lowered *as* a policy, every action in the trail with level and outcome |
-| Contract text quoted verbatim in violations | Dafny/SPARK prove instead of quoting; Python `assert` disappears with `-O` | the failure message is the program's own words at the position the compiler recorded |
+| Contract text quoted verbatim in violations | Dafny/SPARK prove instead of quoting; Python `assert` disappears with `-O` | the failure message is the program's own words at the position the compiler recorded -- and since v1.3 the promise is *discharged first* where the graph already entails it, with the reason it could not be discharged kept beside the clause |
 
 No mainstream language ships all seven.  Several ship none.
 
@@ -80,6 +81,13 @@ weaknesses, each one checkable in this repository:
   (v1.0) but not a soul: the core has no modules, no generics, no
   user-defined types; v0.1 is the conventional language the audits judged
   "not original".  Maintaining both is real cost.
+* **Contract verification is partial by construction.**  `core/contractproof.py`
+  discharges a `holds` over constants or over one sized-integer binding under
+  its guard; it refuses division, library calls, `state`, refined bindings and
+  any covering argument over a float, and it never deletes the runtime check.
+  There is no interprocedural analysis, so v0.1 `requires`/`ensures` remain
+  runtime-only, and the SMT-LIB2 export is a question handed to a solver this
+  toolchain does not run.
 * **No IDE story.**  There is no language server, no incremental parse,
   and the parser's nesting limit (≈52 levels) is a compiler-robustness
   virtue that is an editor latency nightmare if anyone ever wraps it in a
@@ -179,11 +187,15 @@ What Gama-G adds over SPARK is the program *shape* (derived order, bounded
 repetition as the only loop), capabilities as first-class typed handles,
 and the audit trail as a language artifact rather than a logging practice.
 What SPARK adds is: it exists in the world, provably, with proof
-obligations discharged by SMT backends -- Gama-G's proofs are structural
-(guard intervals, graph properties, slot overlaps), not arithmetic over
-user data; `requires` are *runtime-checked*, not statically verified.  That
-is the largest single gap between "contract language" and "verified
-language", and no document can argue it away: it needs a solver.
+obligations discharged by SMT backends.  Gama-G's proofs were purely
+structural until v1.3 (guard intervals, graph properties, slot overlaps) and
+its `holds` clauses were quoted at failure rather than checked at build.  The
+gap has narrowed and remains: `core/contractproof.py` decides a `holds` over
+constants or over one sized-integer binding under its guard, and exports the
+rest as SMT-LIB2 for a solver Gama-G does not run; SPARK's `depends` clauses,
+pointer freedom and interprocedural proofs are still theirs alone, and v0.1
+`requires` are still runtime-checked.  No document can argue the rest away: it
+needs a solver, and then a call-site analysis behind it.
 
 ### 2.7 vs Koka / effect systems, and Lean / Coq
 
@@ -197,8 +209,11 @@ discharges goals no one is typing at that level of ceremony for
 application code; Gama-G's bet is that the *useful* 20% (guard
 partitions, capability coverage, loop bounds, dependency honesty, secret
 flow) can ride in the syntax of an ordinary-looking language.  A future
-where `holds` obligations export to SMT or Lean (spec §27's "formal
-verification is contracts only") is the bridge neither side has built.
+the export from `holds` obligations to SMT or Lean (spec §27's "formal
+verification is contracts only") is the bridge neither side has built -- v1.3
+laid the first plank, an SMT-LIB2 `QF_LIA` export of every obligation the
+built-in prover could not settle, and stopped short of invoking a solver or
+pretending a `; not encoded` comment is a proof.
 
 ### 2.8 vs Erlang/Elixir
 
@@ -227,7 +242,7 @@ BEAM replacement".
 | secrets as a flow-checked type | ✗ | ✗ | ✗ | ✗ | ✗ | ◐ (flow in SPARK) | ✗ | ✗ | ● |
 | audited trail in-language | ✗ | ✗ | ✗ | ✗ | ✗ | ◐ | ✗ | ◐ (lager) | ● |
 | recovery as syntax with levels | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ◐ | ● |
-| contracts statically discharged | ✗ | ✗ | ✗ | ✗ | ✗ | ● | ✗ | ✗ | ✗ runtime-checked |
+| contracts statically discharged | ✗ | ✗ | ✗ | ✗ | ✗ | ● | ✗ | ✗ | ◐ core `holds`: constants + one-interval guards; v0.1 runtime-checked |
 | one canonical formatter | ● rustfmt | ● | ◐ (black, not universal) | ◐ prettier | ● | ◐ | ◐ | ✗ | ● (same-GIR proof) |
 | native performance backends | ● LLVM | ● | ◐ (depends) | ◐ (JS) | ● LLVM | ● GNAT | ◐ | ● BEAM | ◐ subset C |
 | package ecosystem | ● crates | ● modules | ● PyPI | ● npm | ◐ | ◐ | ○ | ● hex | ○ none |
@@ -251,12 +266,15 @@ order:
    audit chain and `CAP_CHECK` in the C runtime (SHA-256 + HMAC are already
    specced in the Python side), keep the refuse-by-name discipline for the
    rest.  *Open; the largest single item.*
-2. **Static discharge for `requires`/`ensures`.**  Contracts are the
-   feature every adjacent language half-has; exporting the obvious ones to
-   an SMT solver (integer bounds, guard partitions -- the prover's
-   interval algebra already exists for selection proofs) turns "quoted at
-   failure" into "proved at build", the SPARK tier.  *Open; the
-   differentiator with the clearest path.*
+2. ~~**Static discharge for `requires`/`ensures`.~~  **The core's `holds` is
+   done in v1.3** (`core/contractproof.py`): closed-form evaluation over the
+   constants the graph fixes, interval implication for one sized-integer binding
+   under its own `when` or its type's range, `W-contract-refuted` when the
+   constants contradict the promise, and an SMT-LIB2 export of what is left.  No
+   proof removes a runtime check.  What remains is the wider half: interprocedural
+   discharge of v0.1 `requires`/`ensures` (they are verbatim clause text on a
+   function, so this needs a call-site pass) and division/calls/state in the
+   prover's fragment.  *Partly open.*
 3. **A language server.**  The checker already accumulates every diagnostic
    in a file rather than stopping at the first -- that is a half-written LSP
    backend.  Nobody adopts a language their editor cannot talk to.
@@ -297,8 +315,11 @@ the compiler's own semantics.  Its current form is the best possible
 backends, permanent fuzz invariants, and documentation that says what it
 does not do.
 
-Whether it becomes competitive depends on items 1-3: **native enforcement,
-real proofs for contracts, and a language server.**  Those three move the
+Whether it becomes competitive depends on items 1 and 3 -- **native enforcement
+and a language server**.  Item 2, real proofs for the contracts, started in
+v1.3: the core's `holds` is now discharged where it is decidable, which is
+exactly the half of the argument a reference compiler can carry alone; the rest
+of it is a solver, an ecosystem to run one over, and a second implementation.  Those three move the
 same guarantees from "checked in a reference interpreter" to "enforced in
 production and felt while typing" -- and production enforcement plus editor
 feel is exactly where the incumbent languages are weak or absent, which is

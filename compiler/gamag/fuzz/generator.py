@@ -115,6 +115,29 @@ def _expression(rng: random.Random, ty: str,
                            b=_operand(rng, ty, names))
 
 
+#: A promise about a binding of this type, in the language's own syntax.  The
+#: generator emits one about half the time: `holds` is otherwise a construct
+#: the campaign never touches, and the promise prover added in v1.3 is exactly
+#: the kind of component that needs someone trying to catch it out.
+CORE_PROMISES: Dict[str, Tuple[str, ...]] = {
+    "I64": ("{n} >= 0", "{n} > -1000", "{n} != 0", "{n} <= 1000000"),
+    "F64": ("{n} > 0.0", "{n} >= -1.0", "{n} != 0.0"),
+    "Bool": ("{n}", "not ({n})"),
+    "Text": ('{n} != ""', "{n} == \"\""),
+}
+
+
+def _promise(rng: random.Random, ty: str, name: str) -> str:
+    """A `holds` clause about `name`, chosen to be satisfiable but not always true.
+
+    Deliberately not always true: a corpus of promises that all hold would let a
+    prover that says `proven` to everything pass the campaign, which is the one
+    bug class this construct can have.
+    """
+    choices = CORE_PROMISES.get(ty) or ("{n}",)
+    return rng.choice(choices).format(n=name)
+
+
 def generate_core(rng: random.Random, *, operations: Optional[int] = None,
                   with_state: bool = False,
                   with_selection: bool = False) -> Generated:
@@ -144,6 +167,10 @@ def generate_core(rng: random.Random, *, operations: Optional[int] = None,
             lines.append(f"    uses     {', '.join(uses)}")
         lines.append(f"    yields   {name} : {ty}")
         lines.append(f"    effect   {rng.choice(CORE_EFFECTS)}")
+        if rng.random() < 0.5:
+            promise = _promise(rng, ty, name)
+            lines.append(f"    holds    {promise}")
+            notes.append(f"promises `{promise}`")
         lines.append(f"    computes {_expression(rng, ty, bindings)}")
         bindings.append((name, ty))
         yields.append(name)
