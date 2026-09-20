@@ -33,7 +33,7 @@ The per-milestone design notes remain as the record of how each part was built:
 honest status; `DESIGN_v1_0.md` is the consolidated design.
 
 Everything claimed below is exercised by the test suite (`python3 -m unittest
-discover -s tests`, **548 tests**) and demonstrated by a runnable example in
+discover -s tests`, **628 tests**) and demonstrated by a runnable example in
 `examples/` or `examples/core/`. Where a claim is partial, the missing part is
 named.
 
@@ -44,12 +44,12 @@ named.
 | | |
 |---|---|
 | Implementation language | Python 3.11+ (reference implementation) |
-| Compiler source | ~19,400 lines across 37 modules |
-| Standard library | 215 builtins across 18 modules |
+| Compiler source | ~30,700 lines across 64 modules, plus a C runtime |
+| Standard library | 266 builtins across 27 modules |
 | Language surface | 23 hard keywords, 84 contextual keywords, 9 effects |
 | AST node types | 70 |
 | GIR operations | 41 |
-| Tests | 501 (all passing under `unittest discover`) |
+| Tests | 628 (all passing under `unittest discover`) |
 | Examples | 8 v0.1 + 8 core, each runnable with `ggc run` |
 | Language core | 8 modules, ~4,300 lines in `compiler/gamag/core/`; see §10–12 |
 | Formal models | memory · capability · recovery, one module each, plus a
@@ -165,13 +165,15 @@ Implemented and tested:
   optional `samples N`. `ggc test` exits non-zero on failure.
 - **§27 Contracts** — `requires`/`ensures` with the condition quoted verbatim in
   the violation message.
-- **§28 Standard library** — 18 modules, 215 builtins.
+- **§28 Standard library** — 27 modules, 266 builtins.
 
 ---
 
 ## 4. Toolchain (spec §31)
 
-`ggc` implements five of the nine commands the spec lists:
+`ggc` implements **all nine commands the spec lists**, plus six the audits
+asked for (build inspection, backends, fuzzing, packaging, signing,
+diff-testing).  The nine of spec section 31:
 
 | Command | Status |
 |---|---|
@@ -179,17 +181,17 @@ Implemented and tested:
 | `ggc build` | **done** — compiles to GIR, `--stats`, `-O0/1/2` |
 | `ggc run` | **done** — `--grant`, `--audit PATH`, `--entry`, `--lenient-runtime` |
 | `ggc test` | **done** — `--json`; exit code 4 on failure |
-| `ggc explain` | **done** — a diagnostic, a decision, or the standard library |
-| `ggc audit` | **not done** as a subcommand; `--audit PATH` on `run` writes and verifies the trail |
-| `ggc bench` | **not done** — see §6 |
-| `ggc profile` | **not done** |
-| `ggc format` / `ggc doc` | **not done** |
+| `ggc audit` | **done** — `audit verify` recomputes every digest and every link of a written trail, offline, and `audit show` prints it; signature checking runs when `--key` supplies the deployment key, and the output says which mode ran |
+| `ggc bench` | **done** — §6; a published baseline is in `docs/BENCHMARK_BASELINE.md` |
+| `ggc profile` | **done** — per-function calls, instructions and inclusive time, counted by the interpreter itself; instruction totals agree with the VM's own counters, and the table goes to stderr so the program's own output stays on stdout |
+| `ggc format` | **done** — canonical layout with a **same-GIR safety proof**: every rewrite is compiled before and after and compared apart from positions, so a formatting that would change a program is refused, never applied; clause bodies (quoted verbatim by failures) are never re-spaced; idempotent, and all sixteen examples are already canonical |
+| `ggc doc` | **done** — markdown for a program (including what the checker derived: levels, authority, selection proofs) and for the standard library, rendered from the same registration table the checker reads |
 
 Exit codes: `0` success, `1` compile error, `2` runtime fault, `3` usage,
 `4` test failure.
 
-A test asserts that the unimplemented commands are *absent* rather than present
-and broken, so they cannot silently start pretending to work.
+The vocabulary test keeps a `ROADMAP_COMMANDS` guard -- empty now, but the
+mechanism stands so a command can never be *claimed* before it is *built*.
 
 ---
 
@@ -233,9 +235,11 @@ dependency on it. The test suite passes either way.
 **The package manager does not reach the network.** `gpm` resolves, locks,
 verifies and audits, but a registry is a directory of packages rather than a
 server, which makes the offline cache and a private registry the same mechanism.
-Resolution is a fixed point *without backtracking*: a graph that can only be
-satisfied by choosing below the highest satisfying version of something is
-reported as a conflict rather than guessed at. Signing is Ed25519, implemented
+Resolution is a fixed point with a bounded backtracking search around it: a
+graph satisfiable only below the highest satisfying version of something now
+resolves, deterministically, and a graph beyond the search budget is still
+reported as a named conflict rather than guessed at (see `gpm/package.py` for
+why *bounded* is the honest word for an NP-complete subproblem). Signing is Ed25519, implemented
 from RFC 8032 and validated against the RFC's vectors; it is **not
 constant-time**, so it must not be used where an attacker can measure signing
 time.
@@ -409,7 +413,9 @@ rather than behind the v0.1 surface.
    category but generates nothing.
 6. **FHIR and database modules** (§16, §17) — the two declared-unimplemented
    modules with the clearest demand.
-7. **Benchmarking** (§24) — only meaningful once (2) exists.
+7. ~~**Benchmarking** (§24)~~ — **done**: `ggc bench` measures with its
+   conditions, and `docs/BENCHMARK_BASELINE.md` publishes a baseline.  A
+   compute-bound corpus with a tail is the open improvement (§5, baseline doc).
 
 ---
 
@@ -483,15 +489,25 @@ plus types, arity, library signatures, effect coverage and secret propagation,
 all checked natively by `core/native.py`.
 
 Checked only at run time: data-dependent constraints, selections whose guards
-were not provably complementary, and refinements that reach their bound.
+fall outside the prover's fragment, and refinements that reach their bound.
 
-**Not checked at all:** exhaustiveness for more than two alternatives (the
-compiler records the constraint's discharge as `unprovable` and relies on the
-runtime fault —
-proving it over arbitrary predicate sets is a decision problem, and claiming
-otherwise would be exactly the kind of claim §6 of this document forbids); and
-re-deriving an operation's declared `effect` from its own clauses rather than
-trusting the declaration.
+**The selection decision procedure.**  A `when`-guarded selection used to be
+provable only for two guards that were complements in *spelling*.  Since v1.2
+`core/guardproof.py` decides exhaustiveness and exclusivity **exactly** for
+the decidable fragment: boolean combinations (`and`, `or`, `not`) of
+comparisons of one sized-integer binding against integer constants, computed
+as finite unions of integer intervals.  A three-way partition
+(`a >= 90` / `a >= 75 and a < 90` / `a < 75`) is now `proven`, recorded with
+the proof note the `ggc graph` and `ggc doc` output show, and the recovery
+graph carries no obligation for it.  Constant guards (`true`, `false`) are
+decided too.  What stays `unprovable` is stated rather than discovered:
+float subjects, where NaN makes interval coverage a lie; guards reading more
+than one binding; function calls inside guards.  For those, the
+`NoActiveAlternative` fault still runs, which is precisely what recording
+`unprovable` promises.
+
+**Not checked at all:** re-deriving an operation's declared `effect` from its
+own clauses rather than trusting the declaration.
 
 ### 10.5 What the core does not do
 

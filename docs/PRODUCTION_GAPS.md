@@ -15,12 +15,17 @@ nowhere outside this file.  What follows is where it lacks.
 
 ## 1. What is built
 
-All eleven remaining audit priorities (P3 - P16) plus the version merge: one
-language, one pipeline, four ways to run it, 548 tests.  The native CPU backend
-emits C and compiles it; the WebAssembly encoder emits a module; the
-accelerator layer detects devices and refuses rather than falling back
-silently; the fuzzer finds real bugs; there is a package manager, a signing
-tool, an FFI, three interoperability modules and five enterprise modules.
+All eleven remaining audit priorities (P3 - P16) plus the version merge, and
+then the v1.2 developer surface: all nine spec section 31 commands exist
+(`format`, `profile`, `doc` and `audit` joined the toolchain), the formatter
+carries a same-GIR safety proof, the package manager's resolver backtracks
+within a stated budget, and the core's selection guards are decided exactly
+inside a decidable fragment.  628 tests.  The native CPU backend emits C and
+compiles it; the WebAssembly encoder emits a module; the accelerator layer
+detects devices and refuses rather than falling back silently; the fuzzer
+finds real bugs and now holds a permanent formatter invariant; there is a
+package manager, a signing tool, an FFI, three interoperability modules and
+five enterprise modules.
 
 That is a vertical slice of a specification whose own scope is Phases 0 - 7.
 The gap between the two is the subject of this document.
@@ -150,10 +155,16 @@ one is already stated in `docs/DESIGN_v1_0.md` section 5.
   against an attacker who can measure timing.  Use an audited library.
 - **No WebAssembly module has ever been executed** and **no accelerator kernel
   has ever run**.  Both are structurally verified only.  `ggc wasm` says so.
-- **The package manager has no network and its resolver does not backtrack**, so
-  a satisfiable graph can be reported as a conflict rather than guessed at.
-- **`http`, `process`, `accelerator` and `identity_provider` are roadmap**, and
-  `ggc format`, `ggc profile` and `ggc doc` do not exist.
+- **The package manager has no network.**  Its resolver now backtracks --
+  deterministically, in sorted order, inside `MAX_SEARCH_NODES` and
+  `MAX_SEARCH_DEPTH` bounds -- so graphs that need a version below the
+  highest satisfying one resolve; a graph whose solution lies past the
+  budget is still reported as a named conflict rather than guessed at.
+- **`http`, `process`, `accelerator` and `identity_provider` are roadmap.**
+  The commands are no longer: `ggc format`, `ggc profile` and `ggc doc`
+  exist as of v1.2; what remains open about them is depth, not presence
+  (`profile` reports the interpreter, not a sampling profiler of the native
+  binary; `doc` documents declarations, with no cross-file index).
 - **Interop covers FHIR, terminology, provenance and consent**, not the wider
   specification surface.
 
@@ -172,10 +183,14 @@ one is already stated in `docs/DESIGN_v1_0.md` section 5.
 - **Fuzzing is hours, not sustained.**  Campaigns found real bugs; a campaign
   that ran for a weekend would find more, and "no violations in 60 rounds" is
   not "no violations".
-- **No performance baseline.**  The interpreter is a tree-walking evaluator in
-  CPython and no measurement against any other implementation is claimed.
-- **Sixteen examples, no releases, no versioned artifacts.**  v1.0.1 is the
-  first tagged state, and package metadata still says Alpha.
+- **A baseline exists; a corpus does not.**  `docs/BENCHMARK_BASELINE.md`
+  publishes the measurements with their conditions, but every program in it
+  is small enough that process startup dominates; the honest portable column
+  is the instruction count, and the compute-bound corpus with a tail that
+  would make the wall-clock column mean something is still to be built.  No
+  measurement against any other implementation is claimed.
+- **Sixteen examples, no releases, no versioned artifacts.**  No tag has been
+  pushed, and package metadata still says Alpha.
 
 ---
 
@@ -195,7 +210,8 @@ In rough order of return on effort:
 4. An independent conformance test suite that reads the specification rather
    than the implementation.
 5. Constant-time crypto, or removal of crypto from the shipped surface.
-6. A benchmark baseline, published with its conditions.
+6. ~~A benchmark baseline, published with its conditions.~~ -- **done** as
+   `docs/BENCHMARK_BASELINE.md`, including what it does not measure.
 7. Releases, and the metadata to match.
 
 None of that is a weekend.  Naming it is the point: the toolchain is honest

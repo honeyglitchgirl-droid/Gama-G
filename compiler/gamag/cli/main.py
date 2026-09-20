@@ -918,8 +918,11 @@ def cmd_explain(args: argparse.Namespace) -> int:
             "only meaningful in non-deterministic mode.",
             "Capability handles returned by `capabilities.open` are typed "
             "Any, so the checker cannot verify their permissions statically.",
-            "There is no native codegen backend; GIR runs on the reference "
-            "interpreter.",
+            "The native backend compiles a subset; programs using the audit "
+            "chain, capabilities, transactions, checkpoints, recovery "
+            "regions, tensors, autodiff, agents, method dispatch or "
+            "indirect calls are refused by name and run on the reference "
+            "interpreter. See `ggc difftest --show-refused`.",
         ],
     }
     print(json.dumps(gaps, indent=2) if args.json else

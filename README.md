@@ -279,6 +279,56 @@ library modules.
 
 ---
 
+## v1.2: the developer surface
+
+A language is used through its tools, and the specification's section 31 lists
+nine `ggc` commands.  As of this release all nine exist; five were roadmap:
+
+```sh
+$ ggc format examples/core/dose.gg        # canonical layout, like gofmt
+$ ggc format --check examples/            # CI gate: exit 1 if not canonical
+$ ggc profile examples/hello.gg           # calls, instructions, time per fn
+$ ggc doc examples/core/dose.gg           # markdown, incl. what the checker derived
+$ ggc doc --stdlib --module medical       # stdlib docs from the checker's table
+$ ggc audit verify trail.jsonl            # the reader's side of the hash chain
+```
+
+The formatter's contract is the compiler's, because indentation is syntax
+here: **a rewrite must compile to the same program.**  Every run of `ggc
+format` compiles the source before and after, and compares their GIR apart
+from positions; a file whose formatting would change its meaning is refused
+with a message, never rewritten.  Clause bodies — the text a failing `holds`
+quotes in the program's own words — are never re-spaced at all.  All sixteen
+shipped examples are canonical: `ggc format --check` passes over the tree,
+formatting is idempotent, and a permanent fuzz invariant
+(`formatter-is-total`) tries to prove otherwise with generated programs.
+
+The profiler counts inside the VM itself: instruction totals are exact and
+agree with the interpreter's own counters; times are inclusive wall clock and
+labelled as one measurement of one machine.
+
+The guard prover (`compiler/gamag/core/guardproof.py`) is a language-level
+improvement: selections of `when`-guarded operations were provable exclusive
+and exhaustive only for two syntactically complementary guards, and recorded
+`unprovable` beyond that.  Now the compiler *decides* the question exactly for
+guards built from comparisons of one sized-integer binding against integer
+constants, combined with `and`/`or`/`not` — so a three-way triage band
+(`a >= 90` / `a >= 75 and a < 90` / `a < 75`) is proven at compile time.
+Floats stay unprovable — NaN makes interval coverage a lie over the reals —
+and the runtime fault still runs wherever the proof does not.
+
+`gpm` resolves with bounded backtracking: a graph that can only be satisfied
+*below* the highest satisfying version of something now resolves, deterministically
+(sorted packages, descending versions), and a graph beyond the search budget is
+still reported as a named conflict rather than guessed at.
+
+[`docs/ANALYSIS_AND_COMPARISON.md`](docs/ANALYSIS_AND_COMPARISON.md) places
+this toolchain against Rust, Go, Python, TypeScript, Zig, Ada/SPARK and the
+proof assistants, and [`docs/BENCHMARK_BASELINE.md`](docs/BENCHMARK_BASELINE.md)
+records the current measurements with their conditions.
+
+---
+
 ## Status
 
 This repository is a **working vertical slice** of
@@ -293,7 +343,7 @@ GIR the same machine serves the reference interpreter, a native CPU backend that
 emits C and compiles it to machine code, a WebAssembly encoder, and an
 accelerator layer.
 
-**548 tests pass**, and CI runs them on every push and pull request across
+**628 tests pass**, and CI runs them on every push and pull request across
 Python 3.9 - 3.13 (`.github/workflows/ci.yml`).  The native backend is
 validated by *differential testing*:
 the same program is run on the interpreter and on the compiled binary, and their
@@ -355,6 +405,9 @@ cd Gama-G
 ./tools/bin/ggc check examples/hello.gg        # diagnostics only
 ./tools/bin/ggc test examples/property_tests.gg # run its tests
 ./tools/bin/ggc gir --fn main examples/hello.gg # inspect the IR
+./tools/bin/ggc format examples/hello.gg         # canonical layout (same-GIR checked)
+./tools/bin/ggc profile examples/hello.gg        # per-function calls and instructions
+./tools/bin/ggc doc examples/hello.gg            # markdown documentation
 
 python3 -m unittest discover -s tests           # the compiler's own suite
 .venv/bin/python -m pytest tests/ -q            # the same suite under pytest
@@ -578,20 +631,31 @@ VERSION pyproject.toml                       the version, stated once
 compiler/gamag/
   core/{mir,parser,graph,native}.py        the language core and its own IR
   core/{memory,capability,recovery}.py     the three v0.4 models
+  core/guardproof.py                       the selection decision procedure
   capabilities.py                          one capability algebra, used by the
                                            checker and the runtime alike
   lexer.py parser.py ast_nodes.py          front end
+  formatter.py                             ggc format: canonical layout with a
+                                           same-GIR safety proof
   semantic/{types,checker}.py              type lattice and checking
   gir/{ir,builder,optimizer}.py            the IR, lowering, optimization
   runtime/{vm,context,values,tensor,       the reference interpreter and
            recovery,audit,checkpoint,ops}.py  its subsystems
-  std/library.py                           215 builtins
+  std/library.py                           266 builtins
   methods.py                               one method table, shared by checker and VM
+  toolchain/{buildinfo,docgen}.py          signed reproducible builds, ggc doc
+  gpm/                                     the package manager
+  backend/{cgen,native,wasm,accelerator}.py  the backends
+  bench/ fuzz/                             measurement, permanent fuzzing
   cli/main.py driver.py                    ggc
 tools/bin/{ggc,ggtest}                     entry points
 examples/core/                             eight core programs
 examples/                                  eight v0.1 programs
-tests/                                     548 tests
+tests/                                     628 tests
+docs/ANALYSIS_AND_COMPARISON.md            what this is, against the languages
+                                           it must compete with
+docs/BENCHMARK_BASELINE.md                 measured numbers, with their
+                                           conditions attached
 docs/DESIGN_v0_4.md                        the memory, capability and recovery
                                            models, and what each one proves
 docs/DESIGN_v0_3.md                        the native IR, the five graphs, and
@@ -626,6 +690,10 @@ tests/test_formal_semantics.py
                              on both sides of the compile/run boundary, recovery
                              levels, named checkpoints, transactions
 tests/test_examples.py       all sixteen examples, end to end
+tests/test_devtools.py       format (canonical, idempotent, semantics-preserving
+                             over every example and generated programs), the
+                             profiler's counters against the VM's own, the
+                             doc generator, and offline audit verification
 ```
 
 The vocabulary and example suites read the blueprint out of the repository at

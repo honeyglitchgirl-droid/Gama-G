@@ -485,6 +485,59 @@ class RunResult:
     violations: List[Violation] = field(default_factory=list)
 
 
+def check_formatter_is_total(source: str, path: str = "<fuzz>",
+                             origin: str = "",
+                             kind: str = "") -> List[Violation]:
+    """The formatter must format a file, refuse it, or crash nothing.
+
+    A formatter has one job beyond tidiness: never change a program.  This
+    invariant checks the whole contract -- `format_source` raises exactly
+    FormatError or returns text, that text re-formats to itself when it can
+    be formatted at all, and whenever both versions compile, the GIR is
+    identical apart from positions.  It found the defects the CLI would
+    otherwise have shipped: any rule that changed a clause body, glued two
+    operators into a third, or re-indented an unparseable shape.
+    """
+    out: List[Violation] = []
+    try:
+        from ..formatter import FormatError, format_source, \
+            verify_same_program
+    except ImportError as exc:                     # pragma: no cover
+        return [Violation("formatter-is-total", "crash",
+                          f"the formatter module cannot be imported: {exc}",
+                          source, origin, kind)]
+    try:
+        formatted = format_source(source, path)
+    except FormatError:
+        return out                                 # a refusal is a verdict
+    except BaseException as exc:                   # noqa: BLE001
+        return [Violation(
+            "formatter-is-total", "crash",
+            f"the formatter raised {type(exc).__name__}: {exc}; it may "
+            f"raise FormatError and nothing else", source, origin, kind,
+            traceback=_tb(exc))]
+    # idempotence: canonical form is a fixed point, not a two-cycle
+    try:
+        again = format_source(formatted, path)
+    except FormatError as exc:
+        out.append(Violation(
+            "formatter-is-total", "inconsistent",
+            f"the formatter produced text it then refuses to re-format: "
+            f"{exc}", source, origin, kind))
+        again = formatted
+    if again != formatted:
+        out.append(Violation(
+            "formatter-is-total", "inconsistent",
+            "formatting twice differs from formatting once; the canonical "
+            "form is not a fixed point", source, origin, kind))
+    # safety: a program that compiles must compile the same after a rewrite
+    divergence = verify_same_program(source, formatted)
+    if divergence is not None:
+        out.append(Violation(
+            "formatter-is-total", "wrong", divergence, source, origin, kind))
+    return out
+
+
 def run_checks(source: str, *, path: str = "<fuzz>", origin: str = "",
                kind: str = "", deep: bool = True,
                timeout: float = 10.0,
@@ -494,6 +547,8 @@ def run_checks(source: str, *, path: str = "<fuzz>", origin: str = "",
     out.extend(check_compiles_or_explains(source, path, origin=origin,
                                           kind=kind))
     out.extend(check_file_path_is_total(source, path, origin=origin,
+                                        kind=kind))
+    out.extend(check_formatter_is_total(source, path, origin=origin,
                                         kind=kind))
 
     # Did the front end accept the program?  Recomputed here rather than

@@ -178,12 +178,15 @@ section: never claim a capability the toolchain lacks.
 - **`messaging` is in-process.**  A broker needs `NetworkConnect` plumbing.
 - **`http` is not implemented** and is still declared roadmap.
 - **`ggc profile`, `ggc format` and `ggc doc` do not exist**, and are declared
-  roadmap rather than stubbed.
+  roadmap rather than stubbed.  *(Superseded in v1.2, where all three were
+  built; this note stands as the v1.0 record.)*
 - **The package manager does not reach the network.**  A registry is a directory
   of packages, which makes the offline cache and a private registry the same
   mechanism.  Resolution is a fixed point without backtracking: a graph that can
   only be satisfied by choosing *below* the highest satisfying version of
-  something is reported as a conflict rather than guessed at.
+  something is reported as a conflict rather than guessed at.  *(Superseded in
+  v1.2: the fixed point now has a bounded deterministic backtracking search
+  around it; past the budget the answer is still a named conflict.)*
 - **Ed25519 here is not constant-time** and must not be used where an attacker
   can measure it.  It exists because the alternative was a symmetric MAC, which
   proves possession of a shared secret rather than identity; in production, use

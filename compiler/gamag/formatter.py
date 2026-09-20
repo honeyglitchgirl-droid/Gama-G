@@ -48,6 +48,7 @@ What it refuses rather than guesses:
 
 from __future__ import annotations
 
+import re
 from typing import List, Optional, Tuple
 
 from .tokens import HARD_KEYWORD_SET
@@ -871,6 +872,15 @@ def _reflow(out: List[str], infos: List[Optional[dict]]) -> None:
 # ----------------------------------------------------------------------
 # the safety check: same program in, same GIR out
 # ----------------------------------------------------------------------
+
+#: A GIR payload keeps positions as fields -- and some of it also keeps the
+#: `repr()` of a whole AST node as a string, which embeds `SourcePos(...)`
+#: inside text.  Both spellings of a position are stripped; a formatter
+#: changes where tokens sit, and that is the one thing it must be allowed to
+#: change without tripping its own safety check.
+_POSITION_IN_TEXT = re.compile(r"SourcePos\([^)]*\)")
+
+
 def _strip_positions(payload) -> object:
     """Remove source positions from a GIR JSON payload.
 
@@ -884,6 +894,8 @@ def _strip_positions(payload) -> object:
                 if k not in ("pos", "end")}
     if isinstance(payload, list):
         return [_strip_positions(v) for v in payload]
+    if isinstance(payload, str) and "SourcePos(" in payload:
+        return _POSITION_IN_TEXT.sub("SourcePos()", payload)
     return payload
 
 
