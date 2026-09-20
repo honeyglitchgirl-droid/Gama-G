@@ -289,4 +289,60 @@ GValue g_main(int argc, char **argv);
 int g_run(int argc, char **argv,
           const char *const *declared_grants, size_t declared_grants_n);
 
+/* ------------------------------------------------------------------ */
+/* Cryptography and the audit chain (spec section 13)                  */
+/* ------------------------------------------------------------------ */
+
+/* SHA-256 and HMAC-SHA-256, implemented here rather than linked from a
+ * crypto library so that the native runtime has no build dependency and every
+ * byte that goes into a digest is visible in this file.
+ *
+ * UNAUDITED, AND SAID SO.  These are straightforward implementations of
+ * published algorithms; they are checked against Python's `hashlib` by
+ * `tests/test_native_audit.py`, including against the FIPS 180-4 vectors.
+ * They are NOT constant-time and they have had no third-party review.  The
+ * audit chain is a *detective* control -- spec section 13: "technical controls
+ * that make unauthorized modification detectable" -- and that is all any
+ * document here claims for it.  Do not use the signature to resist an
+ * adversary who can measure this code.  */
+
+/* The hex digest of `text` (NUL-terminated) into `out`, which holds 64 hex
+ * characters and a terminator. */
+void g_sha256_hex(const char *text, char *out);
+void g_hmac_sha256_hex(const unsigned char *key, size_t keylen,
+                       const char *msg, size_t msglen, char *out);
+
+/* The audit chain.  Timestamps come from the interpreter's virtual clock unless
+ * `--audit-realtime` was passed, so that the trail a compiled program writes can
+ * be put next to the trail the same program writes on the interpreter.  The
+ * signing key is read from the environment (`GAMAG_AUDIT_KEY`, hex) rather than
+ * from an option because a key on a command line is visible in every process
+ * listing on the machine.
+
+ * `g_audit_record` appends one record and returns its
+ * sequence number.  It takes the same shape the interpreter's `Op.AUDIT`
+ * takes -- a flat list of named values, of which `action`, `actor`, `object`
+ * and `reason` are pulled out and the rest become the record's fields -- so
+ * the two agree on which names are special rather than on two spellings of one
+ * event;
+ * the payload it hashes is the interpreter's canonical JSON byte for byte
+ * (sorted keys, `,`/`:` separators, non-ASCII left alone), because two
+ * implementations of a tamper-evident log that disagree by one byte have two
+ * logs.  `g_audit_flush` writes the JSONL trail to the path given by
+ * `--audit`, if the program was run with one.  Nothing is buffered on disk
+ * before that: a program that dies without flushing has no trail, which is the
+ * same failure the reference interpreter has.
+ *
+ * A secret in a field is refused, here as in the interpreter, before anything
+ * is hashed: the trail says that an operation ran and what it was for, never
+ * what a secret computed. */
+/* What run this trail belongs to.  `ggc native` emits one call with the
+ * toolchain's program version, so a native binary and `ggc run` agree on the
+ * field; a program that never calls it gets the interpreter's own defaults. */
+void g_audit_set_context(const char *program_version,
+                         const char *policy_version);
+
+size_t g_audit_record(const char *level, size_t nfields,
+                      const char *const *keys, const GValue *values);
+
 #endif /* GAMAG_RT_H */

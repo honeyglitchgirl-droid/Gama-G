@@ -279,6 +279,65 @@ library modules.
 
 ---
 
+## v1.4: the audit chain, in machine code
+
+A `trail` clause used to be a reason for the C backend to refuse a program.  An
+audit record is a SHA-256 digest over the canonical JSON of the whole payload,
+and when two languages write that digest they either agree on every byte or they
+keep two logs; there is no useful middle.  `gamag_rt.c` now carries its own
+SHA-256, its own HMAC-SHA-256 and its own writer, and the two trails are the
+same bytes:
+
+```sh
+$ ggc run examples/core/selection.gg --audit py.jsonl --audit-key 00112233445566778899aabbccddeeff
+$ ggc native examples/core/selection.gg -o triage
+$ GAMAG_AUDIT_KEY=00112233445566778899aabbccddeeff ./triage --audit nat.jsonl
+$ diff py.jsonl nat.jsonl            # no output
+$ ggc audit verify nat.jsonl --key 00112233445566778899aabbccddeeff
+```
+
+What that covers, and what it does not, in one place:
+
+* **One format, two writers.**  Sorted keys, `,`/`:` separators, non-ASCII left
+  unescaped, `1.0` rather than `1` for a whole float, genesis `0` repeated 64
+  times, `evt-%08d` event ids and the virtual clock in reproducible mode.  The
+  test suite compares the two files byte for byte, so a drift in either side
+  fails a test rather than surfacing in a court.
+* **A signature needs a key that outlives the run.**  `ggc run` without
+  `--audit-key` signs with a key generated for that process and then thrown
+  away, so its signatures cannot be checked afterwards -- the *chain* still
+  proves no record was edited.  The native runtime signs only when
+  `GAMAG_AUDIT_KEY` supplies a deployment key.  `ggc audit verify` says either
+  way whether signatures were checked, because "not checked" is information a
+  reviewer needs.
+* **The crypto is in-house and unaudited.**  SHA-256 and HMAC are implemented in
+  the runtime so that every byte entering a digest is visible in one file, and
+  they are tested against Python's `hashlib` -- the FIPS 180-4 vectors, the
+  padding rule at 55/56/63/64/65 bytes, HMAC with a key longer than a block.
+  They are not constant-time and no one has reviewed them.  Spec §13 asks for a
+  control that makes modification *detectable*, and that is the claim; nothing
+  here reopens the timing-safety claim this project withholds.
+* **What the two writers record is not identical.**  The reference runtime
+  audits its own behaviour too -- a violated `require`, a denied capability, a
+  transaction, a recovery action -- while the C runtime records what the
+  program's `trail` clauses declare.  A native trail is therefore not a
+  smaller-sized version of the same list; it is the declared half of it, byte for
+  byte.
+* **The clock is the reproducible one unless you ask otherwise.**  Like
+  `ggc run`, a native binary stamps its records `1.0, 2.0, ...` from the virtual
+  clock, which is what makes the comparison above possible at all;
+  `--audit-realtime` switches it to `time()`, and a whole-second stamp there
+  meets the interpreter's fractional one only in `--lenient-runtime` mode.  Both
+  trails verify; their digests differ, and the suite tests that too rather than
+  only the flattering case.
+
+Native coverage moved with it: **six** of the sixteen shipped examples now
+compile, run and agree with the interpreter on stdout, exit status and fault
+kind; **ten** are refused by name, for thirteen remaining reasons; **none**
+diverges.
+
+---
+
 ## v1.3: what the compiler can prove about a promise
 
 A `holds` clause used to be quoted when it broke and never consulted before the
@@ -387,7 +446,7 @@ GIR the same machine serves the reference interpreter, a native CPU backend that
 emits C and compiles it to machine code, a WebAssembly encoder, and an
 accelerator layer.
 
-**654 tests pass**, and CI runs them on every push and pull request across
+**671 tests pass**, and CI runs them on every push and pull request across
 Python 3.9 - 3.13 (`.github/workflows/ci.yml`).  The native backend is
 validated by *differential testing*:
 the same program is run on the interpreter and on the compiled binary, and their
@@ -695,7 +754,7 @@ compiler/gamag/
 tools/bin/{ggc,ggtest}                     entry points
 examples/core/                             eight core programs
 examples/                                  eight v0.1 programs
-tests/                                     654 tests
+tests/                                     671 tests
 docs/ANALYSIS_AND_COMPARISON.md            what this is, against the languages
                                            it must compete with
 docs/BENCHMARK_BASELINE.md                 measured numbers, with their

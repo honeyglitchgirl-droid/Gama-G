@@ -13,9 +13,19 @@
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 GFault  g_fault = { "", "", "", 0 };
 jmp_buf g_fault_jmp;
+
+/* The audit chain lives at the end of this file, after `g_run`, because it is
+ * the runtime's largest single responsibility; these three lines are what
+ * `g_run` needs to see of it. */
+static void g_audit_start(void);
+static void g_audit_flush(void);
+static void g_audit_use_realtime(void);
+static void g_audit_set_path(const char *path);
+static int g_nibble(char c);
 
 /* ================================================================== */
 /* Arena                                                              */
@@ -1536,9 +1546,16 @@ int g_run(int argc, char **argv,
     int show_authority = 0;
 
     g_cap_reset();
+    g_audit_start();
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
-        if (strcmp(a, "--grant") == 0 && i + 1 < argc) {
+        if (strcmp(a, "--audit") == 0 && i + 1 < argc) {
+            g_audit_set_path(argv[++i]);
+        } else if (strncmp(a, "--audit=", 8) == 0) {
+            g_audit_set_path(a + 8);
+        } else if (strcmp(a, "--audit-realtime") == 0) {
+            g_audit_use_realtime();
+        } else if (strcmp(a, "--grant") == 0 && i + 1 < argc) {
             if (caller_n < G_CAP_MAX) caller_grants[caller_n++] = argv[++i];
             else i++;
         } else if (strncmp(a, "--grant=", 8) == 0) {
@@ -1556,7 +1573,17 @@ int g_run(int argc, char **argv,
                    "ignoring the capabilities the program declares; pass this\n"
                    "                      when running code you have not read\n"
                    "  --authority         print the authority this run has and "
-                   "exit\n", argv[0]);
+                   "exit\n"
+                   "  --audit PATH        write the audit chain to PATH as the\n"
+                   "                      run ends, in the interpreter's own\n"
+                   "                      JSONL format; the key for signing it\n"
+                   "                      comes from GAMAG_AUDIT_KEY (hex), and\n"
+                   "                      an unsigned chain still verifies\n"
+                   "                      against tampering\n"
+                   "  --audit-realtime    stamp the trail from the wall clock;\n"
+                   "                      the default is the interpreter's\n"
+                   "                      virtual clock, so that two trails for\n"
+                   "                      one program can be compared\n", argv[0]);
             return G_EXIT_OK;
         } else if (a[0] == '-' && a[1] != '\0') {
             fprintf(stderr, "unknown option: %s (try --help)\n", a);
@@ -1598,4 +1625,528 @@ int g_run(int argc, char **argv,
     g_main(argc, argv);
     fflush(stdout);
     return G_EXIT_OK;
+}
+
+/* ================================================================== */
+/* SHA-256, HMAC-SHA-256, and the audit chain (spec section 13)       */
+/* ================================================================== */
+
+/* The counterpart of `compiler/gamag/runtime/audit.py`, and the reason it has
+ * to be a counterpart rather than an approximation: the digest of a record is
+ * taken over canonical JSON text, so the byte layout -- key order, separators,
+ * escaping, how a float is printed -- IS the format.  Two implementations that
+ * disagree by one character produce two chains, and a chain that only one of
+ * them can verify is not evidence about anything.
+ *
+ * `tests/test_native_audit.py` therefore compares, for the same program, the
+ * trail the interpreter writes and the trail the native binary writes, as
+ * bytes.  That test is the specification of everything below.
+ */
+
+typedef struct { uint32_t h[8]; uint64_t bytes; uint8_t buf[64]; size_t n; }
+    GSha;
+
+static const uint32_t G_SHA_K[64] = {
+    0x428a2f98u, 0x71374491u, 0xb5c0fbcfu, 0xe9b5dba5u,
+    0x3956c25bu, 0x59f111f1u, 0x923f82a4u, 0xab1c5ed5u,
+    0xd807aa98u, 0x12835b01u, 0x243185beu, 0x550c7dc3u,
+    0x72be5d74u, 0x80deb1feu, 0x9bdc06a7u, 0xc19bf174u,
+    0xe49b69c1u, 0xefbe4786u, 0x0fc19dc6u, 0x240ca1ccu,
+    0x2de92c6fu, 0x4a7484aau, 0x5cb0a9dcu, 0x76f988dau,
+    0x983e5152u, 0xa831c66du, 0xb00327c8u, 0xbf597fc7u,
+    0xc6e00bf3u, 0xd5a79147u, 0x06ca6351u, 0x14292967u,
+    0x27b70a85u, 0x2e1b2138u, 0x4d2c6dfcu, 0x53380d13u,
+    0x650a7354u, 0x766a0abbu, 0x81c2c92eu, 0x92722c85u,
+    0xa2bfe8a1u, 0xa81a664bu, 0xc24b8b70u, 0xc76c51a3u,
+    0xd192e819u, 0xd6990624u, 0xf40e3585u, 0x106aa070u,
+    0x19a4c116u, 0x1e376c08u, 0x2748774cu, 0x34b0bcb5u,
+    0x391c0cb3u, 0x4ed8aa4au, 0x5b9cca4fu, 0x682e6ff3u,
+    0x748f82eeu, 0x78a5636fu, 0x84c87814u, 0x8cc70208u,
+    0x90befffau, 0xa4506cebu, 0xbef9a3f7u, 0xc67178f2u,
+};
+
+static uint32_t g_ror(uint32_t x, unsigned n) { return (x >> n) | (x << (32 - n)); }
+
+static void g_sha_block(GSha *s, const uint8_t *p)
+{
+    uint32_t w[64], a, b, c, d, e, f, g, h;
+    for (int i = 0; i < 16; i++)
+        w[i] = ((uint32_t)p[i * 4] << 24) | ((uint32_t)p[i * 4 + 1] << 16)
+             | ((uint32_t)p[i * 4 + 2] << 8) | (uint32_t)p[i * 4 + 3];
+    for (int i = 16; i < 64; i++) {
+        uint32_t s0 = g_ror(w[i - 15], 7) ^ g_ror(w[i - 15], 18)
+                    ^ (w[i - 15] >> 3);
+        uint32_t s1 = g_ror(w[i - 2], 17) ^ g_ror(w[i - 2], 19)
+                    ^ (w[i - 2] >> 10);
+        w[i] = w[i - 16] + s0 + w[i - 7] + s1;
+    }
+    a = s->h[0]; b = s->h[1]; c = s->h[2]; d = s->h[3];
+    e = s->h[4]; f = s->h[5]; g = s->h[6]; h = s->h[7];
+    for (int i = 0; i < 64; i++) {
+        uint32_t S1 = g_ror(e, 6) ^ g_ror(e, 11) ^ g_ror(e, 25);
+        uint32_t ch = (e & f) ^ ((~e) & g);
+        uint32_t t1 = h + S1 + ch + G_SHA_K[i] + w[i];
+        uint32_t S0 = g_ror(a, 2) ^ g_ror(a, 13) ^ g_ror(a, 22);
+        uint32_t maj = (a & b) ^ (a & c) ^ (b & c);
+        uint32_t t2 = S0 + maj;
+        h = g; g = f; f = e; e = d + t1;
+        d = c; c = b; b = a; a = t1 + t2;
+    }
+    s->h[0] += a; s->h[1] += b; s->h[2] += c; s->h[3] += d;
+    s->h[4] += e; s->h[5] += f; s->h[6] += g; s->h[7] += h;
+}
+
+static void g_sha_init(GSha *s)
+{
+    static const uint32_t iv[8] = {
+        0x6a09e667u, 0xbb67ae85u, 0x3c6ef372u, 0xa54ff53au,
+        0x510e527fu, 0x9b05688cu, 0x1f83d9abu, 0x5be0cd19u,
+    };
+    for (int i = 0; i < 8; i++) s->h[i] = iv[i];
+    s->bytes = 0;
+    s->n = 0;
+}
+
+static void g_sha_update(GSha *s, const void *data, size_t len)
+{
+    const uint8_t *p = (const uint8_t *)data;
+    s->bytes += (uint64_t)len;
+    while (len) {
+        size_t take = 64 - s->n;
+        if (take > len) take = len;
+        memcpy(s->buf + s->n, p, take);
+        s->n += take; p += take; len -= take;
+        if (s->n == 64) { g_sha_block(s, s->buf); s->n = 0; }
+    }
+}
+
+static void g_sha_final(GSha *s, uint8_t out[32])
+{
+    uint64_t bits = s->bytes * 8u;
+    uint8_t pad = 0x80, zero = 0x00;
+    g_sha_update(s, &pad, 1);
+    s->bytes -= 1;                       /* the pad byte is not message length */
+    while (s->n != 56) {
+        g_sha_update(s, &zero, 1);
+        s->bytes -= 1;
+    }
+    uint8_t tail[8];
+    for (int i = 0; i < 8; i++) tail[i] = (uint8_t)(bits >> (56 - 8 * i));
+    /* append the length without disturbing `bytes` any further */
+    memcpy(s->buf + 56, tail, 8);
+    g_sha_block(s, s->buf);
+    for (int i = 0; i < 8; i++) {
+        out[i * 4]     = (uint8_t)(s->h[i] >> 24);
+        out[i * 4 + 1] = (uint8_t)(s->h[i] >> 16);
+        out[i * 4 + 2] = (uint8_t)(s->h[i] >> 8);
+        out[i * 4 + 3] = (uint8_t)(s->h[i]);
+    }
+}
+
+static void g_sha_hex(const uint8_t digest[32], char *out)
+{
+    static const char *digits = "0123456789abcdef";
+    for (int i = 0; i < 32; i++) {
+        out[i * 2]     = digits[digest[i] >> 4];
+        out[i * 2 + 1] = digits[digest[i] & 15];
+    }
+    out[64] = '\0';
+}
+
+void g_sha256_hex(const char *text, char *out)
+{
+    GSha s;
+    uint8_t digest[32];
+    g_sha_init(&s);
+    g_sha_update(&s, text, strlen(text));
+    g_sha_final(&s, digest);
+    g_sha_hex(digest, out);
+}
+
+void g_hmac_sha256_hex(const unsigned char *key, size_t keylen,
+                       const char *msg, size_t msglen, char *out)
+{
+    unsigned char block[64], inner[32], final_key[64];
+    GSha s;
+    memset(block, 0, sizeof block);
+    if (keylen > 64) {
+        g_sha_init(&s);
+        g_sha_update(&s, key, keylen);
+        g_sha_final(&s, inner);
+        memcpy(block, inner, 32);
+        keylen = 32;
+    } else {
+        memcpy(block, key, keylen);
+    }
+    for (int i = 0; i < 64; i++) final_key[i] = (unsigned char)(block[i] ^ 0x36);
+    g_sha_init(&s);
+    g_sha_update(&s, final_key, 64);
+    g_sha_update(&s, msg, msglen);
+    g_sha_final(&s, inner);
+    for (int i = 0; i < 64; i++) final_key[i] = (unsigned char)(block[i] ^ 0x5c);
+    g_sha_init(&s);
+    g_sha_update(&s, final_key, 64);
+    g_sha_update(&s, inner, 32);
+    uint8_t digest[32];
+    g_sha_final(&s, digest);
+    g_sha_hex(digest, out);
+}
+
+/* -- the chain ------------------------------------------------------ */
+
+#define G_AUDIT_MAX_FIELDS 8
+
+typedef struct {
+    char *line;                    /* the whole record, canonical JSON */
+    char hash[65];
+    char action[64];
+} GAuditEntry;
+
+static struct {
+    GAuditEntry *items;
+    size_t n, cap;
+    char prev[65];
+    char path[4096];
+    unsigned char key[512];
+    size_t keylen;
+    int signing;
+    int deterministic;
+    double epoch;
+    const char *actor;
+    const char *authority;
+    const char *program_version;
+    const char *policy_version;
+    int broken;                    /* a write failed; say so and exit non-zero */
+} g_audit;
+
+static void g_audit_json_string(SBuf *b, const char *s)
+{
+    /* json.dumps(..., ensure_ascii=False): the quotation marks, the escape
+     * character and the C0 controls are escaped; everything else goes out as
+     * the bytes it already is, which for UTF-8 is what Python writes. */
+    sb_putc(b, '"');
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        switch (*p) {
+        case '"':  sb_puts(b, "\\\""); break;
+        case '\\': sb_puts(b, "\\\\"); break;
+        case '\b': sb_puts(b, "\\b"); break;
+        case '\f': sb_puts(b, "\\f"); break;
+        case '\n': sb_puts(b, "\\n"); break;
+        case '\r': sb_puts(b, "\\r"); break;
+        case '\t': sb_puts(b, "\\t"); break;
+        default:
+            if (*p < 0x20) sb_putf(b, "\\u%04x", (unsigned)*p);
+            else sb_putc(b, (char)*p);
+        }
+    }
+    sb_putc(b, '"');
+}
+
+/* `values.canonical` projected onto the runtime's own value model: what the
+ * interpreter hashes, the native runtime hashes.  Anything this cannot name is
+ * rendered with `display` and quoted, which is what `default=str` does in the
+ * Python writer -- ugly, but it never silently drops a field from a digest. */
+static void g_audit_canonical(SBuf *b, GValue v);
+
+typedef struct { const char *key; GValue value; } GPair;
+
+static void g_audit_map(SBuf *b, GMap *m)
+{
+    GPair pairs[64];
+    size_t n = m->len, i, j;
+    if (n > 64) n = 64;                       /* the sort is insertion: bounded */
+    for (i = 0; i < n; i++) {
+        char *key = g_display(m->keys[i], 1);
+        pairs[i].key = key;
+        pairs[i].value = m->vals[i];
+    }
+    for (i = 1; i < n; i++) {                 /* sorted by key text: strcmp on
+                                                 UTF-8 is code-point order, the
+                                                 same order Python sorts by */
+        GPair t = pairs[i];
+        for (j = i; j && strcmp(pairs[j - 1].key, t.key) > 0; j--) pairs[j] = pairs[j - 1];
+        pairs[j] = t;
+    }
+    sb_putc(b, '{');
+    for (i = 0; i < n; i++) {
+        if (i) sb_putc(b, ',');
+        g_audit_json_string(b, pairs[i].key);
+        sb_putc(b, ':');
+        g_audit_canonical(b, pairs[i].value);
+    }
+    sb_putc(b, '}');
+}
+
+static void g_audit_canonical(SBuf *b, GValue v)
+{
+    char num[64];
+    switch (v.tag) {
+    case GV_UNIT:  sb_puts(b, "\"()\""); return;
+    case GV_BOOL:  sb_puts(b, v.u.b ? "true" : "false"); return;
+    case GV_INT:   sb_putf(b, "%lld", (long long)v.u.i); return;
+    case GV_FLOAT: g_repr_float(v.u.f, num, sizeof num); sb_puts(b, num); return;
+    case GV_TEXT:  g_audit_json_string(b, v.u.s->data); return;
+    case GV_BYTES: {
+        static const char *digits = "0123456789abcdef";
+        char *hex = (char *)g_alloc(v.u.s->len * 2 + 1);
+        for (size_t i = 0; i < v.u.s->len; i++) {
+            unsigned char c = (unsigned char)v.u.s->data[i];
+            hex[i * 2] = digits[c >> 4];
+            hex[i * 2 + 1] = digits[c & 15];
+        }
+        hex[v.u.s->len * 2] = '\0';
+        g_audit_json_string(b, hex);
+        return;
+    }
+    case GV_SECRET:
+        sb_putf(b, "\"<secret %s>\"", v.u.sec->label ? v.u.sec->label : "");
+        return;
+    case GV_LIST: {
+        sb_putc(b, '[');
+        for (size_t i = 0; i < v.u.l->len; i++) {
+            if (i) sb_putc(b, ',');
+            g_audit_canonical(b, v.u.l->items[i]);
+        }
+        sb_putc(b, ']');
+        return;
+    }
+    case GV_MAP: g_audit_map(b, v.u.m); return;
+    default: {
+        char *shown = g_display(v, 1);
+        g_audit_json_string(b, shown);
+        return;
+    }
+    }
+}
+
+/* The record, in the order Python's `sort_keys=True` produces.  Hardcoded
+ * because the key set is fixed by `AuditRecord.digest_payload`; the digest
+ * comparison in tests/test_native_audit.py is what keeps the two lists in step
+ * if either side ever changes. */
+static void g_audit_render(SBuf *b, const char *level, size_t nfields,
+                           const char *const *keys, const GValue *values,
+                           const char *hash, const char *signature)
+{
+    /* `vm.op_audit` is the source of this: `action` defaults to AUDIT_EVENT,
+     * `actor` defaults to the context's, `object` and `reason` default to
+     * null, and whatever is left over is the record's `fields`. */
+    const char *action = "AUDIT_EVENT", *actor = g_audit.actor;
+    const char *object = NULL, *reason = NULL;
+    const char *fkeys[G_AUDIT_MAX_FIELDS];
+    const GValue *fvals[G_AUDIT_MAX_FIELDS];
+    size_t nkeep = 0;
+    for (size_t i = 0; i < nfields; i++) {
+        const char *key = keys[i];
+        if (strcmp(key, "action") == 0) action = g_display(values[i], 0);
+        else if (strcmp(key, "actor") == 0) actor = g_display(values[i], 0);
+        else if (strcmp(key, "object") == 0) object = g_display(values[i], 0);
+        else if (strcmp(key, "reason") == 0) reason = g_display(values[i], 0);
+        else { fkeys[nkeep] = key; fvals[nkeep] = &values[i]; nkeep++; }
+    }
+    char num[32];
+    size_t seq = g_audit.n;
+    sb_putc(b, '{');
+    sb_puts(b, "\"action\":"); g_audit_json_string(b, action);
+    sb_puts(b, ",\"actor\":"); g_audit_json_string(b, actor);
+    sb_puts(b, ",\"authority\":"); g_audit_json_string(b, g_audit.authority);
+    sb_puts(b, ",\"event_id\":");
+    if (g_audit.deterministic) {
+        snprintf(num, sizeof num, "evt-%08zu", seq);
+        g_audit_json_string(b, num);
+    } else {
+        /* The interpreter has a UUID4 here and this program has no entropy
+         * source it is allowed to invent.  A fabricated id would look like a
+         * match and be a lie, so the field is what it is: a sequence. */
+        snprintf(num, sizeof num, "evt-%08zu", seq);
+        g_audit_json_string(b, num);
+    }
+    sb_puts(b, ",\"fields\":{");
+    /* `values.canonical` sorts a dict by its keys before it is serialised.
+     * strcmp on UTF-8 bytes is code-point order, the order Python sorts by. */
+    size_t order[G_AUDIT_MAX_FIELDS];
+    for (size_t i = 0; i < nkeep; i++) order[i] = i;
+    for (size_t i = 1; i < nkeep; i++) {      /* insertion sort, by key text */
+        size_t pick = order[i];
+        int j = (int)i - 1;
+        while (j >= 0 && strcmp(fkeys[order[j]], fkeys[pick]) > 0) {
+            order[j + 1] = order[j];
+            j--;
+        }
+        order[j + 1] = pick;
+    }
+    for (size_t i = 0; i < nkeep; i++) {
+        if (i) sb_putc(b, ',');
+        g_audit_json_string(b, fkeys[order[i]]);
+        sb_putc(b, ':');
+        g_audit_canonical(b, *fvals[order[i]]);
+    }
+    sb_puts(b, "}");
+    if (hash) { sb_puts(b, ",\"hash\":"); g_audit_json_string(b, hash); }
+    sb_puts(b, ",\"level\":"); g_audit_json_string(b, level);
+    sb_puts(b, ",\"object\":");
+    if (object) g_audit_json_string(b, object); else sb_puts(b, "null");
+    sb_puts(b, ",\"policy_version\":");
+    g_audit_json_string(b, g_audit.policy_version);
+    sb_puts(b, ",\"prev_hash\":"); g_audit_json_string(b, g_audit.prev);
+    sb_puts(b, ",\"program_version\":");
+    g_audit_json_string(b, g_audit.program_version);
+    sb_puts(b, ",\"reason\":");
+    if (reason) g_audit_json_string(b, reason); else sb_puts(b, "null");
+    sb_puts(b, ",\"seq\":");
+    snprintf(num, sizeof num, "%zu", seq);
+    sb_puts(b, num);
+    if (signature) { sb_puts(b, ",\"signature\":"); g_audit_json_string(b, signature); }
+    sb_puts(b, ",\"timestamp\":");
+    if (g_audit.deterministic) {
+        g_repr_float(g_audit.epoch + (double)(seq + 1), num, sizeof num);
+        sb_puts(b, num);
+    } else {
+        /* Whole seconds.  The interpreter stamps `time.time()` with fractions;
+         * in the reproducible mode, which is the mode that can be compared
+         * against anything, neither of them reads a clock at all.  Saying so
+         * here is cheaper than pretending the two agree. */
+        g_repr_float((double)time(NULL), num, sizeof num);
+        sb_puts(b, num);
+    }
+    sb_putc(b, '}');
+}
+
+size_t g_audit_record(const char *level, size_t nfields,
+                      const char *const *keys, const GValue *values)
+{
+    SBuf payload;
+    char digest_hex[65], signature[65];
+    sb_init(&payload);
+    if (nfields > G_AUDIT_MAX_FIELDS) {
+        g_raise("BadGIR", "",
+                "an audit record may carry %d fields, this one carries %d",
+                G_AUDIT_MAX_FIELDS, (int)nfields);
+        return g_audit.n;
+    }
+    for (size_t i = 0; i < nfields; i++)
+        if (values[i].tag == GV_SECRET)
+            g_raise("SecretLeak", "",
+                    "audit field `%s` would record a secret value", keys[i]);
+    /* The hashed payload is the record without `hash` and without `signature`:
+     * both are passed as NULL, and the writer omits those keys. */
+    g_audit_render(&payload, level, nfields, keys, values, NULL, NULL);
+    g_sha256_hex(payload.p, digest_hex);
+
+    char *line = NULL;
+    {
+        SBuf full;
+        sb_init(&full);
+        if (g_audit.signing) {
+            g_hmac_sha256_hex(g_audit.key, g_audit.keylen, digest_hex, 64,
+                              signature);
+        } else {
+            signature[0] = '\0';       /* unsigned: `ggc audit verify` reports
+                                          signatures_checked false, and so does
+                                          this line being empty */
+        }
+        g_audit_render(&full, level, nfields, keys, values, digest_hex,
+                       signature);
+        line = g_strdup_n(full.p, full.len);
+    }
+
+    if (g_audit.n == g_audit.cap) {
+        size_t want = g_audit.cap ? g_audit.cap * 2 : 16;
+        GAuditEntry *grown = (GAuditEntry *)malloc(want * sizeof(GAuditEntry));
+        if (!grown) { g_audit.broken = 1; return g_audit.n; }
+        if (g_audit.items)
+            memcpy(grown, g_audit.items, g_audit.n * sizeof(GAuditEntry));
+        free(g_audit.items);
+        g_audit.items = grown;
+        g_audit.cap = want;
+    }
+    g_audit.items[g_audit.n].line = line;
+    memcpy(g_audit.items[g_audit.n].hash, digest_hex, 65);
+    g_audit.items[g_audit.n].action[0] = '\0';
+    memcpy(g_audit.prev, digest_hex, 65);
+    return g_audit.n++;
+}
+
+/* The chain is written once, at exit: the trail of a program that faults mid-run
+ * is the trail most worth having, so `atexit` is not a convenience here. */
+static int g_nibble(char c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+static void g_audit_set_path(const char *path)
+{
+    snprintf(g_audit.path, sizeof g_audit.path, "%s", path);
+    atexit(g_audit_flush);
+}
+
+static void g_audit_use_realtime(void) { g_audit.deterministic = 0; }
+
+void g_audit_set_context(const char *program_version,
+                         const char *policy_version)
+{
+    if (program_version) g_audit.program_version = program_version;
+    if (policy_version) g_audit.policy_version = policy_version;
+}
+
+static void g_audit_flush(void)
+{
+    /* An empty trail is still a trail: `ggc run --audit` writes an empty file
+     * when the program recorded nothing, and a reader who cannot tell "no
+     * records" from "the flag was never honoured" has been handed an
+     * ambiguity. */
+    if (!g_audit.path[0]) return;
+    FILE *out = fopen(g_audit.path, "w");
+    if (!out) {
+        fprintf(stderr, "ggc native: cannot write the audit trail to %s\n",
+                g_audit.path);
+        g_audit.broken = 1;
+        return;
+    }
+    for (size_t i = 0; i < g_audit.n; i++)
+        fprintf(out, "%s%s", g_audit.items[i].line,
+                i + 1 == g_audit.n ? "" : "\n");
+    fclose(out);
+}
+
+/* Called from `g_run`: option strings, the signing key, and the head of the
+ * chain.  Kept out of the generated code so that a program cannot turn its own
+ * audit off by not calling it. */
+static void g_audit_start(void)
+{
+    const char *key = getenv("GAMAG_AUDIT_KEY");
+    memcpy(g_audit.prev, "0000000000000000000000000000000000000000000000000000000000000000", 65);
+    /* Defaults for whatever the artifact did not name.  `ggc native` writes the
+     * toolchain's own program version into `main`, so a native binary stamps
+     * the same version `ggc run` does; a hand-written program that calls
+     * nothing gets the interpreter's defaults instead of an empty string. */
+    if (!g_audit.actor) g_audit.actor = "program";
+    if (!g_audit.authority) g_audit.authority = "gama-g/runtime";
+    if (!g_audit.program_version) g_audit.program_version = "0.1.0";
+    if (!g_audit.policy_version) g_audit.policy_version = "0";
+    /* The virtual clock is the default, because that is what `ggc run` does:
+     * reproducible mode stamps `epoch + n` rather than reading the wall, and the
+     * whole point of writing the same trail in two languages is that the two
+     * trails can be put next to each other.  `--audit-realtime` opts out, and is
+     * an option rather than a default so that a trail with unmatchable stamps is
+     * a decision somebody made out loud. */
+    g_audit.deterministic = !getenv("GAMAG_AUDIT_REALTIME");
+    {
+        const char *epoch = getenv("GAMAG_AUDIT_EPOCH");
+        g_audit.epoch = epoch ? strtod(epoch, NULL) : 0.0;
+    }
+    if (!key || !*key) return;
+    size_t len = strlen(key);
+    if (len % 2) { g_audit.broken = 1; return; }
+    size_t n = len / 2;
+    if (n > sizeof g_audit.key) n = sizeof g_audit.key;
+    for (size_t i = 0; i < n; i++) {
+        int hi = g_nibble(key[i * 2]), lo = g_nibble(key[i * 2 + 1]);
+        if (hi < 0 || lo < 0) { g_audit.broken = 1; return; }
+        g_audit.key[i] = (unsigned char)((hi << 4) | lo);
+    }
+    g_audit.keylen = n;
+    g_audit.signing = n > 0;
 }

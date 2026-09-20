@@ -265,6 +265,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="print runtime counters afterwards")
     p.add_argument("--audit", metavar="PATH",
                    help="write the hash-chained audit log here")
+    p.add_argument("--audit-key", metavar="HEX",
+                   help="sign the audit log with this hex key; without it the "
+                        "log is chained but the signature is meaningless "
+                        "afterwards, because the key is random per run")
     p.add_argument("--lenient-runtime", action="store_true",
                    help="run without the deterministic clock and RNG")
     p.add_argument("--strict-authority", action="store_true",
@@ -784,10 +788,18 @@ def cmd_run(args: argparse.Namespace) -> int:
             exit_code = EXIT_USAGE
             continue
         from ..runtime.context import Context
+        audit_key = None
+        if getattr(args, "audit_key", None):
+            try:
+                audit_key = bytes.fromhex(args.audit_key)
+            except ValueError:
+                print("audit key must be hexadecimal (odd length or non-hex "
+                      "characters)", file=sys.stderr)
+                return EXIT_USAGE
         ctx = Context(
             deterministic=not args.lenient_runtime,
             grants=_authority(compilation, args),
-            program_version=__version__)
+            program_version=__version__, audit_key=audit_key)
         result = execute(compilation, entry=entry, context=ctx)
         if not result.ok:
             fault = result.fault
@@ -1256,6 +1268,16 @@ def cmd_native(args: argparse.Namespace) -> int:
             continue
         for line in result.render():
             print(line)
+        if result.ok and args.output:
+            # `-o` is honoured here, not only advertised: the executable is
+            # copied out of the build directory, which is the one place a reader
+            # of `--help` would otherwise have to go looking.
+            import shutil
+            directory = os.path.dirname(os.path.abspath(args.output))
+            os.makedirs(directory, exist_ok=True)
+            shutil.copy2(result.exe_path, args.output)
+            os.chmod(args.output, 0o755)
+            print(f"  executable: {args.output}")
         if result.ok:
             # Say how much of the program gets the arena release path.  The
             # rule that decides is conservative, so the number is a statement

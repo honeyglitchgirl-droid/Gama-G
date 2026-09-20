@@ -118,15 +118,18 @@ Every row names the evidence, because a feature list without one is a wish.
 
 **Native CPU.**  GIR becomes C, and the system compiler turns that into machine
 code.  The binding constraint is not code generation but agreement: the C
-runtime reproduces three properties of the interpreter rather than approximating
+runtime reproduces four properties of the interpreter rather than approximating
 them -- exact integers with the interpreter's range checks at *store* and
 *return*, Python's shortest-round-trip float formatting (including its switch to
-exponential notation outside `-4 < decpt <= 16`), and variadic space-joined
-output.  A support analysis runs *before* any C is written, so a program using
-the audit chain, capabilities, transactions, tensors or parallel regions is
-refused with a reason naming the construct and its position.  Four of the
-sixteen shipped examples compile natively today; twelve are refused, none
-diverges.
+exponential notation outside `-4 < decpt <= 16`), variadic space-joined output,
+and, since 1.4, the canonical JSON byte layout an audit record is hashed over.
+That last one is why the native trail is worth having: `tests/test_native_audit.py`
+compares the two files byte for byte rather than checking that the native one
+"looks similar", and `ggc audit verify` accepts what a compiled binary wrote.
+A support analysis runs *before* any C is written, so a program using
+transactions, checkpoints, tensors or parallel regions is refused with a reason
+naming the construct and its position.  Six of the sixteen shipped examples
+compile natively today; ten are refused, none diverges.
 
 **WebAssembly.**  A self-contained binary encoder, with a decoder and a
 disassembler so the emitted instructions can be read against the GIR they came
@@ -152,11 +155,16 @@ absence of hardware makes it unverifiable twice over.
 Written down rather than left to be discovered.  Spec section 43 governs this
 section: never claim a capability the toolchain lacks.
 
-- **The native and WebAssembly backends cover a subset.**  The audit chain,
-  capabilities, transactions, checkpoints, recovery regions, tensors, autodiff,
-  agents, method dispatch and indirect calls are not implemented natively.  They
-  are refused by name, never miscompiled.  A program that uses them runs on the
-  interpreter.
+- **The native and WebAssembly backends cover a subset.**  Transactions,
+  checkpoints, recovery regions, tensors, autodiff, agents, policy evaluation,
+  method dispatch, indirect calls, record mutation, sets, `for` and the v0.1
+  contract op are not implemented natively.  They are refused by name, never
+  miscompiled.  A program that uses them runs on the interpreter.  Capabilities
+  (1.2) and the audit chain (1.4) have since moved onto the native list; the
+  C implementation of SHA-256 and HMAC is in-house, unaudited and not
+  constant-time, which is stated where it is used and is a reason to keep the
+  interpreter as the thing a deployment trusts, not a reason to soften what the
+  chain claims.
 - **The native runtime releases at function return, not at the memory model's
   extents.**  The arena used to grow for the lifetime of the process, so a
   program that repeatedly called a helper allocating a temporary leaked by

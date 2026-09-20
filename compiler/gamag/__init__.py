@@ -29,7 +29,7 @@ def _read_version() -> str:
             if text:
                 return text
         here = os.path.dirname(here)
-    return "1.3.0"
+    return "1.4.0"
 
 
 __version__ = _read_version()

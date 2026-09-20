@@ -15,13 +15,16 @@ import io
 import json
 import os
 import random
+import subprocess
 import tempfile
 import unittest
 
 import support as S
 
 from gamag.cli.main import COMMANDS, build_parser
+from gamag.backend import native
 from gamag.driver import compile_source
+from gamag.runtime.audit import verify_trail
 from gamag.formatter import (FormatError, format_source,
                              verify_same_program)
 
@@ -55,6 +58,61 @@ def all_examples():
                 paths.append(os.path.join(directory, name))
     return paths
 
+
+# ---------------------------------------------------------------------------
+# ggc native -o
+# ---------------------------------------------------------------------------
+
+@unittest.skipIf(native.find_c_compiler() is None, "no C compiler on this machine")
+class NativeOutputPath(unittest.TestCase):
+    """`ggc native -o PATH` puts the executable at PATH.
+
+    This flag has been advertised in `--help` since the backend existed and was
+    quietly ignored: the binary always stayed in the build directory, so a reader
+    who followed the help text found nothing where they were told to look.  The
+    test is of the promise in `--help`, not of the compiler -- which is the only
+    kind of test that would have caught it.
+    """
+
+    def test_the_executable_lands_where_it_was_asked_for(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            exe = os.path.join(tmp, "nested", "hello")
+            code, out, err = run_cli(
+                "native", S.example("hello.gg"), "-o", exe,
+                "--build-dir", os.path.join(tmp, "b"))
+            self.assertEqual(code, 0, out + err)
+            self.assertTrue(os.path.isfile(exe),
+                            f"-o was ignored; ggc said:\n{out}")
+            self.assertTrue(os.access(exe, os.X_OK), "and it must be runnable")
+            proc = subprocess.run([exe], capture_output=True, text=True,
+                                  timeout=60)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("total", proc.stdout)
+            self.assertIn("42", proc.stdout)
+
+    def test_an_audit_trail_can_be_written_by_the_copied_binary(self):
+        """The option the copy exists for: `./triage --audit trail.jsonl`.
+
+        The binary is moved out of the build directory, so this is also the
+        check that nothing about the trail depends on where the file was built.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            exe = os.path.join(tmp, "triage")
+            trail = os.path.join(tmp, "trail.jsonl")
+            code, out, err = run_cli(
+                "native", S.example("core/selection.gg"), "-o", exe,
+                "--build-dir", os.path.join(tmp, "b"))
+            self.assertEqual(code, 0, out + err)
+            proc = subprocess.run([exe, "--audit", trail], capture_output=True,
+                                  text=True, timeout=60)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertTrue(os.path.isfile(trail),
+                            "the compiled program writes its own trail")
+            ok, problems, summary = verify_trail(open(trail, encoding="utf-8").read())
+            self.assertTrue(ok, "\n".join(problems))
+            self.assertEqual(summary["records"], 1)
+            self.assertFalse(summary["signatures_checked"],
+                             "no key was supplied, and the verifier says so")
 
 # ---------------------------------------------------------------------------
 # ggc format

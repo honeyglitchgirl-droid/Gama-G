@@ -33,7 +33,7 @@ The per-milestone design notes remain as the record of how each part was built:
 honest status; `DESIGN_v1_0.md` is the consolidated design.
 
 Everything claimed below is exercised by the test suite (`python3 -m unittest
-discover -s tests`, **654 tests**) and demonstrated by a runnable example in
+discover -s tests`, **671 tests**) and demonstrated by a runnable example in
 `examples/` or `examples/core/`. Where a claim is partial, the missing part is
 named.
 
@@ -44,12 +44,12 @@ named.
 | | |
 |---|---|
 | Implementation language | Python 3.11+ (reference implementation) |
-| Compiler source | ~31,800 lines across 65 modules, plus a C runtime |
+| Compiler source | ~31,900 lines across 65 modules, plus a C runtime |
 | Standard library | 266 builtins across 27 modules |
 | Language surface | 23 hard keywords, 84 contextual keywords, 9 effects |
 | AST node types | 70 |
 | GIR operations | 41 |
-| Tests | 654 (all passing under `unittest discover`) |
+| Tests | 671 (all passing under `unittest discover`) |
 | Examples | 8 v0.1 + 8 core, each runnable with `ggc run` |
 | Language core | 10 modules, ~5,800 lines in `compiler/gamag/core/`; see §10–12 |
 | Formal models | memory · capability · recovery, one module each, plus a
@@ -184,12 +184,13 @@ diff-testing).  The nine of spec section 31:
 |---|---|
 | `ggc check` | **done** — diagnostics only, with `--profile`, `--json`, and `--smt PATH` to write the obligations the promise prover could not settle as SMT-LIB2 (the toolchain never invokes a solver) |
 | `ggc build` | **done** — compiles to GIR, `--stats`, `-O0/1/2` |
-| `ggc run` | **done** — `--grant`, `--audit PATH`, `--entry`, `--lenient-runtime` |
+| `ggc run` | **done** — `--grant`, `--audit PATH`, `--audit-key HEX`, `--entry`, `--lenient-runtime`; without a key the trail is still chained and its digests verify, but its signatures are made with a key that dies with the process, which is why `--audit-key` exists |
 | `ggc test` | **done** — `--json`; exit code 4 on failure |
 | `ggc audit` | **done** — `audit verify` recomputes every digest and every link of a written trail, offline, and `audit show` prints it; signature checking runs when `--key` supplies the deployment key, and the output says which mode ran |
 | `ggc bench` | **done** — §6; a published baseline is in `docs/BENCHMARK_BASELINE.md` |
 | `ggc profile` | **done** — per-function calls, instructions and inclusive time, counted by the interpreter itself; instruction totals agree with the VM's own counters, and the table goes to stderr so the program's own output stays on stdout |
 | `ggc format` | **done** — canonical layout with a **same-GIR safety proof**: every rewrite is compiled before and after and compared apart from positions, so a formatting that would change a program is refused, never applied; clause bodies (quoted verbatim by failures) are never re-spaced; idempotent, and all sixteen examples are already canonical |
+| `ggc native` | **done** — §5; the binary it produces takes the same `--audit PATH` (and `GAMAG_AUDIT_KEY` for signing) that `ggc run` does, and writes a trail byte-identical to the interpreter's for the same program, key and clock |
 | `ggc doc` | **done** — markdown for a program (including what the checker derived: levels, authority, selection proofs) and for the standard library, rendered from the same registration table the checker reads |
 
 Exit codes: `0` success, `1` compile error, `2` runtime fault, `3` usage,
@@ -208,12 +209,61 @@ does not have.
 **The native backend covers a subset**, and refuses by name whatever it cannot
 compile, before writing any C. `ggc native` emits C and compiles it to machine
 code; `ggc difftest` runs the same program on both machines and compares stdout,
-exit status and fault kind. The audit chain, capabilities, transactions,
-checkpoints, recovery regions, tensors, autodiff, agents, method dispatch and
-indirect calls are not implemented natively. Four of the sixteen shipped examples
-compile natively today; twelve are refused; none diverges. A refused program
-still runs on the reference interpreter, which remains the definition of the
-language.
+exit status and fault kind. Transactions, checkpoints, recovery regions,
+parallel regions, policy evaluation, agents, tensors and autodiff, method
+dispatch, indirect calls, record mutation, sets, `for` and the v0.1
+`requires`/`ensures` op are not implemented natively; capabilities have been
+checked in the C runtime since 1.2, and since 1.4 the audit chain has too --
+`trail` lowers to a runtime call that builds the record, hashes it and links it,
+so a native binary writes a trail `ggc audit verify` accepts, and for the same
+program under the same key the two trails are byte-identical (see section 5.1).
+Six of the sixteen shipped examples compile natively today; ten are refused;
+none diverges. A refused program still runs on the reference interpreter, which
+remains the definition of the language.
+
+### 5.1 The audit chain in the native runtime
+
+Spec section 13 asks for a control that makes unauthorized modification
+*detectable*, and detection needs one format rather than two dialects, because a
+record whose digest only its own writer can recompute is not evidence.  So
+`backend/rt/gamag_rt.c` implements the whole chain itself: SHA-256 (FIPS 180-4),
+HMAC-SHA-256 (RFC 2104), the canonical-JSON projection of a record, the genesis
+link, and the `evt-%08d` ids and virtual clock of reproducible mode.  The
+generated `main` passes the toolchain's version into `g_audit_set_context`, so
+`program_version` is the same field both backends would have written, taken from
+one place at compile time rather than guessed by the runtime.
+
+`tests/test_native_audit.py` is the specification of that paragraph.  It compares
+the native trail against the interpreter's as *bytes*; it compares SHA-256 and
+HMAC against Python's `hashlib` on the standard vectors and at every length where
+the padding rule changes; it checks that a tampered field is caught, that a
+removed record is caught twice (once by the digest, once by the link), that a
+trail written with no key is not reported as signed, and that a native trail
+verifies offline against the deployment key.
+
+Three differences are left in the open rather than smoothed over.
+
+The two writers do not record the same *events*.  The reference runtime audits
+its own behaviour -- a violated `require`, a denied capability, a transaction, a
+recovery action -- while the C runtime records what the program's `trail`
+clauses declare and nothing else.  So the trail of a faulting native program is
+shorter than the interpreter's by exactly those events (the lowering places the
+check before the clause, so a native program that dies on a promise records
+nothing at all), and `test_the_native_trail_records_only_what_the_program_declared`
+pins that asymmetry down rather than letting it be mistaken for a hash mismatch.
+
+The
+native binary uses the virtual clock by default, the way `ggc run` does, and
+`--audit-realtime` switches it to `time()`: whole seconds where the interpreter's
+non-reproducible mode has fractions, so the digests of two realtime trails do not
+match -- both chains still verify, and `test_a_real_clock_still_produces_a_valid_chain`
+is the test that says so.  And the
+interpreter signs with an ephemeral key unless `--audit-key` supplies one, which
+is why a `ggc run --audit` trail verifies for integrity while its signatures mean
+nothing after the process exits.  Neither is a reason to overstate what the
+native chain does claim: it is unaudited, in-house, non-constant-time SHA-256 and
+HMAC, documented as such, and it reclaims no timing or adversarial-security
+claim.
 
 The native runtime allocates heap values from an arena and does not free until
 exit, so it does not yet act on the extents the v0.4 memory model computes. It
@@ -316,6 +366,12 @@ here in two ways: by not making the claims, and by a test
   establishes non-repudiation.** Records are HMAC-signed with a key the process
   holds; key management, witnessed countersigning and tamper-evident storage
   are outside this implementation.
+- **No claim that the native runtime's crypto has been reviewed.** The C
+  SHA-256 and HMAC-SHA-256 are in-house implementations of published algorithms,
+  tested against Python's `hashlib` for agreement and not for side-channel
+  resistance; they are not constant-time. They serve a detective control --
+  noticing that a record changed -- and are never offered as protection against
+  an attacker who can measure the process.
 - **No claim that recovery makes a system self-healing in production.** The
   recovery engine is bounded and audited, and a permanent fault exhausts it and
   propagates. That is the design, not a success story.

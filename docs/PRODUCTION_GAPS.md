@@ -26,7 +26,7 @@ one sized-integer binding under its guard), `ggc check --smt` exports the rest
 as SMT-LIB2 without ever invoking a solver, and the fuzzer gained two
 invariants that attack the prover -- `prover-is-sound` and
 `proof-keeps-the-boundary` -- with matching bug injections in the self-check.
-654 tests.  The native CPU backend emits C and
+671 tests.  The native CPU backend emits C and
 compiles it; the WebAssembly encoder emits a module; the accelerator layer
 detects devices and refuses rather than falling back silently; the fuzzer
 finds real bugs and now holds a permanent formatter invariant; there is a
@@ -140,14 +140,21 @@ from a checkout.  Declared as package data, and the CI packaging job now runs
 These are not bugs.  They are the reasons the toolchain is a slice, and each
 one is already stated in `docs/DESIGN_v1_0.md` section 5.
 
-- **Native coverage is 4 of 16 examples.**  Programs using the audit chain,
-  capabilities, transactions, checkpoints, recovery regions, tensors, autodiff,
-  agents, method dispatch or indirect calls are refused by name -- never
-  miscompiled -- and run on the interpreter instead.
-- **The native runtime does not enforce capabilities.**  There is no capability
-  logic in `gamag_rt.c` at all; those programs are refused, so nothing is
-  miscompiled, but there is no second line of defence either.  The interpreter
-  is where the security model lives.
+- **Native coverage is 6 of 16 examples.**  Programs using transactions,
+  checkpoints, recovery regions, parallel regions, policy evaluation, agents,
+  tensors, autodiff, method dispatch, indirect calls, record mutation, sets or
+  `for` are refused by name -- never miscompiled -- and run on the interpreter
+  instead.  Capabilities and the audit chain are off this list: both are
+  implemented in the C runtime, the check since 1.2 and the chain since 1.4.
+- **The native audit chain is hashed by code nobody has reviewed.**  A native
+  program writes the same trail `ggc run` writes and the digests agree byte for
+  byte, but the SHA-256 and HMAC in `gamag_rt.c` are in-house, unaudited and not
+  constant-time.  That makes modification detectable, which is what spec section
+  13 asks for; it is not a hardened crypto path, and a deployment that needs one
+  should keep treating the interpreter as the thing it trusts.  The capability
+  *check* is native (`g_cap_require`, honouring `--grant` and
+  `--strict-authority`), which is why an ungranted effect faults on both
+  machines; policy evaluation itself remains interpreter-only.
 - **Memory is released at function return, not per extent.**  The arena used
   to never free; it now marks and releases around every function that provably
   cannot hand an allocated value on (see `docs/DESIGN_v1_0.md` section 5).

@@ -71,20 +71,27 @@ class TempBuild(unittest.TestCase):
 class NativeSupportAnalysis(TempBuild):
     """The backend refuses before it emits, and says why."""
 
-    def test_a_program_using_the_audit_chain_is_refused_with_a_reason(self):
-        program = compiled_program(S.example_file("core/dose.gg"),
-                                   "examples/core/dose.gg")
+    def test_a_program_using_an_unimplemented_construct_names_the_construct(self):
+        # This used to be the audit chain's test: the backend refused `trail`
+        # and said so.  The chain has a C implementation now, so that program
+        # compiles, and the subject of this test moved to the construct that is
+        # still refused -- which is the point of the mechanism, not of any one
+        # reason.  What the chain's absence used to prove is now proved by
+        # `tests/test_native_audit.py`, which compares the two trails byte for
+        # byte.
+        program = compiled_program(S.example_file("core/ledger.gg"),
+                                   "examples/core/ledger.gg")
         support = cgen.unsupported(program)
         self.assertFalse(support.ok)
         text = "\n".join(p.render() for p in support.problems)
-        self.assertIn("audit", text)
-        self.assertIn("hash-chained", text,
+        self.assertIn("transaction", text)
+        self.assertIn("not implemented natively", text,
                       "the reason should say what is missing, not just name it")
 
     def test_no_c_is_written_when_the_backend_refuses(self):
-        program = compiled_program(S.example_file("core/dose.gg"),
-                                   "examples/core/dose.gg")
-        result = native.generate(program, "examples/core/dose.gg",
+        program = compiled_program(S.example_file("core/ledger.gg"),
+                                   "examples/core/ledger.gg")
+        result = native.generate(program, "examples/core/ledger.gg",
                                  build_dir=self.build_dir)
         self.assertFalse(result.ok)
         self.assertTrue(result.refused)
@@ -95,8 +102,8 @@ class NativeSupportAnalysis(TempBuild):
                          "and must not leave a build directory behind")
 
     def test_the_reasons_name_positions_in_the_program(self):
-        program = compiled_program(S.example_file("core/dose.gg"),
-                                   "examples/core/dose.gg")
+        program = compiled_program(S.example_file("core/ledger.gg"),
+                                   "examples/core/ledger.gg")
         support = cgen.unsupported(program)
         self.assertTrue(any(p.where for p in support.problems),
                         "a refusal without a position makes the user search")

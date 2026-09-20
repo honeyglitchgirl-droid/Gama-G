@@ -259,13 +259,16 @@ The gap is not ideas -- several columns above are things competitors do not
 have.  The gap is *distribution of the guarantees to real workloads*.  In
 order:
 
-1. **A native backend that covers the security constructs.**  Capabilities,
-   audit, contracts and transactions refused-by-name are the difference
-   between "a language for safety-critical systems" and "a reference
-   implementation of one".  It starts where `cgen.py` is: implement the
-   audit chain and `CAP_CHECK` in the C runtime (SHA-256 + HMAC are already
-   specced in the Python side), keep the refuse-by-name discipline for the
-   rest.  *Open; the largest single item.*
+1. ~~**A native backend that covers the security constructs.**~~  **Two of the
+   four are done.**  `CAP_CHECK` has been enforced in the C runtime since v1.2,
+   and since v1.4 the audit chain has been too: `gamag_rt.c` implements SHA-256,
+   HMAC-SHA-256 and the canonical-JSON record itself, so a compiled binary writes
+   a trail `ggc audit verify` accepts and that matches the interpreter's byte for
+   byte (`tests/test_native_audit.py`).  *Remaining: transactions (and with them
+   checkpoints and recovery regions), and the contract op -- the core's `holds`
+   already compiles natively because it lowers to `require`, but `Op.CONTRACT`
+   itself is still refused by name.*  The refuse-by-name discipline held
+   throughout: nothing was miscompiled to make a coverage number look better.
 2. ~~**Static discharge for `requires`/`ensures`.~~  **The core's `holds` is
    done in v1.3** (`core/contractproof.py`): closed-form evaluation over the
    constants the graph fixes, interval implication for one sized-integer binding

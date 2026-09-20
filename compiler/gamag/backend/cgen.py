@@ -29,6 +29,7 @@ import sys
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from .. import __version__
 from ..gir.ir import GFunction, GProgram, Instr, Op, Operand
 from ..semantic import types as T
 
@@ -59,13 +60,12 @@ SUPPORTED_OPS = frozenset({
     Op.CONSTRUCT, Op.FIELD, Op.INDEX, Op.SET_INDEX, Op.JUMP, Op.JUMP_IF,
     Op.RETURN, Op.FAULT, Op.MATCH_FAIL, Op.REQUIRE, Op.ASSERT,
     Op.LOAD_GLOBAL, Op.STORE_GLOBAL, Op.SECRET_GUARD, Op.CAP_CHECK,
+    Op.AUDIT,
 })
 
 #: Ops that are refused with a reason, because translating them would produce a
 #: program that looks right and is not.
 UNSUPPORTED_REASONS = {
-    Op.AUDIT: "the audit chain (hash-chained, signed records) has no C "
-              "implementation yet",
     Op.CHECKPOINT: "checkpoint capture and restore are not implemented natively",
     Op.TRANSACTION: "transaction begin/commit are not implemented natively",
     Op.PROTECTED: "recovery regions are not implemented natively",
@@ -351,8 +351,14 @@ class CGenerator:
         for name, fn in self.program.functions.items():
             self.emit(self._signature(name, fn) + ";")
         self.emit()
+        # The audit trail records which build of the language produced it.  The
+        # interpreter takes that from the toolchain version; so does this, at
+        # compile time, so that the two trails agree on the field rather than
+        # agreeing that one of them guessed.
         self.emit("int main(int argc, char **argv)")
         self.emit("{")
+        self.emit('    g_audit_set_context(' + _c_string(__version__)
+                  + ', "0");')
         self.emit("    return g_run(argc, argv, g_declared_grants,")
         self.emit("                 g_declared_grants_n);")
         self.emit("}")
@@ -690,6 +696,27 @@ class CGenerator:
             capability = _c_string(str(instr.meta.get("capability", "")))
             what = _c_string(str(instr.meta.get("what", "")))
             self.emit(f"    g_cap_require({capability}, {what}, {pos});")
+        elif op == Op.AUDIT:
+            # What the intent declared it would record (`trail`), handed to the
+            # runtime as the same flat list of named values the interpreter's
+            # `Op.AUDIT` carries.  Nothing about the record's shape is decided
+            # here on purpose: the field order, the canonical JSON, the digest
+            # and the chaining are the runtime's, and they have to be, because a
+            # trail the reference verifier cannot re-hash proves nothing about
+            # the run that wrote it.  The braces are a scope, so a function with
+            # several trail clauses declares its keys once per clause.
+            keys = [str(k) for k in instr.meta.get("keys", ())]
+            args = list(instr.args)[:len(keys)]
+            listed = ", ".join(_c_string(k) for k in keys) or '""'
+            vals = ", ".join(self._operand(a) for a in args) or "g_unit()"
+            self.emit("    {   /* `trail`: this record is what the program "
+                      "promised to record */")
+            self.emit(f"        static const char *const g_audit_keys[] = "
+                      f"{{{listed}}};")
+            self.emit(f"        GValue g_audit_vals[] = {{{vals}}};")
+            self.emit(f"        g_audit_record(\"info\", {len(keys)}, "
+                      f"g_audit_keys, g_audit_vals);")
+            self.emit("    }")
         elif op == Op.SECRET_GUARD:
             # The guard is a compile-time property that survives into the IR so
             # that it is visible; the runtime refusal lives in g_display.
