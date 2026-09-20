@@ -376,30 +376,50 @@ def run_source(source: str, path: str = "<source>", *, entry: str = "main",
                                 context=context, grants=grants)
 
 
+def declared_grants(compilation: "Compilation") -> Set[str]:
+    """The capabilities the *program itself* asks for.
+
+    A ``grant`` header in the older dialect, or ``authority`` on a core intent,
+    which the lowerer writes into :attr:`GProgram.grants`.  This is a request,
+    not authority: spec section 12 says "no ambient filesystem access", and a
+    program that could confer a capability on itself by writing it down would
+    have exactly that.
+
+    Keeping the request separate from the grant is what lets a deployment decide.
+    `ggc run` chooses to honour these (the user chose to run this program);
+    an embedder that calls `execute` gets only what it passes.
+    """
+    declared: Set[str] = set()
+    if compilation.program is not None:
+        declared |= set(compilation.program.grants)
+    if compilation.checker is not None:
+        declared |= set(compilation.checker.grants)
+    return declared
+
+
 def program_grants(compilation: "Compilation",
                    extra: Sequence[str] = ()) -> Set[str]:
-    """Every capability a run of this compilation is granted.
+    """The authority a run of this compilation actually has.
 
-    Three sources, and a core program relies on the second:
+    One source: what the caller supplied.  A capability the program merely
+    declared is *not* included, because including it made the whole capability
+    system decorative -- a program could read any file it liked by writing
+    ``grant FileRead`` at the top, which is the ambient authority spec section 12
+    forbids by name.
 
-    * what the caller asked for, on the command line or in a test harness;
-    * what the *program* declares -- a ``grant`` header in the older dialect, or
-      ``authority`` on a core intent, which the lowerer writes into
-      :attr:`GProgram.grants`;
-    * what the older checker resolved, when there is one.
+    A caller that has decided to trust a program's declarations can say so
+    explicitly, and `ggc run` does exactly that, in one place, where the decision
+    is visible:
 
-    Reading only the checker's grants is the defect this replaces. A core program
-    has no checker, so its declared authority reached nothing at all: the compiler
-    proved every capability demand was covered and the runtime then denied every
-    one of them, which looks like a bug in the program and is a disagreement
-    between two halves of the toolchain.
+        grants = set(args.grant)
+        if not args.strict_authority:
+            grants |= declared_grants(compilation)
+
+    The checker's grants are not included either.  They are the same
+    declarations seen from the older front end, so including them would reopen
+    the hole this closes.
     """
-    granted = set(extra)
-    if compilation.program is not None:
-        granted |= set(compilation.program.grants)
-    if compilation.checker is not None:
-        granted |= set(compilation.checker.grants)
-    return granted
+    return set(extra)
 
 
 def find_entry(compilation: Compilation, preferred: str = "main") -> Optional[str]:

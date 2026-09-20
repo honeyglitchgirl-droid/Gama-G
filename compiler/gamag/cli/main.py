@@ -19,11 +19,12 @@ import json
 import os
 import random
 import sys
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from .. import GIR_VERSION, SPEC_VERSION, __version__
 from ..diagnostics import GamaRuntimeFault
-from ..driver import Compilation, compile_file, execute, find_entry, program_grants
+from ..driver import (Compilation, compile_file, declared_grants, execute,
+                       find_entry)
 from ..std import library as L
 
 EXIT_OK = 0
@@ -170,6 +171,59 @@ def build_parser() -> argparse.ArgumentParser:
                    help="how many distinct failures to print (default: 12)")
     p.add_argument("--json", action="store_true")
 
+    p = sub.add_parser(
+        "gpm",
+        help="resolve, lock, verify and audit packages (spec section 30)")
+    gpm = p.add_subparsers(dest="gpm_command", metavar="SUBCOMMAND")
+    # Named `action` rather than `sub`: the outer subparsers handle is also
+    # called `sub`, and shadowing it made the next add_parser call fail.
+    action = gpm.add_parser("resolve", help="resolve dependencies and report")
+    action.add_argument("--dir", default=".", metavar="DIR")
+    action.add_argument("--registry", action="append", default=[],
+                        metavar="DIR", help="a registry root (repeatable)")
+    action.add_argument("--write-lock", action="store_true",
+                        help="write gama.lock")
+    action.add_argument("--json", action="store_true")
+    action = gpm.add_parser("verify", help="check packages against gama.lock")
+    action.add_argument("--dir", default=".", metavar="DIR")
+    action.add_argument("--registry", action="append", default=[],
+                        metavar="DIR")
+    action.add_argument("--json", action="store_true")
+    action = gpm.add_parser("audit",
+                            help="check resolved versions against advisories")
+    action.add_argument("--dir", default=".", metavar="DIR")
+    action.add_argument("--registry", action="append", default=[],
+                        metavar="DIR")
+    action.add_argument("--advisories", default=".", metavar="DIR")
+    action = gpm.add_parser("sign", help="sign a package's contents")
+    action.add_argument("package", metavar="DIR")
+    action.add_argument("--key", required=True, metavar="FILE",
+                        help="the Ed25519 secret key (hex)")
+    action = gpm.add_parser("keygen", help="create a signing key")
+    action.add_argument("--key", default=".gama-signing-key", metavar="FILE")
+    action = gpm.add_parser("show", help="print a package manifest")
+    action.add_argument("package", metavar="DIR")
+
+    p = sub.add_parser(
+        "manifest",
+        help="produce a reproducible, optionally signed build manifest")
+    # Files are optional here because `--verify` reads a manifest rather than
+    # compiling anything, and add_common's `nargs="+"` would make that
+    # impossible to invoke without naming a program.
+    add_common(p, files=False)
+    p.add_argument("files", nargs="*", metavar="FILE.gg",
+                   help="Gama-G source files")
+    p.add_argument("--verify", metavar="FILE", help="verify this manifest")
+    p.add_argument("--sign-key", metavar="FILE",
+                   help="sign with this Ed25519 secret key")
+    p.add_argument("--sign", action="store_true",
+                   help="create a key first if --sign-key is not given")
+    p.add_argument("--check-reproducible", type=int, default=0, metavar="N",
+                   help="build N times and compare the manifests")
+    p.add_argument("--target", default="interpreter",
+                   choices=("interpreter", "native"))
+    p.add_argument("-o", "--output", metavar="PATH")
+
     p = sub.add_parser("run", help="compile and execute")
     add_common(p)
     p.add_argument("--entry", metavar="NAME", default="main",
@@ -180,9 +234,16 @@ def build_parser() -> argparse.ArgumentParser:
                    help="write the hash-chained audit log here")
     p.add_argument("--lenient-runtime", action="store_true",
                    help="run without the deterministic clock and RNG")
+    p.add_argument("--strict-authority", action="store_true",
+                   help="grant only what --grant names, ignoring the "
+                        "capabilities the program declares; pass this when "
+                        "running code you have not read")
 
     p = sub.add_parser("test", help="run the program's `test` declarations")
     add_common(p)
+    p.add_argument("--strict-authority", action="store_true",
+                   help="grant only what --grant names, ignoring the "
+                        "capabilities the program declares")
 
     p = sub.add_parser("explain", help="describe the language surface")
     p.add_argument("topic", nargs="?", default="modules",
@@ -199,6 +260,28 @@ def build_parser() -> argparse.ArgumentParser:
 # ----------------------------------------------------------------------
 # helpers
 # ----------------------------------------------------------------------
+def _authority(compilation: Compilation, args) -> Set[str]:
+    """The capabilities this run has, and the one place trust is decided.
+
+    Spec section 12 requires "no ambient filesystem access", so authority comes
+    from the deployment and not from the program: a program that could grant
+    itself a capability by writing `grant FileRead` has ambient authority under
+    another name.  The library enforces that (`driver.program_grants` returns
+    only what the caller supplied).
+
+    The command line is the deployment here, and the user chose to run this
+    file, so `ggc run examples/medical_dosing.gg` honours what the file declares
+    rather than demanding the flags be repeated.  The decision is taken here,
+    once, and is visible: `--strict-authority` refuses it, which is what a
+    supervisor running code it has not read should pass.
+    """
+    grants = set(args.grant)
+    if not getattr(args, "strict_authority", False):
+        grants |= declared_grants(compilation)
+    return grants
+
+
+
 def _examples_dir() -> str:
     """Where the shipped examples live, for commands that default to them.
 
@@ -492,7 +575,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         from ..runtime.context import Context
         ctx = Context(
             deterministic=not args.lenient_runtime,
-            grants=program_grants(compilation, args.grant),
+            grants=_authority(compilation, args),
             program_version=__version__)
         result = execute(compilation, entry=entry, context=ctx)
         if not result.ok:
@@ -558,7 +641,7 @@ def cmd_test(args: argparse.Namespace) -> int:
             category = categories.get(name, "")
             total += 1
             ctx = Context(deterministic=True,
-                          grants=program_grants(compilation, args.grant))
+                          grants=_authority(compilation, args))
             from ..runtime.vm import VM
             vm = VM(compilation.program, ctx, compilation.checker)
             try:
@@ -969,7 +1052,216 @@ def cmd_fuzz(args: argparse.Namespace) -> int:
     return EXIT_OK if not campaign.distinct else EXIT_TEST
 
 
+def cmd_gpm(args: argparse.Namespace) -> int:
+    """Package resolution, verification and auditing (spec section 30)."""
+    from ..gpm import package as packages
+
+    command = args.gpm_command
+    if command == "keygen":
+        from ..toolchain import buildinfo
+        secret, public = buildinfo.generate_key(args.key)
+        print(f"wrote a signing key to {args.key} (mode 0600)")
+        print(f"  public key: {buildinfo.ed25519.to_hex(public)}")
+        print("  the secret is not printed and is not recoverable; keep it out "
+              "of the repository")
+        return EXIT_OK
+
+    if command == "show":
+        manifest = packages.PackageManifest.read(args.package)
+        print(manifest.to_json().rstrip())
+        return EXIT_OK
+
+    if command == "sign":
+        from ..toolchain import buildinfo
+        try:
+            secret = buildinfo.load_key(args.key)
+        except (OSError, ValueError) as exc:
+            print(f"cannot read the signing key: {exc}", file=sys.stderr)
+            return EXIT_USAGE
+        manifest = packages.PackageManifest.read(args.package)
+        digest = manifest.sign(secret, args.package)
+        manifest_path = os.path.join(args.package, packages.MANIFEST_NAME)
+        with open(manifest_path, "w", encoding="utf-8") as handle:
+            handle.write(manifest.to_json())
+        print(f"signed {manifest.name} {manifest.version}")
+        print(f"  content hash: {digest}")
+        print(f"  public key:   {manifest.public_key}")
+        return EXIT_OK
+
+    roots = args.registry or [os.path.join(args.dir, "registry"),
+                              os.path.expanduser("~/.gama/registry")]
+    registry = packages.Registry(roots=[r for r in roots if os.path.isdir(r)])
+
+    if command in (None, "resolve"):
+        manifest_path = packages.find_manifest(args.dir)
+        if manifest_path is None:
+            print(f"no {packages.MANIFEST_NAME} at or above {args.dir}",
+                  file=sys.stderr)
+            return EXIT_USAGE
+        root = packages.PackageManifest.read(os.path.dirname(manifest_path))
+        resolution = packages.resolve(root, registry)
+        if getattr(args, "json", False):
+            print(json.dumps({
+                "root": f"{root.name} {root.version}",
+                "registry": registry.roots,
+                "resolved": [e.to_dict() for e in resolution.ordered()],
+                "constraints": resolution.constraints,
+                "problems": resolution.problems,
+            }, indent=2, sort_keys=True))
+        else:
+            print(f"{root.name} {root.version}: "
+                  f"{len(resolution.resolved)} dependency(ies)")
+            for entry in resolution.ordered():
+                why = ", ".join(entry.dependency_of) or "direct"
+                print(f"  {entry.name:24} {str(entry.version):10} "
+                      f"{entry.content_hash[:16]}  ({why})")
+            print()
+            for problem in resolution.problems:
+                print(f"  ! {problem}")
+            if not resolution.problems:
+                print("  every constraint is satisfied")
+        if getattr(args, "write_lock", False) and resolution.ok:
+            lock = packages.Lock.from_resolution(resolution,
+                                                 root=f"{root.name} {root.version}")
+            path = lock.write(os.path.dirname(manifest_path))
+            print(f"wrote {path}")
+        return EXIT_OK if resolution.ok else EXIT_COMPILE
+
+    if command == "verify":
+        try:
+            lock = packages.Lock.read(args.dir)
+        except packages.PackageError as exc:
+            print(str(exc), file=sys.stderr)
+            return EXIT_USAGE
+        result = packages.verify_lock(lock, registry)
+        if getattr(args, "json", False):
+            print(json.dumps({"ok": result.ok, "checked": result.checked,
+                              "signed": result.verified_signatures,
+                              "unsigned": result.unsigned,
+                              "problems": result.problems}, indent=2))
+        else:
+            for line in result.render():
+                print(line)
+        return EXIT_OK if result.ok else EXIT_COMPILE
+
+    if command == "audit":
+        try:
+            lock = packages.Lock.read(args.dir)
+        except packages.PackageError as exc:
+            print(str(exc), file=sys.stderr)
+            return EXIT_USAGE
+        advisories = packages.load_advisories(args.advisories)
+        report = packages.audit(lock, advisories)
+        for line in report.render():
+            print(line)
+        return EXIT_TEST if report.hits else EXIT_OK
+
+    print(f"unknown gpm subcommand {command!r}", file=sys.stderr)
+    return EXIT_USAGE
+
+
+def cmd_manifest(args: argparse.Namespace) -> int:
+    """A reproducible, optionally signed record of what was built.
+
+    The point is the reproducibility check: a manifest nobody can reproduce is
+    not evidence of anything, so `--check-reproducible` builds twice and
+    compares.  Signing is Ed25519, which proves identity; a keyed hash would
+    only have proved possession of a shared secret.
+    """
+    from ..driver import compile_source
+    from ..toolchain import buildinfo
+
+    if args.verify:
+        try:
+            with open(args.verify, "r", encoding="utf-8") as handle:
+                signed = buildinfo.SignedManifest.from_json(handle.read())
+        except (OSError, ValueError, KeyError) as exc:
+            print(f"cannot read the manifest: {exc}", file=sys.stderr)
+            return EXIT_USAGE
+        problems = buildinfo.verify_manifest(signed)
+        if args.json:
+            print(json.dumps({"ok": not problems, "problems": problems,
+                              "digest": signed.digest,
+                              "signed": signed.signed}, indent=2))
+        else:
+            if problems:
+                print("manifest verification FAILED")
+                for problem in problems:
+                    print(f"  - {problem}")
+            else:
+                print(f"manifest verification ok")
+                print(f"  digest: {signed.digest}")
+                if signed.signed:
+                    print(f"  signed by: {signed.public_key}")
+        return EXIT_OK if not problems else EXIT_COMPILE
+
+    if not args.verify and not args.files:
+        print("name at least one FILE.gg, or pass --verify FILE",
+              file=sys.stderr)
+        return EXIT_USAGE
+
+    compilations, status = _compile(args.files, args)
+    if status != EXIT_OK:
+        for compilation in compilations:
+            _report(compilation, not args.no_color, args.json)
+        return status
+
+    secret = None
+    if args.sign_key:
+        try:
+            secret = buildinfo.load_key(args.sign_key)
+        except (OSError, ValueError) as exc:
+            print(f"cannot read the signing key: {exc}", file=sys.stderr)
+            return EXIT_USAGE
+    elif args.sign:
+        path = ".gama-build-key"
+        secret, public = buildinfo.generate_key(path)
+        print(f"no signing key was given, so one was created at {path}")
+        print(f"  public key: {buildinfo.ed25519.to_hex(public)}")
+
+    exit_code = EXIT_OK
+    for compilation in compilations:
+        if compilation.program is None:
+            continue
+
+        def build_one():
+            return buildinfo.build_manifest(
+                source_path=compilation.path, source_text=compilation.source,
+                program=compilation.program, profile=compilation.profile,
+                opt_level=compilation.opt_level, target=args.target)
+
+        if args.check_reproducible:
+            report = buildinfo.reproducibility_report(
+                compilation.path, compilation.source, build_one,
+                runs=args.check_reproducible)
+            for line in report.render():
+                print(line)
+            if not report.reproducible:
+                exit_code = EXIT_TEST
+            print()
+
+        signed = buildinfo.sign_manifest(build_one(), secret)
+        if args.json:
+            print(signed.to_json())
+        else:
+            print(f"{compilation.path}")
+            print(f"  program hash:  {signed.manifest['program_sha256'][:32]}")
+            print(f"  manifest digest: {signed.digest}")
+            print(f"  signed: {'yes' if signed.signed else 'no'}"
+                  + (f" ({signed.public_key[:16]}...)" if signed.signed else ""))
+            if not signed.signed:
+                print("  unsigned means this manifest proves the build was "
+                      "reproducible, not who produced it")
+        if args.output:
+            with open(args.output, "w", encoding="utf-8") as handle:
+                handle.write(signed.to_json())
+            print(f"  written to {args.output}")
+    return exit_code
+
+
 COMMANDS = {
+    "gpm": cmd_gpm,
+    "manifest": cmd_manifest,
     "check": cmd_check,
     "native": cmd_native,
     "difftest": cmd_difftest,

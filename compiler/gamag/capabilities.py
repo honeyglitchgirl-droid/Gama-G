@@ -25,6 +25,11 @@ KNOWN_CAPABILITIES = frozenset({
     "FileRead", "FileWrite", "NetworkConnect", "DatabaseRead", "DatabaseWrite",
     "PatientRead", "PatientWrite", "CryptoSign", "AuditWrite", "ProcessSpawn",
     "EnvironmentRead", "SecretExpose", "ModelLoad", "Network",
+    # Spec section 29: "FFI must be explicitly marked unsafe/trusted where
+    # memory ownership cannot be verified by Gama-G."  `ForeignCall` is that
+    # marking in the authority system, and the `unsafe` effect is the same
+    # marking in the type system; a foreign call needs both.
+    "ForeignCall",
 })
 
 

@@ -1803,6 +1803,23 @@ MODULE_TYPE_NAMES: Dict[str, T.ModuleType] = {
 }
 
 
+def refresh_module_names() -> None:
+    """Rebuild the module-name table from `MODULES`.
+
+    This table is snapshotted when this module is imported, so a module that
+    registers its builtins *later* -- `ffi`, or the interoperability and
+    enterprise modules -- would be present in `BUILTINS` and absent from the
+    checker's global scope, and every call to it would fail with "cannot find
+    `ffi` in this scope" while the effect checker could see it perfectly well.
+    That contradiction is what `tests/test_interop.py` checks for.
+
+    Called by `gamag.std` once every extension module has been imported, so the
+    table has exactly one source of truth: `MODULES`.
+    """
+    for module in MODULES:
+        MODULE_TYPE_NAMES.setdefault(module, T.ModuleType(module))
+
+
 def lookup(qualified: str) -> Optional[Builtin]:
     return BUILTINS.get(qualified)
 

@@ -320,7 +320,17 @@ class Parser:
                     if eff == "deterministic":
                         fn.deterministic = True
                     elif eff == "unsafe":
+                        # `unsafe` is both a modifier and an effect: the flag
+                        # records that the function asked for it, and the effect
+                        # list is what the effect checker compares the inferred
+                        # set against.  Recording only the flag made the
+                        # declaration unusable -- a function that read a line
+                        # saying `unsafe` was then told it performed `unsafe`
+                        # without declaring it, and the marker spec section 29
+                        # requires for foreign calls could never be satisfied.
                         fn.unsafe = True
+                        if eff not in fn.effects:
+                            fn.effects.append(eff)
                     elif eff not in fn.effects:
                         fn.effects.append(eff)
             elif isinstance(first, A.Contract):
