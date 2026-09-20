@@ -704,7 +704,13 @@ let x = 1
 outcome a
 """)
         out.assert_rejected(self)
-        self.assertIn("there are no statements", out.messages())
+        # The message names what *is* allowed, which now includes `fn`
+        # helpers:
+        # the two declaration families share a file (see tests/test_unified.py),
+        # so a message that still said "there are no statements" and stopped
+        # would be describing the language this used to be.
+        self.assertIn("there are no top-level statements", out.messages())
+        self.assertIn("fn", out.messages())
 
     def test_two_intents_are_refused(self):
         out = S.run("""gama core 0.2

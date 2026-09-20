@@ -130,9 +130,15 @@ class NativeChecker:
     producer table with types attached.
     """
 
-    def __init__(self, model: M.SemanticModel, bag: DiagnosticBag):
+    def __init__(self, model: M.SemanticModel, bag: DiagnosticBag,
+                 helpers: Optional[Dict[str, Any]] = None):
         self.m = model
         self.bag = bag
+        #: `fn` helpers declared in the same core file, as {name: Signature}.
+        #: The two declaration families share one file, so the core's checker
+        #: has to be able to see a helper's signature; without this a core
+        #: `computes` could not call a function written three lines above it.
+        self.helpers: Dict[str, Any] = dict(helpers or {})
         self.env: Dict[str, T.Type] = {}
         self.producer: Dict[str, M.OpNode] = {}
         self.node_effects: Dict[str, Set[str]] = {}
@@ -507,6 +513,27 @@ class NativeChecker:
 
     def _infer_call(self, expr: M.MCall) -> T.Type:
         key = self._builtin_key(expr)
+        helper = self.helpers.get(key) if not expr.module else None
+        if helper is not None:
+            arg_types = [self.infer(a) for a in expr.args]
+            expected = helper.params
+            if len(arg_types) != len(expected):
+                self.error(
+                    f"`{key}` takes {len(expected)} argument(s) "
+                    f"({', '.join(p for p, _t in expected)}), found "
+                    f"{len(arg_types)}", expr.pos, code="E-arity")
+                return T.ERROR
+            for (pname, ptype), actual, argument in zip(expected, arg_types,
+                                                        expr.args):
+                if actual is T.ERROR or ptype is T.ERROR:
+                    continue
+                if not actual.assignable_to(ptype):
+                    self.error(
+                        f"argument `{pname}` of `{key}` is declared "
+                        f"{ptype.render()} but this is {actual.render()}",
+                        getattr(argument, "pos", expr.pos),
+                        code="E-arg-type")
+            return helper.returns
         builtin = L.BUILTINS.get(key)
         if builtin is None:
             self.error(f"`{key}` is not an operation the standard library "
@@ -548,9 +575,10 @@ class NativeChecker:
         return builtin.ret or T.ANY
 
 
-def check(model: M.SemanticModel, bag: DiagnosticBag) -> NativeChecker:
+def check(model: M.SemanticModel, bag: DiagnosticBag,
+          helpers: Optional[Dict[str, Any]] = None) -> NativeChecker:
     """Public entry point: check the model, recording types on its nodes."""
-    checker = NativeChecker(model, bag)
+    checker = NativeChecker(model, bag, helpers)
     checker.check()
     return checker
 
@@ -1348,6 +1376,13 @@ class Lowerer:
             args = [self.expr(a) for a in node.args]
             key = self.c._builtin_key(node)
             dst = self.temp(self.c.infer(node))
+            if not node.module and key in self.c.helpers:
+                # A helper declared in this file.  It is already a GIR function
+                # -- the v0.1 front end lowered it into this same module -- so
+                # this is an ordinary direct call, not a library dispatch.
+                self.emit(Op.CALL, args, dst=dst, type_=node.type,
+                          meta={"callee": key}, pos=node.pos)
+                return self.slot_op(dst)
             self.emit(Op.BUILTIN, args, dst=dst, type_=node.type,
                       meta={"name": key}, pos=node.pos)
             return self.slot_op(dst)

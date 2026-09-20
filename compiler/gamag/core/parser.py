@@ -81,6 +81,35 @@ class CoreSyntax:
     outcome: str = ""
     outcome_pos: Optional[SourcePos] = None
     filename: str = "<core>"
+    #: `fn` declarations written in a core file, captured as token spans and
+    #: compiled by the same front end that compiles a v0.1 module.  This is the
+    #: seam that makes the two surfaces one language rather than two: the
+    #: declaration families live in one file, one pipeline compiles them, and
+    #: one GIR module is the result.
+    functions: List["CoreFunction"] = field(default_factory=list)
+
+
+@dataclass
+class CoreFunction:
+    """A `fn` declaration found in a core program, still as tokens.
+
+    Held as tokens rather than as an AST because the v0.1 parser is the thing
+    that understands a function body, and re-implementing that here would mean
+    two definitions of what a function is -- which is the problem the merge
+    exists to remove.
+    """
+
+    name: str
+    tokens: List[Token] = field(default_factory=list)
+    pos: Optional[SourcePos] = None
+
+    def source_text(self, whole: str) -> str:
+        if not self.tokens:
+            return ""
+        start = self.tokens[0].pos.offset
+        end = self.tokens[-1].end.offset if self.tokens[-1].end \
+            else self.tokens[-1].pos.offset + len(self.tokens[-1].text)
+        return whole[start:end]
 
 
 class CoreParser:
@@ -190,13 +219,17 @@ class CoreParser:
                 break
             tok = self.peek()
             word = tok.text if tok.kind is TokenKind.IDENT else ""
+            if word == "fn" or tok.kind is TokenKind.FN:
+                syntax.functions.append(self._function())
+                continue
             if word not in DECL_WORDS:
                 raise self.error(
                     f"expected a core declaration but found {tok.descr}", tok,
                     help_text="a core program is a set of `intent`, `source`, "
                               "`state`, `operation`, `refine`, `each`, "
                               "`resolve`, `transition` and `outcome` "
-                              "declarations; there are no statements")
+                              "declarations, plus `fn` helper functions; "
+                              "there are no top-level statements")
             if word == "intent":
                 if syntax.intent.name:
                     raise self.error("a core program declares one intent", tok)
@@ -216,6 +249,50 @@ class CoreParser:
             else:
                 syntax.nodes.append(self._operation(word))
         return syntax
+
+    def _function(self) -> CoreFunction:
+        """Capture a `fn` declaration as a token span.
+
+        The span ends at the next token that starts a line in column one, which
+        is where the body's indentation ends.  Using the lexer's INDENT/DEDENT
+        would be tidier, and it would also tie this to the lexer's block rules;
+        column one is what the language actually promises a reader, and the
+        v0.1 parser re-derives the block structure from the same tokens anyway.
+        """
+        start = self.i
+        first = self.adv()                       # `fn`
+        name_tok = self.peek()
+        name = name_tok.text if name_tok.kind is TokenKind.IDENT else ""
+        self.i = start
+        tokens: List[Token] = []
+        while self.i < len(self.toks):
+            tok = self.toks[self.i]
+            if tok.kind is TokenKind.EOF:
+                break
+            if tokens and tok.kind is not TokenKind.SEPARATOR \
+                    and tok.kind is not TokenKind.NEWLINE \
+                    and tok.kind is not TokenKind.DEDENT \
+                    and tok.kind is not TokenKind.INDENT \
+                    and tok.pos.col == 1:
+                break
+            tokens.append(tok)
+            self.i += 1
+        # Trimming is done on the captured copy, and the stream is advanced
+        # *forward* past the trailing structure.  Winding `self.i` back instead
+        # left a DEDENT for the outer loop, which then reported "expected a core
+        # declaration but found dedent" -- the function had been read correctly
+        # and the parser had lost its place.
+        # Only whitespace-like tokens are trimmed.  The closing DEDENT stays:
+        # it is what tells the v0.1 parser where the body ended, and dropping it
+        # produced "unexpected end of file inside body of function `double`" for
+        # a function whose body was captured in full.
+        while tokens and tokens[-1].kind in (TokenKind.NEWLINE,
+                                             TokenKind.SEPARATOR):
+            tokens.pop()
+        while self.i < len(self.toks) and self.toks[self.i].kind in (
+                TokenKind.NEWLINE, TokenKind.SEPARATOR, TokenKind.DEDENT):
+            self.i += 1
+        return CoreFunction(name=name, tokens=tokens, pos=first.pos)
 
     def _pragma(self) -> str:
         """`gama core <version>` -- how the driver detects the dialect."""

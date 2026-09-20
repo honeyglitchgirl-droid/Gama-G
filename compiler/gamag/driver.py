@@ -253,10 +253,24 @@ def _compile_core(c: "Compilation", source: str, *, profile: str,
         c.stopped_at = "graph"
         return c
 
+    # `fn` helpers written in this core file, compiled first so the core
+    # checker can resolve a call to one.  They go through the v0.1 parser, the
+    # v0.1 checker and the v0.1 lowering -- the same pipeline a v0.1 module
+    # uses -- and the GIR they produce is merged into this module below.
+    helpers = _Helpers()
+    if c.core_syntax.functions:
+        helpers = _compile_helpers(c, source, profile)
+        for diag in helpers.diagnostics:
+            if diag not in c.bag.diagnostics:
+                c.bag.add(diag)
+        if not helpers.ok:
+            c.stopped_at = "helpers"
+            return c
+
     # The checker is kept, not discarded: it holds the resolved type of every
     # binding and every expression, which is exactly what lowering needs.
     # Building a second checker would lower against an empty environment.
-    checker = core_native.check(c.core_model, model_bag)
+    checker = core_native.check(c.core_model, model_bag, helpers.signatures)
     for diag in model_bag.diagnostics:
         if diag not in c.bag.diagnostics:
             c.bag.add(diag)
@@ -308,12 +322,132 @@ def _compile_core(c: "Compilation", source: str, *, profile: str,
         return c
     c.timings.lower = time.perf_counter() - t0
 
+    # `fn` helpers written in a core file.  They are compiled by the v0.1 front
+    # end -- the same parser, the same checker, the same lowering -- and merged
+    # into the one GIR module the core produced.  That is what makes the two
+    # surfaces one language: the declaration families share a file, a pipeline
+    # and an output, rather than being two dialects the driver chooses between.
+    if helpers.program is not None:
+        _merge_programs(c.program, helpers.program)
+
     if opt_level > 0:
         t0 = time.perf_counter()
         c.optimization = optimize(c.program, opt_level,
                                   deterministic=(profile == "strict"))
         c.timings.optimize = time.perf_counter() - t0
     return c
+
+
+@dataclass
+class HelperSignature:
+    """A helper's parameters and result, for the core checker to resolve against."""
+
+    params: List[Any] = field(default_factory=list)   # [(name, type), ...]
+    returns: Any = None
+
+
+@dataclass
+class _Helpers:
+    """The result of compiling a core program's `fn` declarations."""
+
+    ok: bool = True
+    program: Optional[Any] = None
+    diagnostics: List[Any] = field(default_factory=list)
+    signatures: Dict[str, HelperSignature] = field(default_factory=dict)
+
+
+def _compile_helpers(c: "Compilation", source: str,
+                     profile: str) -> _Helpers:
+    """Compile the `fn` declarations captured from a core program.
+
+    The tokens carry their original positions, so a diagnostic inside a helper
+    points at the helper in the user's file rather than at a synthesized one.
+    That is the reason the capture keeps tokens instead of text.
+    """
+    from .core.parser import CoreFunction
+    from .gir.builder import build_program
+    from .lexer import tokenize
+    from .parser import Parser
+    from .semantic.checker import check_module
+    from .semantic import types as T
+    from .tokens import Token, TokenKind
+
+    out = _Helpers()
+    # No `if c.program is None` guard here.  Helpers are compiled *before* the
+    # core is lowered, so the module does not exist yet -- the guard was left
+    # over from when they were compiled afterwards, and it silently returned an
+    # empty result, which then made every helper call an unknown call.
+    tokens: List[Any] = []
+    for function in c.core_syntax.functions:
+        if tokens:
+            # A separator between declarations, so the parser sees them as
+            # separate top-level items rather than one run-on declaration.
+            last = tokens[-1]
+            tokens.append(Token(kind=TokenKind.NEWLINE, text="\n",
+                                pos=last.pos, end=last.pos, value=None))
+        tokens.extend(function.tokens)
+
+    # A token stream without an EOF ends the parser in an IndexError rather than
+    # at the end of the module, so the terminator is part of the contract.
+    if tokens:
+        last = tokens[-1]
+        tokens.append(Token(kind=TokenKind.EOF, text="", pos=last.pos,
+                            end=last.pos, value=None))
+
+    try:
+        module = Parser(tokens, c.path, source).parse_module()
+    except GamaError as exc:
+        out.diagnostics.append(exc.diagnostic)
+        out.ok = False
+        return out
+
+    checker, bag = check_module(module, source, profile=profile)
+    out.diagnostics.extend(bag.diagnostics)
+    if not bag.ok:
+        out.ok = False
+        return out
+
+    # The signatures the core checker needs.  Taken from the checked module
+    # rather than re-derived, so there is one answer to "what type is this
+    # parameter" and it is the checker's.
+    for name, info in getattr(checker, "functions", {}).items():
+        fn_type = getattr(info, "fn_type", None)
+        if fn_type is None:
+            continue
+        names = getattr(fn_type, "param_names", ()) or ()
+        out.signatures[name] = HelperSignature(
+            params=[(names[i] if i < len(names) else f"arg{i}", param)
+                    for i, param in enumerate(fn_type.params)],
+            returns=fn_type.ret)
+
+    try:
+        program = build_program(module, checker)
+    except GamaError as exc:
+        out.diagnostics.append(exc.diagnostic)
+        out.ok = False
+        return out
+    except Exception as exc:                        # noqa: BLE001
+        bag.error(f"internal compiler error while lowering a helper function: "
+                  f"{exc}", phase=Phase.GIR, code="E-ice")
+        out.diagnostics.append(bag.diagnostics[-1])
+        out.ok = False
+        return out
+    out.program = program
+    return out
+
+
+def _merge_programs(core: Any, helpers: Any) -> None:
+    """Fold the helpers' functions into the core program's module.
+
+    A name that already exists in the core module is left alone and reported by
+    the core checker rather than silently overwritten: two functions with one
+    name is a program the user did not write.
+    """
+    if core is None or helpers is None:
+        return
+    for name, function in helpers.functions.items():
+        core.functions.setdefault(name, function)
+    core.grants = tuple(dict.fromkeys(tuple(core.grants) + tuple(helpers.grants)))
 
 
 def compile_file(path: str, **kwargs: Any) -> Compilation:
