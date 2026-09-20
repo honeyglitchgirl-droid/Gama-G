@@ -371,20 +371,24 @@ class ForbiddenClaims(unittest.TestCase):
                          "the exemption list names documents that are not in "
                          "the repository; prune it: " + ", ".join(exempt_missing))
 
-    # What an exempted document must still contain, lower-cased.  The
-    # exemption is earned by disclaiming, so if the disclaimer is deleted the
-    # exemption must be withdrawn too.
+    # What an exempted document must still contain, lower-cased.  The exemption
+    # is earned by disclaiming, so if the disclaimer is deleted the exemption
+    # must be withdrawn -- and the *content* of the disclaimer has to track
+    # reality.  These phrases said "no native backend" until a native backend
+    # existed; leaving them would have made the exemption a way to keep making a
+    # claim that had stopped being true.
     REQUIRED_DISCLAIMERS = {
         "docs/IMPLEMENTATION.md": (
             "does not make",          # "Claims this implementation does not make"
-            "no native backend",
-            "no benchmark against native code",
+            "no performance claim",
+            "refuses by name",
+            "never executed here",
             "no automatic medical, legal or regulatory compliance",
         ),
         "README.md": (
             "does not claim",         # "What this does not claim"
-            "no native backend",
-            "no benchmark against native code",
+            "no performance claim",
+            "no wasm runtime",
             "no automatic medical, legal or regulatory compliance",
         ),
     }

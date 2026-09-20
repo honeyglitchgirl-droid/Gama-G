@@ -238,35 +238,83 @@ Priority 3 (a native CPU backend) and priorities 7–16 are still untouched.
 
 ---
 
+## v1.0: one language, one version
+
+Earlier milestones built the language's two surfaces separately, and the
+toolchain showed it: a core file could not contain a function, and a core
+expression could not call one.  That split is gone.  Both declaration families
+now live in one file and share a lexer, a parser, a checker and a pipeline:
+
+```gamag
+gama core 0.2
+intent Rounding
+    purpose   round a measurement to a whole number
+
+source reading : F64 from 5.4
+
+fn round_half_up(x: F64) -> I64          // a helper
+    pure
+    return math.round(x)
+
+operation Rounded                         // a core operation calling it
+    uses     reading
+    yields   whole : I64
+    effect   pure
+    computes round_half_up(reading)
+
+outcome whole
+```
+
+The helper is compiled by the same front end that compiles a module of `fn`
+declarations, and its GIR is merged into the module the core produced.  By the
+time anything downstream sees the program there is one module with one optimizer
+and one set of backends.
+
+This release also adds the rest of the second audit's priorities: a **native CPU
+backend** with **differential testing** against the interpreter, a
+**WebAssembly** encoder, an **accelerator** device layer, **benchmarking**,
+**fuzzing** as a permanent tool, **reproducible signed builds**, a **package
+manager**, an **FFI** to the C ABI, and the **medical** and **enterprise**
+library modules.
+
+---
+
 ## Status
 
 This repository is a **working vertical slice** of
 [`Gama-G_v1.0_Production_Specification.txt`](Gama-G_v1.0_Production_Specification.txt),
-not a finished implementation of it. The specification describes a multi-year,
-multi-team production language across Phases 0–7.
+not a finished implementation of it.  The specification describes a multi-year,
+multi-team production language across Phases 0-7.
 
-What is here: two language surfaces and one machine. The **core**
-(`compiler/gamag/core/`) is the original language described above, compiled
-through its own semantic IR. The **v0.1 surface** is the research /
-vertical-slice reference implementation: a complete compiler front end (lexer,
-parser, name resolution, type/effect/capability/ownership checking), the Gama IR,
-an optimizer, and a reference interpreter, with the safety systems enforced end
-to end. Both dialects run on that one tested machine — 316 passing tests.
+What is here: one language, one pipeline, and four ways to run it.  The compiler
+lexes, parses, derives the semantic graph, checks types, effects, capabilities
+and secret flow, builds the three formal models of v0.4, and lowers to GIR; after
+GIR the same machine serves the reference interpreter, a native CPU backend that
+emits C and compiles it to machine code, a WebAssembly encoder, and an
+accelerator layer.
 
-What is not: **there is no native backend, no package manager and no borrow
-checker.** Programs run on an interpreter. Performance is interpreter-grade and
-**no benchmark against native code has been run or is claimed.**
+**501 tests pass.**  The native backend is validated by *differential testing*:
+the same program is run on the interpreter and on the compiled binary, and their
+stdout, exit status and fault kind are compared.  Where the two could differ --
+integer range checks, float formatting, variadic output -- the C runtime
+reproduces the interpreter rather than approximating it.
 
-The current milestone is **v0.4, the formal semantics of the core**: the second
-audit's priorities 4, 5 and 6, each working end to end with real code, real tests
-and the honest limits named. Priorities 1 and 2 shipped in v0.3. Priority 3 — a
-native CPU backend, which is a multi-session code-generation effort rather than a
-model — is deliberately not started, as are priorities 7–16.
+What is not: **the native and WebAssembly backends cover a subset.**  Programs
+using the audit chain, capabilities, transactions, checkpoints, tensors,
+autodiff or agents are *refused with a reason naming the construct* and run on
+the interpreter instead -- never miscompiled.  Four of the sixteen shipped
+examples compile natively; twelve are refused; none diverges.  There is no
+WebAssembly runtime here, so no module has been executed, and no accelerator
+here, so no kernel has been run.
 
-[`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md) goes through the
-specification section by section and says what is done, what is partial and what
-is missing, including the seventeen-item first-implementation checklist in §44.
-Read it before relying on anything here.
+There is **no wasm runtime** in this environment, so no module this toolchain
+emits has ever been executed; `ggc wasm` says so when it writes one.  There is no
+accelerator either, so no kernel has been run: `ggc device` reports the CPU as
+the device that ran the work rather than falling back silently.
+
+**No performance claim** is made anywhere.  `ggc bench` measures and reports the
+conditions of the measurement, and refuses to compare two runs whose conditions
+differ.
 
 ---
 
@@ -480,8 +528,10 @@ it never invents state.
 Spec §43 lists what Gama-G must never claim, and a test scans the repository for
 the forbidden phrases so they cannot creep in:
 
-- **No universal performance guarantee.** Nothing is benchmarked against native
-  code, because there is no native code.
+- **No universal performance guarantee.** A native backend now exists and
+  `ggc bench` measures it, but a measurement of one program on one machine is
+  not a property of the language.  The harness prints its conditions and refuses
+  to divide two runs whose conditions differ.
 - **No universal accuracy guarantee.** The training example converging on the
   parameters of a linear model is a correctness test, not an accuracy claim
   about any real dataset.

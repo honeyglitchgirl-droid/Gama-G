@@ -9,28 +9,33 @@ optimizer, and a reference interpreter, with the safety systems that define the
 language — types, effects, capabilities, secrets, audit, recovery — enforced
 end to end.
 
-This repository now contains **two language surfaces and one machine**. The
-v0.1 surface described below is the research / vertical-slice reference
-implementation. On top of it sits the **v0.2 original language core**, the
-redesign that
-`Gama-G_Detailed_Audit_and_Verification_Report.txt` §16–18 asked for; it is
-covered in §10 here and in [`DESIGN_v0_2.md`](DESIGN_v0_2.md). On top of that
-sits the **v0.3 native semantic IR**, the answer to
-`Gama-G_Complete_Originality_and_Technical_Audit.txt` §13 and its priorities 1–2;
-it is covered in §11 here and in [`DESIGN_v0_3.md`](DESIGN_v0_3.md). The core
-compiles through its own IR and runs on the v0.1 machine, so both surfaces are
-enforced by the same tested runtime.
+This repository is **Gama-G 1.0**: one language, one pipeline, and four ways to
+run it.
 
-On top of that sits **v0.4, the formal semantics of the core** — the same audit's
-priorities 4–6: an explicit memory/resource model, formal capability semantics,
-and a direct transition/recovery representation. It is covered in §12 here and in
-[`DESIGN_v0_4.md`](DESIGN_v0_4.md). Priority 3, a native CPU backend, is
-deliberately not started.
+Earlier milestones built the language's two surfaces separately, and the
+toolchain showed it -- a core file could not contain a function and a core
+expression could not call one. Both declaration families now live in one file and
+share a lexer, a parser, a checker and a pipeline; the helper's GIR is merged
+into the module the core produced, so nothing after lowering can tell which
+family a function came from. See [`DESIGN_v1_0.md`](DESIGN_v1_0.md) §1.
+
+After GIR the same machine serves the reference interpreter (the semantics
+everything else is compared against), a **native CPU backend** that emits C and
+compiles it to machine code, a **WebAssembly encoder**, and an **accelerator
+layer**. The native backend is validated by *differential testing*: the same
+program is run on the interpreter and on the compiled binary, and stdout, exit
+status and fault kind are compared.
+
+The per-milestone design notes remain as the record of how each part was built:
+[`DESIGN_v0_2.md`](DESIGN_v0_2.md) (the language core),
+[`DESIGN_v0_3.md`](DESIGN_v0_3.md) (the native semantic IR) and
+[`DESIGN_v0_4.md`](DESIGN_v0_4.md) (the three formal models). This document is the
+honest status; `DESIGN_v1_0.md` is the consolidated design.
 
 Everything claimed below is exercised by the test suite (`python3 -m unittest
-discover -s tests`, 318 tests) and demonstrated by a
-runnable example in `examples/` or `examples/core/`. Where a claim is partial,
-the missing part is named.
+discover -s tests`, **501 tests**) and demonstrated by a runnable example in
+`examples/` or `examples/core/`. Where a claim is partial, the missing part is
+named.
 
 ---
 
@@ -44,14 +49,17 @@ the missing part is named.
 | Language surface | 23 hard keywords, 84 contextual keywords, 9 effects |
 | AST node types | 70 |
 | GIR operations | 41 |
-| Tests | 318 (all passing under `unittest discover`) |
+| Tests | 501 (all passing under `unittest discover`) |
 | Examples | 8 v0.1 + 8 core, each runnable with `ggc run` |
 | Language core | 8 modules, ~4,300 lines in `compiler/gamag/core/`; see §10–12 |
 | Formal models | memory · capability · recovery, one module each, plus a
   shared capability algebra; see §12 |
 | Licence | Apache-2.0 (`LICENSE`); version in `VERSION`, packaging in `pyproject.toml` |
 | Dialects | selected per file by the `gama core <version>` pragma |
-| Native backend | **not implemented** — see §5 |
+| Native backend | implemented for a subset; the rest is refused by name — §5 |
+| Other backends | WebAssembly (encodes; never executed here), accelerator (detects; never run here) — §5 |
+| Toolchain | fuzzing, benchmarking, signed builds, package manager, FFI — §5 |
+| Interop | FHIR, terminology, provenance, consent, database, identity, workflow, messaging, observability — §5 |
 
 The compiler runs from a checkout with no installation step:
 
@@ -190,22 +198,47 @@ and broken, so they cannot silently start pretending to work.
 Named deliberately, because spec §43 forbids claiming capability the toolchain
 does not have.
 
-**No native backend.** There is no AOT compiler, no LLVM or WASM target, no
-machine code. Programs execute on the GAEM reference interpreter
-(`runtime/vm.py`), a tree-walking evaluator over GIR. Consequences:
+**The native backend covers a subset**, and refuses by name whatever it cannot
+compile, before writing any C. `ggc native` emits C and compiles it to machine
+code; `ggc difftest` runs the same program on both machines and compares stdout,
+exit status and fault kind. The audit chain, capabilities, transactions,
+checkpoints, recovery regions, tensors, autodiff, agents, method dispatch and
+indirect calls are not implemented natively. Four of the sixteen shipped examples
+compile natively today; twelve are refused; none diverges. A refused program
+still runs on the reference interpreter, which remains the definition of the
+language.
 
-- Performance is interpreter-grade. **No benchmark against native code has been
-  run, and none is claimed.** Spec §24's "≤ 1.05× equivalent optimized native
-  implementation median" is a target for a backend that does not exist here.
-- `Tensor` operations use NumPy when it is importable and fall back to a
-  pure-Python implementation when it is not, so the language has no hard
-  dependency on it. The test suite passes either way; only the speed differs.
-  Tensor-heavy code is therefore not interpreter-bound when NumPy is present,
-  but everything else is.
+The native runtime allocates heap values from an arena and does not free until
+exit, so it does not yet act on the extents the v0.4 memory model computes. It
+computes integers in 64 bits, which is why an integer type wider than that is
+refused at analysis time rather than truncated.
 
-**No package manager.** `gpm` does not exist. There is no dependency
-resolution, registry, lockfile or vendoring. A program is a file or a directory
-of files.
+**The WebAssembly backend has never been executed here.** There is no WASM
+runtime in this environment, so what is claimed is structural conformance, and
+`ggc wasm` says so when it writes a file. The **accelerator layer has never run a
+kernel here** either, for the same reason: no device is present, and the
+placement report says the CPU ran it rather than falling back silently.
+
+**No performance claim is made anywhere.** `ggc bench` measures and reports, with
+the conditions of the measurement (machine, Python, profile, tier) attached to
+every number, percentiles rather than means, and instruction counts alongside
+the timings because they do not depend on machine load. It refuses to compare
+two runs whose conditions differ, because a ratio between incomparable runs is a
+made-up number.
+
+`Tensor` operations use NumPy when it is importable and fall back to a
+pure-Python implementation when it is not, so the language has no hard
+dependency on it. The test suite passes either way.
+
+**The package manager does not reach the network.** `gpm` resolves, locks,
+verifies and audits, but a registry is a directory of packages rather than a
+server, which makes the offline cache and a private registry the same mechanism.
+Resolution is a fixed point *without backtracking*: a graph that can only be
+satisfied by choosing below the highest satisfying version of something is
+reported as a conflict rather than guessed at. Signing is Ed25519, implemented
+from RFC 8032 and validated against the RFC's vectors; it is **not
+constant-time**, so it must not be used where an attacker can measure signing
+time.
 
 **No borrow checker in the Rust sense.** The **core** has an explicit memory
 model since v0.4: one owner per binding, extents computed from the derived
@@ -224,16 +257,21 @@ prevented by analysis.
 compiler does not yet fuse compatible stages or schedule them across devices,
 which is what §38's fraud-detection example is meant to demonstrate.
 
-**Sixteen standard-library modules are declared but not implemented**, and say
-so rather than failing obscurely: `fhir`, `terminology`, `provenance`, `consent`,
-`database`, `http`, `messaging`, `workflow`, `transaction`, `observability`,
-`accelerator`, `process`, `concurrency`, `train`, `infer`, `identity_provider`.
-Each carries a reason in `std/library.py::UNIMPLEMENTED_MODULES`, and a test
-asserts every module the spec names is either implemented or on that list with a
-non-placeholder reason.
+**Some standard-library modules are declared but not implemented**, and say so
+rather than being stubbed: `http`, plus the roadmap commands `profile`, `format`
+and `doc`. Nine modules that were on that list have since been implemented --
+`fhir`, `terminology`, `provenance`, `consent`, `database`, `identity`,
+`workflow`, `messaging` and `observability` -- and a test asserts that a module
+is not declared roadmap once it is registered, because that would be a false
+claim about the toolchain. `messaging` is in-process: publishing to a broker
+needs `NetworkConnect` plumbing, and none is claimed.
 
-**Interop (§29) is not implemented.** No C ABI, no Python embedding API beyond
-importing the compiler as a library, no FFI.
+**Interop (§29) is partial.** The C ABI is available through `ffi`, gated by the
+`ForeignCall` capability and the `unsafe` effect, with a closed type vocabulary:
+a pointer is not expressible, because a pointer Gama-G cannot verify is what
+§29's "marked unsafe" rule is about. JSON is available. CBOR, Protocol Buffers,
+database protocols beyond SQLite and a Python embedding API are not
+implemented.
 
 **Formal verification (§27) is contracts only.** `requires`/`ensures` are
 checked at run time and quoted in violations. There is no proof assistant, no
@@ -248,8 +286,10 @@ here in two ways: by not making the claims, and by a test
 (`test_enforcement.ForbiddenClaims`) that scans every `.md`, `.py`, `.gg` and
 `.txt` file in the repository for the forbidden phrases and fails if any appear.
 
-- **No universal performance guarantee.** Nothing here is benchmarked against a
-  native implementation. The interpreter is a reference, not a product backend.
+- **No universal performance guarantee.** A native backend exists and `ggc bench`
+  measures it, but a measurement of one program on one machine is not a property
+  of the language. Measurements are reported with their conditions and are not
+  comparisons. There is **no performance claim** anywhere in this repository.
 - **No universal accuracy guarantee.** The autodiff and training example
   converges on `w=2, b=1` for `y = 2x + 1` because that is what gradient
   descent does on a linear model — it is a correctness test, not an accuracy

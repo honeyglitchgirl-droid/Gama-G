@@ -66,7 +66,7 @@ def compiler_fingerprint() -> Dict[str, str]:
     """What produced a build.
 
     The compiler's own sources are hashed rather than trusted from a version
-    string: two checkouts can both say 0.4.0 and compile different programs, and
+    string: two checkouts can both say 1.0.0 and compile different programs, and
     the manifest is supposed to be evidence.
     """
     package_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
