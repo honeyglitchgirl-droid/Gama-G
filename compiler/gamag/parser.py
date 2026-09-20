@@ -90,6 +90,14 @@ class Parser(BoundedRecursion):
         # means a call, so `load Model("fraud-v3")` (spec section 38) reads
         # as `load(Model("fraud-v3"))`.
         self.command_ctx = 0
+        # Depth of model bodies.  A model declares its methods by name followed
+        # by parameters and an indented body -- `predict x` -- and only the
+        # literal name `predict` used to be recognised, so a model with a
+        # second method parsed that method as an expression statement and
+        # dropped it.  The rest of the pipeline already handles several
+        # methods: the checker registers them, the builder lowers them and the
+        # runtime builds a dispatch table for them.
+        self.model_ctx = 0
 
     # ------------------------------------------------------------------
     # token stream helpers (SEPARATOR tokens are transparent)
@@ -472,10 +480,12 @@ class Parser(BoundedRecursion):
         name = self.expect(TokenKind.IDENT, "a model name").text
         params = self.parse_params() if self.at(TokenKind.LPAREN) else []
         self.command_ctx += 1
+        self.model_ctx += 1
         try:
             body = self.parse_block(f"body of model `{name}`")
         finally:
             self.command_ctx -= 1
+            self.model_ctx -= 1
         decl = A.ModelDecl(pos=kw.pos, name=name, body=body)
         for st in body.stmts:
             if isinstance(st, A.IODirective):
@@ -852,6 +862,19 @@ class Parser(BoundedRecursion):
         if text == "predict" and not called and not assigned and not member:
             return self.parse_predict()
 
+        # Any other method name, inside a model body.  `predict` has its own
+        # branch above because it is also a pipeline stage (spec section 38),
+        # so the general case has to exclude the stage vocabulary to keep the
+        # two readings apart.  The decision to be a method is made by trying:
+        # if no indented body follows, the token position is restored and the
+        # line parses exactly as it did before.
+        if (self.model_ctx > 0 and not called and not assigned and not member
+                and text not in STAGE_WORDS
+                and self._method_follows()):
+            method = self.parse_method(text)
+            if method is not None:
+                return method
+
         if text in STAGE_WORDS and not called and not assigned and not member \
                 and nxt.kind in (TokenKind.IDENT, TokenKind.NEWLINE,
                                  TokenKind.DEDENT, TokenKind.RBRACE):
@@ -876,6 +899,40 @@ class Parser(BoundedRecursion):
         if text == "for":  # never reached; `for` is a hard keyword
             return None
         return None
+
+    def _method_follows(self) -> bool:
+        """Whether `name p1, p2` here is followed by an indented body.
+
+        Separate from :meth:`_block_follows` because the parameter names sit
+        between the name and the body, and the lookahead must not disturb the
+        token position.
+        """
+        save = self.i
+        try:
+            self.adv()                       # the method name
+            while self.at(TokenKind.IDENT) and not self.at_kw("using"):
+                self.adv()
+                if self.at(TokenKind.NEWLINE, TokenKind.DEDENT,
+                           TokenKind.RBRACE, TokenKind.EOF):
+                    break
+            return self._block_follows()
+        finally:
+            self.i = save
+
+    def parse_method(self, name: str) -> Optional[A.Stmt]:
+        """`twice x` + an indented body: a model method that is not `predict`."""
+        tok = self.adv()
+        names: List[str] = []
+        while self.at(TokenKind.IDENT) and not self.at_kw("using"):
+            names.append(self.adv().text)
+            if self.at(TokenKind.NEWLINE, TokenKind.DEDENT, TokenKind.RBRACE,
+                       TokenKind.EOF):
+                break
+        if not self._block_follows():
+            return None
+        params = [A.Param(pos=tok.pos, name=n) for n in names]
+        body = self.parse_block(f"body of `{name}`")
+        return A.FnDecl(pos=tok.pos, name=name, params=params, body=body)
 
     def parse_predict(self) -> A.Stmt:
         """`predict risk using model` (stage) or `predict features` + body (method)."""

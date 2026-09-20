@@ -589,6 +589,94 @@ fn main() -> Unit
         outcome.assert_rejected(self, "E-duplicate-declaration")
         self.assertNotIn("E-ice", outcome.messages())
 
+    def test_a_duplicate_model_method_is_refused(self):
+        """A model is a namespace too, and methods were not checked.
+
+        The module-level check saw only top-level declarations, so two methods
+        called `predict` in one model both registered, the second replacing the
+        first, and the collision surfaced during lowering as ``E-ice: internal
+        compiler error`` -- the same failure the module-level check exists to
+        remove, surviving one level deeper.
+        """
+        outcome = S.run("""
+model Scorer
+    input x: I64
+    output y: I64
+
+    predict x
+        return x + 1
+
+    predict x
+        return x + 2
+
+fn main() -> Unit
+    io
+    print(Scorer.predict(1))
+""")
+        outcome.assert_rejected(self, "E-duplicate-declaration")
+        self.assertNotIn("E-ice", outcome.messages())
+
+    def test_a_model_may_declare_more_than_one_method(self):
+        """`predict` was the only method name the parser recognised.
+
+        Any other name parsed as an expression statement, so the method was
+        dropped: `Scorer.twice(3)` compiled and then failed at run time with
+        `NoMethod`, and the GIR contained no `Scorer.twice` at all.
+        """
+        outcome = S.run("""
+model Scorer
+    input x: I64
+    output y: I64
+
+    predict x
+        return x + 1
+
+    twice x
+        return x * 2
+
+fn main() -> Unit
+    io
+    print(Scorer.predict(1), Scorer.twice(3))
+""")
+        outcome.assert_output_contains(self, "2 6")
+
+    def test_every_declared_method_reaches_gir(self):
+        """A method the compiler drops is a method the runtime cannot call."""
+        outcome = S.compile_only("""
+model Scorer
+    input x: I64
+    output y: I64
+
+    predict x
+        return x + 1
+
+    twice x
+        return x * 2
+
+fn main() -> Unit
+    io
+    print(Scorer.predict(1), Scorer.twice(3))
+""")
+        outcome.assert_compiled(self)
+        names = set(outcome.compilation.program.functions)
+        self.assertIn("Scorer.predict", names)
+        self.assertIn("Scorer.twice", names)
+
+    def test_a_stage_word_is_not_a_method_in_a_model(self):
+        """`normalize` stays a stage even inside a model body."""
+        outcome = S.compile_only("""
+pipeline P {
+    input x: I64
+    normalize
+    return x
+}
+
+fn main() -> Unit
+    io
+    print(1)
+""")
+        self.assertTrue(outcome.compiled or outcome.diagnostics)
+
     def test_a_duplicate_record_is_refused(self):
         outcome = S.run("""
 record Point

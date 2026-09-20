@@ -276,6 +276,32 @@ class Checker:
                 continue
             seen[name] = (kind, decl)
 
+    def _claim_method_names(self, decl: A.ModelDecl) -> None:
+        """The same rule as `_claim_declaration_names`, one level down.
+
+        A model's methods are not module declarations, so they were never
+        claimed: two methods called `predict` in one model both registered, the
+        second replacing the first in the namespace, and the collision reached
+        GIR as ``E-ice: internal compiler error`` -- the very failure the
+        module-level check was added to remove, surviving one level deeper.
+        """
+        seen: Dict[str, Any] = {}
+        for method in decl.methods:
+            name = getattr(method, "name", None) or "predict"
+            previous = seen.get(name)
+            if previous is not None:
+                first = getattr(previous, "pos", None)
+                where = f" (first declared at line {first.line})" if first else ""
+                self.error(
+                    f"model `{decl.name}` declares `{name}` more than once"
+                    f"{where}",
+                    getattr(method, "pos", None), phase=Phase.RESOLVE,
+                    code="E-duplicate-declaration",
+                    help_text="methods are referred to by name, so two of them "
+                              "sharing one make every mention ambiguous")
+                continue
+            seen[name] = method
+
     def collect_declarations(self) -> None:
         self._claim_declaration_names()
         for decl in self.module.decls:
@@ -316,6 +342,7 @@ class Checker:
                 self.models[decl.name] = decl
                 self.globals.define(Symbol(decl.name, T.ANY, "model",
                                            decl=decl, pos=decl.pos))
+                self._claim_method_names(decl)
                 for method in decl.methods:
                     method.name = f"{decl.name}.{method.name or 'predict'}"
                     self._apply_model_io(decl, method)
